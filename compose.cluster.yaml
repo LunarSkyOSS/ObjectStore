@@ -1,0 +1,127 @@
+services:
+  gateway:
+    build: .
+    image: lunarsky-objectstore:cluster-local
+    restart: unless-stopped
+    environment:
+      STORE_MODE: cluster
+      CLUSTER_LOCAL_DEV: "true"
+      CLUSTER_TEST_NODE_DOMAINS: "true"
+      BIND_ADDRESS: 0.0.0.0
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?Set S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET:-objects}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      MAX_OBJECT_BYTES: ${MAX_OBJECT_BYTES:-134217728}
+      MAX_TOTAL_BYTES: ${MAX_TOTAL_BYTES:-2147483648}
+      CLUSTER_TOKEN: ${CLUSTER_TOKEN:?Set CLUSTER_TOKEN}
+      CLUSTER_NODES: ${CLUSTER_NODES:-http://node-a:9100,http://node-b:9100,http://node-c:9100}
+      POSTGRES_JDBC_URL: jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10
+      POSTGRES_USER: objectstore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:${CLUSTER_HOST_PORT:-9001}:9000"
+    depends_on:
+      metadata:
+        condition: service_healthy
+      node-a:
+        condition: service_healthy
+      node-b:
+        condition: service_healthy
+      node-c:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/ready"]
+      interval: 10s
+      timeout: 4s
+      retries: 3
+    mem_limit: 384m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  metadata:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: objectstore
+      POSTGRES_USER: objectstore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - cluster-metadata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U objectstore -d objectstore"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+
+  repair:
+    image: lunarsky-objectstore:cluster-local
+    profiles: [maintenance]
+    entrypoint: ["/usr/local/bin/objectstore", "cluster-repair"]
+    environment:
+      STORE_MODE: cluster
+      CLUSTER_LOCAL_DEV: "true"
+      CLUSTER_TEST_NODE_DOMAINS: "true"
+      CLUSTER_NODES: ${CLUSTER_NODES:-http://node-a:9100,http://node-b:9100,http://node-c:9100}
+      CLUSTER_TOKEN: ${CLUSTER_TOKEN:?Set CLUSTER_TOKEN}
+      CLUSTER_REPAIR_TOKEN: ${CLUSTER_REPAIR_TOKEN:?Set CLUSTER_REPAIR_TOKEN}
+      S3_BUCKET: ${S3_BUCKET:-objects}
+      POSTGRES_JDBC_URL: jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10
+      POSTGRES_USER: objectstore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    mem_limit: 384m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  node-a: &node
+    image: lunarsky-objectstore:cluster-local
+    restart: unless-stopped
+    entrypoint: ["java", "-XX:MaxRAMPercentage=70", "--add-modules", "jdk.httpserver,java.net.http", "-cp", "/app:/app/postgresql.jar", "cloud.lunarsky.store.ClusterNode"]
+    environment:
+      CLUSTER_TOKEN: ${CLUSTER_TOKEN:?Set CLUSTER_TOKEN}
+      CLUSTER_REPAIR_TOKEN: ${CLUSTER_REPAIR_TOKEN:?Set CLUSTER_REPAIR_TOKEN}
+      CLUSTER_HOST_ID: 5f1447b5-3f9e-457b-8ee7-e26f0c475b5f
+      DATA_DIR: /data
+      NODE_BIND: 0.0.0.0
+    volumes:
+      - cluster-node-a:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9100/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  node-b:
+    <<: *node
+    volumes:
+      - cluster-node-b:/data
+
+  node-c:
+    <<: *node
+    volumes:
+      - cluster-node-c:/data
+
+  node-d:
+    <<: *node
+    profiles: [expansion]
+    volumes:
+      - cluster-node-d:/data
+
+volumes:
+  cluster-metadata:
+  cluster-node-a:
+  cluster-node-b:
+  cluster-node-c:
+  cluster-node-d:

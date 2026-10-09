@@ -1,4 +1,10 @@
 out/
 .env
+.env.cluster
+*.local.env
 data/
 *.log
+__pycache__/
+*.pyc
+CLUSTER_PLAN.md
+SCALE_OUT_PLAN.md

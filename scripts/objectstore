@@ -1,0 +1,14 @@
+#!/bin/sh
+if [ "${1:-}" = "cluster-repair" ]; then
+  shift
+  exec java -XX:MaxRAMPercentage=70 --add-modules java.net.http -cp /app:/app/postgresql.jar cloud.lunarsky.store.ClusterRepair "$@"
+fi
+if [ "${1:-}" = "cluster-migrate" ]; then
+  shift
+  exec java -XX:MaxRAMPercentage=70 --add-modules java.net.http -cp /app:/app/postgresql.jar cloud.lunarsky.store.ClusterMigrate "$@"
+fi
+if [ "${1:-}" = "cluster-join" ]; then
+  shift
+  exec java -XX:MaxRAMPercentage=70 --add-modules java.net.http -cp /app:/app/postgresql.jar cloud.lunarsky.store.ClusterJoin "$@"
+fi
+exec java -XX:MaxRAMPercentage=70 -cp /app cloud.lunarsky.store.Cli "$@"
