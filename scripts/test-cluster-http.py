@@ -2,11 +2,10 @@
 import datetime
 import hashlib
 import hmac
+import http.client
 import pathlib
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 
 
 values = dict(line.strip().split("=", 1) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
@@ -14,7 +13,9 @@ values = dict(line.strip().split("=", 1) for line in pathlib.Path(sys.argv[1]).r
 access = values["S3_ACCESS_KEY"]
 secret = values["S3_SECRET_KEY"]
 bucket = values.get("S3_BUCKET", "objects")
-port = values.get("CLUSTER_HOST_PORT", "9001")
+port = int(values.get("CLUSTER_HOST_PORT", "9001"))
+if not 1 <= port <= 65535:
+    raise ValueError("CLUSTER_HOST_PORT must be between 1 and 65535")
 host = f"127.0.0.1:{port}"
 
 
@@ -40,14 +41,13 @@ def request(method, path, body=b"", extra=None):
     signature = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
     headers["authorization"] = (f"AWS4-HMAC-SHA256 Credential={access}/{scope},"
                                 f"SignedHeaders={signed_names},Signature={signature}")
-    url = f"http://{host}{path}"
-    outgoing = urllib.request.Request(url, data=body if method == "PUT" else None,
-                                      method=method, headers=headers)
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     try:
-        with urllib.request.urlopen(outgoing, timeout=30) as response:
-            return response.status, response.read(), response.headers
-    except urllib.error.HTTPError as error:
-        return error.code, error.read(), error.headers
+        connection.request(method, path, body=body if method == "PUT" else None, headers=headers)
+        response = connection.getresponse()
+        return response.status, response.read(), response.headers
+    finally:
+        connection.close()
 
 
 if len(sys.argv) > 2 and sys.argv[2] == "survivor":
