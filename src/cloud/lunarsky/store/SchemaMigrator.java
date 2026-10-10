@@ -60,7 +60,8 @@ final class SchemaMigrator {
             connection.commit();
             return format;
         } catch (SQLException | IOException error) {
-            try { connection.rollback(); } catch (SQLException rollback) { error.addSuppressed(rollback); }
+            try { connection.rollback(); }
+            catch (SQLException rollback) { error.addSuppressed(rollback); }
             if (error instanceof IOException io) throw io;
             throw new IOException("Metadata schema migration failed", error);
         } finally {

@@ -9,25 +9,33 @@ import java.util.List;
 public final class StoreTest {
     interface Operation {void run() throws Exception;}
     static void fails(int status,Operation operation)throws Exception{
-        try{operation.run();throw new AssertionError("Expected "+status);}catch(StoreException error){if(error.status!=status)throw error;}
+        try {
+            operation.run();
+            throw new AssertionError("Expected " + status);
+        } catch (StoreException error) {
+            if (error.status != status) throw error;
+        }
     }
     static ObjectStorage.Metadata put(DiskStore store,String key,byte[] body,boolean only)throws Exception{
         return store.put("test",key,new ByteArrayInputStream(body),body.length,SigV4.hex(SigV4.hash(body)),null,only,"application/octet-stream");
     }
     private static void testSignature() throws Exception {
         var headers=new com.sun.net.httpserver.Headers();
-        headers.set("host","examplebucket.s3.amazonaws.com");headers.set("range","bytes=0-9");
+        headers.set("host","examplebucket.s3.amazonaws.com");
+        headers.set("range","bytes=0-9");
         headers.set("x-amz-date","20130524T000000Z");
         headers.set("x-amz-content-sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         headers.set("authorization","AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41");
         var clock=java.time.Clock.fixed(java.time.Instant.parse("2013-05-24T00:00:00Z"),java.time.ZoneOffset.UTC);
         var auth=new SigV4("AKIAIOSFODNN7EXAMPLE","wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","us-east-1",clock);
-        var uri=java.net.URI.create("/test.txt");auth.verify("GET",uri,headers);
+        var uri=java.net.URI.create("/test.txt");
+        auth.verify("GET",uri,headers);
         fails(403,()->auth.verify("GET",java.net.URI.create("/other.txt"),headers));
         fails(403,()->auth.verify("DELETE",uri,headers));
         fails(403,()->new SigV4("AKIAIOSFODNN7EXAMPLE","wrong","us-east-1",clock).verify("GET",uri,headers));
         fails(403,()->new SigV4("AKIAIOSFODNN7EXAMPLE","wrong","us-east-1",java.time.Clock.systemUTC()).verify("GET",uri,headers));
-        headers.add("host","duplicate");fails(403,()->auth.verify("GET",uri,headers));
+        headers.add("host","duplicate");
+        fails(403,()->auth.verify("GET",uri,headers));
         System.out.println("SigV4 official vector and tampering tests passed");
     }
 
@@ -59,7 +67,8 @@ public final class StoreTest {
         try(var restarted=new DiskStore(root,8,10)){
             try(var obj=restarted.open("test","../nested/☾")){if(obj.stream().read()!=9)throw new AssertionError("Persistence");}
             if(restarted.list("test","","",100,null).objects().size()!=2)throw new AssertionError("Index persistence");
-            restarted.delete("test","../nested/☾");restarted.delete("test","../nested/☾");
+            restarted.delete("test","../nested/☾");
+            restarted.delete("test","../nested/☾");
             fails(404,()->restarted.open("test","../nested/☾"));
             var uploads=new MultipartStore(restarted);
             String upload=uploads.create("test","from-parts","text/plain");

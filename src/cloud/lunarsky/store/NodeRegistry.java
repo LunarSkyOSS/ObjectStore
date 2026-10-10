@@ -52,7 +52,8 @@ final class NodeRegistry {
             connection.commit();
             return new NodeClient.Node(identity.nodeId(), identity.hostId(), url);
         } catch (SQLException | IOException error) {
-            try { connection.rollback(); } catch (SQLException rollback) { error.addSuppressed(rollback); }
+            try { connection.rollback(); }
+            catch (SQLException rollback) { error.addSuppressed(rollback); }
             if (error instanceof IOException io) throw io;
             throw new IOException("Node registration failed", error);
         } finally {
@@ -77,7 +78,8 @@ final class NodeRegistry {
             connection.commit();
             return nodes;
         } catch (SQLException | IOException | RuntimeException error) {
-            try { connection.rollback(); } catch (SQLException rollback) { error.addSuppressed(rollback); }
+            try { connection.rollback(); }
+            catch (SQLException rollback) { error.addSuppressed(rollback); }
             if (error instanceof IOException io) throw io;
             if (error instanceof SQLException sql) throw new IOException("Node registry check failed", sql);
             throw (RuntimeException) error;

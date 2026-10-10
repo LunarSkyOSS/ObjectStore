@@ -31,7 +31,9 @@ public final class ClusterMigrationTest {
         if (args[0].equals("create")) {
             UUID segment = UUID.randomUUID();
             byte[] hash = SigV4.hash(DATA);
-            for (int i = 0; i < nodes.count(); i++) nodes.put(i, segment, DATA, hash);
+            for (int i = 0; i < nodes.count(); i++) {
+                nodes.put(i, segment, DATA, hash);
+            }
             try (var connection = DriverManager.getConnection(env.get("POSTGRES_JDBC_URL"),
                     env.get("POSTGRES_USER"), env.get("POSTGRES_PASSWORD"));
                  var statement = connection.createStatement()) {
@@ -40,18 +42,28 @@ public final class ClusterMigrationTest {
                 statement.execute("CREATE TABLE cluster_segments (generation uuid NOT NULL, ordinal integer NOT NULL, segment_id uuid NOT NULL, length integer NOT NULL, sha256 bytea NOT NULL, replicas text NOT NULL, PRIMARY KEY (generation, ordinal))");
                 statement.execute("CREATE TABLE cluster_tombstones (bucket text NOT NULL, object_key text COLLATE \"C\" NOT NULL, generation uuid NOT NULL, deleted_at bigint NOT NULL, PRIMARY KEY (bucket, object_key))");
                 try (var insert = connection.prepareStatement("INSERT INTO cluster_usage VALUES (?, ?)")) {
-                    insert.setString(1, bucket); insert.setLong(2, DATA.length); insert.executeUpdate();
+                    insert.setString(1, bucket);
+                    insert.setLong(2, DATA.length);
+                    insert.executeUpdate();
                 }
                 UUID generation = UUID.randomUUID();
                 try (var insert = connection.prepareStatement("INSERT INTO cluster_objects VALUES (?, ?, ?, ?, ?, ?, ?, ?)")) {
-                    insert.setString(1, bucket); insert.setString(2, KEY); insert.setObject(3, generation);
-                    insert.setLong(4, DATA.length); insert.setLong(5, System.currentTimeMillis());
+                    insert.setString(1, bucket);
+                    insert.setString(2, KEY);
+                    insert.setObject(3, generation);
+                    insert.setLong(4, DATA.length);
+                    insert.setLong(5, System.currentTimeMillis());
                     insert.setString(6, HexFormat.of().formatHex(MessageDigest.getInstance("MD5").digest(DATA)));
-                    insert.setBytes(7, hash); insert.setString(8, "text/plain"); insert.executeUpdate();
+                    insert.setBytes(7, hash);
+                    insert.setString(8, "text/plain");
+                    insert.executeUpdate();
                 }
                 try (var insert = connection.prepareStatement("INSERT INTO cluster_segments VALUES (?, 0, ?, ?, ?, '0,1,2')")) {
-                    insert.setObject(1, generation); insert.setObject(2, segment);
-                    insert.setInt(3, DATA.length); insert.setBytes(4, hash); insert.executeUpdate();
+                    insert.setObject(1, generation);
+                    insert.setObject(2, segment);
+                    insert.setInt(3, DATA.length);
+                    insert.setBytes(4, hash);
+                    insert.executeUpdate();
                 }
             }
             System.out.println("Legacy cluster fixture created");

@@ -38,8 +38,12 @@ final class ClusterStore implements ObjectStorage {
                  boolean testNodeDomains) throws IOException {
         if (jdbcUrl == null || !jdbcUrl.startsWith("jdbc:postgresql://") || user == null || password == null)
             throw new IllegalArgumentException("Invalid metadata database configuration");
-        this.jdbcUrl = jdbcUrl; this.user = user; this.password = password;
-        this.configuredBucket = bucket; this.maxObject = maxObject; this.maxTotal = maxTotal;
+        this.jdbcUrl = jdbcUrl;
+        this.user = user;
+        this.password = password;
+        this.configuredBucket = bucket;
+        this.maxObject = maxObject;
+        this.maxTotal = maxTotal;
         this.testNodeDomains = testNodeDomains;
         try (Connection connection = connect()) {
             int format = SchemaMigrator.prepare(connection, bucket);
@@ -88,7 +92,8 @@ final class ClusterStore implements ObjectStorage {
                 int count = input.read(buffer, 0, (int) Math.min(buffer.length, remaining));
                 if (count < 0) throw new StoreException(400, "IncompleteBody", "Payload length does not match Content-Length");
                 if (count == 0) continue;
-                sha.update(buffer, 0, count); md5.update(buffer, 0, count);
+                sha.update(buffer, 0, count);
+                md5.update(buffer, 0, count);
                 output.write(buffer, 0, count);
                 remaining -= count;
             }
@@ -169,8 +174,11 @@ final class ClusterStore implements ObjectStorage {
                     "INSERT INTO cluster_segments (generation, ordinal, segment_id, length, sha256, replicas, replica_ids) VALUES (?, ?, ?, ?, ?, 'v2', ?)")) {
                     for (int i = 0; i < segments.size(); i++) {
                         Segment segment = segments.get(i);
-                        insert.setObject(1, generation); insert.setInt(2, i); insert.setObject(3, segment.id());
-                        insert.setInt(4, segment.length()); insert.setBytes(5, segment.hash());
+                        insert.setObject(1, generation);
+                        insert.setInt(2, i);
+                        insert.setObject(3, segment.id());
+                        insert.setInt(4, segment.length());
+                        insert.setBytes(5, segment.hash());
                         insert.setArray(6, connection.createArrayOf("uuid", segment.replicas().toArray()));
                         insert.addBatch();
                     }
@@ -178,13 +186,18 @@ final class ClusterStore implements ObjectStorage {
                 }
                 try (PreparedStatement update = connection.prepareStatement(
                     "INSERT INTO cluster_objects VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bucket, object_key) DO UPDATE SET generation=EXCLUDED.generation, length=EXCLUDED.length, modified=EXCLUDED.modified, etag=EXCLUDED.etag, sha256=EXCLUDED.sha256, content_type=EXCLUDED.content_type")) {
-                    bindObject(update, metadata, generation); update.executeUpdate();
+                    bindObject(update, metadata, generation);
+                    update.executeUpdate();
                 }
                 try (PreparedStatement update = connection.prepareStatement("UPDATE cluster_usage SET used_bytes=? WHERE bucket=?")) {
-                    update.setLong(1, used - Math.max(0, previous) + length); update.setString(2, bucket); update.executeUpdate();
+                    update.setLong(1, used - Math.max(0, previous) + length);
+                    update.setString(2, bucket);
+                    update.executeUpdate();
                 }
                 try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_tombstones WHERE bucket=? AND object_key=?")) {
-                    delete.setString(1, bucket); delete.setString(2, key); delete.executeUpdate();
+                    delete.setString(1, bucket);
+                    delete.setString(2, key);
+                    delete.executeUpdate();
                 }
                 connection.commit();
             } catch (SQLException | RuntimeException error) {
@@ -204,7 +217,8 @@ final class ClusterStore implements ObjectStorage {
                 UUID generation;
                 try (PreparedStatement query = connection.prepareStatement(
                     "SELECT generation, length, modified, etag, sha256, content_type FROM cluster_objects WHERE bucket=? AND object_key=?")) {
-                    query.setString(1, bucket); query.setString(2, key);
+                    query.setString(1, bucket);
+                    query.setString(2, key);
                     try (ResultSet result = query.executeQuery()) {
                         if (!result.next()) throw new StoreException(404, "NoSuchKey", "Object not found");
                         generation = (UUID) result.getObject(1);
@@ -245,17 +259,23 @@ final class ClusterStore implements ObjectStorage {
                 long used = lockUsage(connection, bucket);
                 long previous = currentLength(connection, bucket, key);
                 try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_objects WHERE bucket=? AND object_key=?")) {
-                    delete.setString(1, bucket); delete.setString(2, key); delete.executeUpdate();
+                    delete.setString(1, bucket);
+                    delete.setString(2, key);
+                    delete.executeUpdate();
                 }
                 try (PreparedStatement update = connection.prepareStatement(
                     "INSERT INTO cluster_tombstones VALUES (?, ?, ?, ?) ON CONFLICT (bucket, object_key) DO UPDATE SET generation=EXCLUDED.generation, deleted_at=EXCLUDED.deleted_at")) {
-                    update.setString(1, bucket); update.setString(2, key);
-                    update.setObject(3, UUID.randomUUID()); update.setLong(4, Instant.now().toEpochMilli());
+                    update.setString(1, bucket);
+                    update.setString(2, key);
+                    update.setObject(3, UUID.randomUUID());
+                    update.setLong(4, Instant.now().toEpochMilli());
                     update.executeUpdate();
                 }
                 if (previous >= 0) {
                     try (PreparedStatement update = connection.prepareStatement("UPDATE cluster_usage SET used_bytes=? WHERE bucket=?")) {
-                        update.setLong(1, used - previous); update.setString(2, bucket); update.executeUpdate();
+                        update.setLong(1, used - previous);
+                        update.setString(2, bucket);
+                        update.executeUpdate();
                     }
                 }
                 connection.commit();
@@ -297,10 +317,18 @@ final class ClusterStore implements ObjectStorage {
             if (!key.startsWith(prefix)) break;
             if (after != null && key.compareTo(after) <= 0) continue;
             String group = commonPrefix(key, prefix, delimiter);
-            if (group != null && group.equals(activePrefix)) { lastKey = key; continue; }
-            if (entries.size() + prefixes.size() >= maxKeys) { truncated = true; break; }
-            if (group != null) { prefixes.add(group); activePrefix = group; }
-            else {
+            if (group != null && group.equals(activePrefix)) {
+                lastKey = key;
+                continue;
+            }
+            if (entries.size() + prefixes.size() >= maxKeys) {
+                truncated = true;
+                break;
+            }
+            if (group != null) {
+                prefixes.add(group);
+                activePrefix = group;
+            } else {
                 entries.add(new ListedObject(key, new Metadata(result.getLong(2), result.getLong(3),
                     result.getString(4), result.getBytes(5), bucket, key, result.getString(6))));
                 activePrefix = null;
@@ -327,14 +355,20 @@ final class ClusterStore implements ObjectStorage {
     }
     private long currentLength(Connection connection, String bucket, String key) throws SQLException {
         try (PreparedStatement query = connection.prepareStatement("SELECT length FROM cluster_objects WHERE bucket=? AND object_key=?")) {
-            query.setString(1, bucket); query.setString(2, key);
+            query.setString(1, bucket);
+            query.setString(2, key);
             try (ResultSet result = query.executeQuery()) { return result.next() ? result.getLong(1) : -1; }
         }
     }
     private static void bindObject(PreparedStatement update, Metadata data, UUID generation) throws SQLException {
-        update.setString(1, data.bucket()); update.setString(2, data.key()); update.setObject(3, generation);
-        update.setLong(4, data.length()); update.setLong(5, data.modified()); update.setString(6, data.etag());
-        update.setBytes(7, data.sha256()); update.setString(8, data.contentType());
+        update.setString(1, data.bucket());
+        update.setString(2, data.key());
+        update.setObject(3, generation);
+        update.setLong(4, data.length());
+        update.setLong(5, data.modified());
+        update.setString(6, data.etag());
+        update.setBytes(7, data.sha256());
+        update.setString(8, data.contentType());
     }
     private static List<UUID> replicaIds(ResultSet result, int column) throws SQLException, IOException {
         java.sql.Array value = result.getArray(column);
@@ -406,7 +440,10 @@ final class ClusterStore implements ObjectStorage {
                             healthy.add(id);
                             healthyHosts.add(nodes.faultDomain(node, testNodeDomains));
                         }
-                        if (copy == null) { unrecoverable++; continue; }
+                        if (copy == null) {
+                            unrecoverable++;
+                            continue;
+                        }
                         for (int node : PlacementPolicy.candidates(segment.id(), nodes, testNodeDomains)) {
                             UUID host = nodes.faultDomain(node, testNodeDomains);
                             if (healthyHosts.contains(host)) continue;
@@ -484,6 +521,9 @@ final class ClusterStore implements ObjectStorage {
             }
             return current.read(buffer, offset, length);
         }
-        @Override public void close() { closed = true; current = null; }
+        @Override public void close() {
+            closed = true;
+            current = null;
+        }
     }
 }

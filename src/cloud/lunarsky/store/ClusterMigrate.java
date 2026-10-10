@@ -148,7 +148,8 @@ public final class ClusterMigrate {
             }
             connection.commit();
         } catch (SQLException | IOException | RuntimeException error) {
-            try { connection.rollback(); } catch (SQLException rollback) { error.addSuppressed(rollback); }
+            try { connection.rollback(); }
+            catch (SQLException rollback) { error.addSuppressed(rollback); }
             if (error instanceof IOException io) throw io;
             if (error instanceof SQLException sql) throw sql;
             throw (RuntimeException) error;

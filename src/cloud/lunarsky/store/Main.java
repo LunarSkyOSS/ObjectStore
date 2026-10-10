@@ -34,8 +34,10 @@ public final class Main {
     }
 
     Main(ObjectStorage store, MultipartStorage multipart, SigV4 authentication, String bucket) {
-        this.store = store; this.multipart = multipart;
-        this.authentication = authentication; this.bucket = bucket;
+        this.store = store;
+        this.multipart = multipart;
+        this.authentication = authentication;
+        this.bucket = bucket;
     }
 
     void handle(HttpExchange exchange) throws IOException {
@@ -58,7 +60,10 @@ public final class Main {
         catch (Exception error) {
             System.err.println("ObjectStore request failed: " + requestId + " " + error.getClass().getSimpleName());
             sendError(exchange, 500, "InternalError", "Storage operation failed", requestId);
-        } finally { if (admitted) slots.release(); exchange.close(); }
+        } finally {
+            if (admitted) slots.release();
+            exchange.close();
+        }
     }
 
     private boolean handleStatus(HttpExchange exchange) throws IOException {
@@ -321,7 +326,8 @@ public final class Main {
             else {
                 object.stream().skipNBytes(range.start());
                 exchange.sendResponseHeaders(status, range.length());
-                byte[] buffer = new byte[65536]; long left = range.length();
+                byte[] buffer = new byte[65536];
+                long left = range.length();
                 while (left > 0) {
                     int n = object.stream().read(buffer, 0, (int) Math.min(buffer.length, left));
                     if (n < 0) throw new IOException("Object body ended before its recorded length");
@@ -345,7 +351,8 @@ public final class Main {
             if (parts[0].isEmpty()) {
                 long suffix = Long.parseLong(parts[1]);
                 if (suffix == 0) throw new NumberFormatException();
-                start = Math.max(0, size - suffix); end = size - 1;
+                start = Math.max(0, size - suffix);
+                end = size - 1;
             } else {
                 start = Long.parseLong(parts[0]);
                 end = parts[1].isEmpty() ? size - 1 : Math.min(Long.parseLong(parts[1]), size - 1);
@@ -494,7 +501,8 @@ public final class Main {
             ? new InetSocketAddress(env.getOrDefault("BIND_ADDRESS", "127.0.0.1"), port)
             : new InetSocketAddress(port), 64);
         var executor = Executors.newVirtualThreadPerTaskExecutor();
-        server.setExecutor(executor); server.createContext("/", app::handle);
+        server.setExecutor(executor);
+        server.createContext("/", app::handle);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             server.stop(5);
             executor.close();
@@ -526,7 +534,10 @@ public final class Main {
         String[] units = {"KiB", "MiB", "GiB", "TiB"};
         double value = bytes;
         int unit = -1;
-        do { value /= 1024; unit++; } while (value >= 1024 && unit < units.length - 1);
+        do {
+            value /= 1024;
+            unit++;
+        } while (value >= 1024 && unit < units.length - 1);
         return String.format(Locale.ROOT, "%.1f %s", value, units[unit]);
     }
     private static String required(Map<String, String> env, String key) {

@@ -24,7 +24,10 @@ final class SigV4 {
     private final Clock clock;
 
     SigV4(String accessKey, String secretKey, String region, Clock clock) {
-        this.accessKey = accessKey; this.secretKey = secretKey; this.region = region; this.clock = clock;
+        this.accessKey = accessKey;
+        this.secretKey = secretKey;
+        this.region = region;
+        this.clock = clock;
     }
 
     String verify(String method, URI uri, Headers headers) {
@@ -111,17 +114,25 @@ final class SigV4 {
 
     static String decode(String value) {
         try {
-            var bytes=new java.io.ByteArrayOutputStream();
-            for(int i=0;i<value.length();){
-                if(value.charAt(i)=='%'){
-                    if(i+2>=value.length())throw new IllegalArgumentException();
-                    int hi=Character.digit(value.charAt(i+1),16),lo=Character.digit(value.charAt(i+2),16);
-                    if(hi<0||lo<0)throw new IllegalArgumentException();
-                    bytes.write((hi<<4)|lo);i+=3;
-                }else{int point=value.codePointAt(i);bytes.writeBytes(new String(Character.toChars(point)).getBytes(StandardCharsets.UTF_8));i+=Character.charCount(point);}
+            var bytes = new java.io.ByteArrayOutputStream();
+            for (int i = 0; i < value.length();) {
+                if (value.charAt(i) == '%') {
+                    if (i + 2 >= value.length()) throw new IllegalArgumentException();
+                    int hi = Character.digit(value.charAt(i + 1), 16);
+                    int lo = Character.digit(value.charAt(i + 2), 16);
+                    if (hi < 0 || lo < 0) throw new IllegalArgumentException();
+                    bytes.write((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    int point = value.codePointAt(i);
+                    bytes.writeBytes(new String(Character.toChars(point)).getBytes(StandardCharsets.UTF_8));
+                    i += Character.charCount(point);
+                }
             }
             return StandardCharsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT).decode(java.nio.ByteBuffer.wrap(bytes.toByteArray())).toString();
-        }catch(IllegalArgumentException|java.nio.charset.CharacterCodingException e){throw new StoreException(400,"InvalidURI","Malformed URI encoding");}
+        } catch (IllegalArgumentException | java.nio.charset.CharacterCodingException e) {
+            throw new StoreException(400, "InvalidURI", "Malformed URI encoding");
+        }
     }
 
     static String encode(String value, boolean keepSlash) {
@@ -146,10 +157,17 @@ final class SigV4 {
         return hmac(hmac(hmac(hmac(("AWS4"+secret).getBytes(StandardCharsets.UTF_8),date),region),"s3"),"aws4_request");
     }
     static byte[] hmac(byte[] key, String text) {
-        try { Mac mac=Mac.getInstance("HmacSHA256");mac.init(new SecretKeySpec(key,"HmacSHA256"));return mac.doFinal(text.getBytes(StandardCharsets.UTF_8)); }
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(text.getBytes(StandardCharsets.UTF_8));
+        }
         catch (java.security.GeneralSecurityException e) { throw new IllegalStateException(e); }
     }
-    static byte[] hash(byte[] data) { try {return MessageDigest.getInstance("SHA-256").digest(data);}catch(java.security.NoSuchAlgorithmException e){throw new IllegalStateException(e);} }
+    static byte[] hash(byte[] data) {
+        try { return MessageDigest.getInstance("SHA-256").digest(data); }
+        catch (java.security.NoSuchAlgorithmException e) { throw new IllegalStateException(e); }
+    }
     static String hex(byte[] data) { return HexFormat.of().formatHex(data); }
     private static void denied(String message) { throw new StoreException(403,"AccessDenied",message); }
 }

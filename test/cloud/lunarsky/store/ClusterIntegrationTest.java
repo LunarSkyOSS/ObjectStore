@@ -21,7 +21,9 @@ public final class ClusterIntegrationTest {
             switch (args[0]) {
                 case "basic" -> {
                     byte[] large = new byte[ClusterNode.MAX_SEGMENT + 37];
-                    for (int i = 0; i < large.length; i++) large[i] = (byte) (i * 31);
+                    for (int i = 0; i < large.length; i++) {
+                        large[i] = (byte) (i * 31);
+                    }
                     String largeKey = "cluster-test/large";
                     put(store, bucket, largeKey, large, false);
                     try (var opened = store.open(bucket, largeKey)) {
@@ -39,7 +41,10 @@ public final class ClusterIntegrationTest {
                             "Overwrite was not visible");
                     }
                     store.delete(bucket, largeKey);
-                    try { store.open(bucket, largeKey); throw new AssertionError("Deleted object remained visible"); }
+                    try {
+                        store.open(bucket, largeKey);
+                        throw new AssertionError("Deleted object remained visible");
+                    }
                     catch (StoreException error) { require(error.status == 404, "Wrong missing-object status"); }
                     put(store, bucket, KEY, stable, false);
                     require(store.ready(), "Healthy cluster is not ready");
@@ -63,7 +68,10 @@ public final class ClusterIntegrationTest {
                         put(store, bucket, "cluster-test/rejected", new byte[]{1}, false);
                         throw new AssertionError("Write succeeded with only one node");
                     } catch (StoreException error) { require(error.status == 503, "Wrong unavailable status"); }
-                    try { store.open(bucket, "cluster-test/rejected"); throw new AssertionError("Failed write became visible"); }
+                    try {
+                        store.open(bucket, "cluster-test/rejected");
+                        throw new AssertionError("Failed write became visible");
+                    }
                     catch (StoreException error) { require(error.status == 404, "Partial object became visible"); }
                     System.out.println("Cluster quorum-loss test passed");
                 }
@@ -82,13 +90,18 @@ public final class ClusterIntegrationTest {
                     var executor = java.util.concurrent.Executors.newFixedThreadPool(2);
                     try {
                         var a = executor.submit(() -> {
-                            start.await(); put(store, bucket, key, first, false); return null;
+                            start.await();
+                            put(store, bucket, key, first, false);
+                            return null;
                         });
                         var b = executor.submit(() -> {
-                            start.await(); put(store, bucket, key, second, false); return null;
+                            start.await();
+                            put(store, bucket, key, second, false);
+                            return null;
                         });
                         start.countDown();
-                        a.get(); b.get();
+                        a.get();
+                        b.get();
                         try (var opened = store.open(bucket, key)) {
                             byte[] actual = opened.stream().readAllBytes();
                             require(Arrays.equals(actual, first) || Arrays.equals(actual, second),

@@ -43,7 +43,9 @@ final class NodeClient {
     List<Node> nodes() { return nodes; }
     Node node(int index) { return nodes.get(index); }
     int index(UUID id) {
-        for (int i = 0; i < nodes.size(); i++) if (nodes.get(i).id().equals(id)) return i;
+        for (int i = 0; i < nodes.size(); i++) {
+            if (nodes.get(i).id().equals(id)) return i;
+        }
         return -1;
     }
     UUID faultDomain(int index, boolean testNodeDomains) {

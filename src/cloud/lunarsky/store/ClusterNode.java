@@ -252,7 +252,8 @@ public final class ClusterNode implements AutoCloseable {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             server.stop(5);
             executor.close();
-            try { node.close(); } catch (IOException error) { System.err.println("Node close failed: " + error); }
+            try { node.close(); }
+            catch (IOException error) { System.err.println("Node close failed: " + error); }
         }));
         server.start();
         System.out.println("ObjectStore cluster node listening on :" + port);

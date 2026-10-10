@@ -142,7 +142,8 @@ public final class HttpTest {
             "?partNumber=1&uploadId=" + upload), "PUT", first, Map.of()), HttpResponse.BodyHandlers.ofByteArray());
         var partTwo = client.send(signedUri(URI.create(base + "/objects/" + movie +
             "?partNumber=2&uploadId=" + upload), "PUT", second, Map.of()), HttpResponse.BodyHandlers.ofByteArray());
-        status(200, partOne); status(200, partTwo);
+        status(200, partOne);
+        status(200, partTwo);
         String completion = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" +
             partOne.headers().firstValue("etag").orElseThrow() +
             "</ETag></Part><Part><PartNumber>2</PartNumber><ETag>" +

@@ -109,7 +109,9 @@ public final class Cli {
             }
             if (verify) {
                 MessageDigest sha = digest("SHA-256"), md5 = digest("MD5");
-                byte[] buffer = new byte[65536]; long count = 0; int n;
+                byte[] buffer = new byte[65536];
+                long count = 0;
+                int n;
                 while ((n = input.read(buffer)) != -1) {
                     count += n;
                     sha.update(buffer, 0, n);

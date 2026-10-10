@@ -97,11 +97,14 @@ final class MultipartStore implements MultipartStorage {
             MessageDigest sha = digest("SHA-256"), md5 = digest("MD5");
             long count = 0;
             try (var output = Files.newOutputStream(pending)) {
-                byte[] buffer = new byte[65536]; int n;
+                byte[] buffer = new byte[65536];
+                int n;
                 while ((n = input.read(buffer)) != -1) {
                     count += n;
                     if (count > length) throw new StoreException(413, "EntityTooLarge", "Part exceeds declared size");
-                    sha.update(buffer, 0, n); md5.update(buffer, 0, n); output.write(buffer, 0, n);
+                    sha.update(buffer, 0, n);
+                    md5.update(buffer, 0, n);
+                    output.write(buffer, 0, n);
                 }
             }
             if (count != length) throw new StoreException(400, "IncompleteBody", "Part length does not match Content-Length");
@@ -124,7 +127,8 @@ final class MultipartStore implements MultipartStorage {
             throw new StoreException(400, "InvalidPart", "No valid parts supplied");
         MessageDigest sha = digest("SHA-256");
         List<Path> paths = new ArrayList<>();
-        long total = 0; int last = 0;
+        long total = 0;
+        int last = 0;
         for (Part part : parts) {
             if (part.number() <= last || part.number() > 10000)
                 throw new StoreException(400, "InvalidPartOrder", "Parts must be in ascending order");
@@ -136,8 +140,12 @@ final class MultipartStore implements MultipartStorage {
             if (total > store.maxObject()) throw new StoreException(413, "EntityTooLarge", "Object exceeds the configured size limit");
             MessageDigest md5 = digest("MD5");
             try (var input = Files.newInputStream(file)) {
-                byte[] buffer = new byte[65536]; int n;
-                while ((n = input.read(buffer)) != -1) { sha.update(buffer, 0, n); md5.update(buffer, 0, n); }
+                byte[] buffer = new byte[65536];
+                int n;
+                while ((n = input.read(buffer)) != -1) {
+                    sha.update(buffer, 0, n);
+                    md5.update(buffer, 0, n);
+                }
             }
             if (!SigV4.hex(md5.digest()).equals(part.etag().replace("\"", "")))
                 throw new StoreException(400, "InvalidPart", "Part ETag mismatch");
@@ -209,7 +217,8 @@ final class MultipartStore implements MultipartStorage {
                 }
                 int n = current.read(buffer, offset, length);
                 if (n >= 0) return n;
-                current.close(); current = null;
+                current.close();
+                current = null;
             }
         }
         @Override public void close() throws IOException { if (current != null) current.close(); }

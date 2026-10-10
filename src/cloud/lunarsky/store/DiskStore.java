@@ -34,8 +34,10 @@ final class DiskStore implements ObjectStorage {
 
     DiskStore(Path root, long maxObject, long maxTotal) throws IOException {
         this.root = root;
-        objects = root.resolve("objects"); temporary = root.resolve("pending");
-        this.maxObject = maxObject; this.maxTotal = maxTotal;
+        objects = root.resolve("objects");
+        temporary = root.resolve("pending");
+        this.maxObject = maxObject;
+        this.maxTotal = maxTotal;
         Arrays.setAll(locks, i -> new Object());
         Files.createDirectories(root);
         FileChannel channel = FileChannel.open(root.resolve(".process.lock"), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
@@ -45,7 +47,8 @@ final class DiskStore implements ObjectStorage {
             try { acquired = channel.tryLock(); }
             catch (OverlappingFileLockException e) { throw new IOException("Data directory is already in use", e); }
             if (acquired == null) throw new IOException("Data directory is already in use");
-            Files.createDirectories(objects); Files.createDirectories(temporary);
+            Files.createDirectories(objects);
+            Files.createDirectories(temporary);
             syncDirectory(root);
             try (var paths = Files.list(temporary)) {
                 for (Path p : paths.toList()) if (p.getFileName().toString().endsWith(".part")) Files.delete(p);
@@ -140,12 +143,15 @@ final class DiskStore implements ObjectStorage {
         long count = 0;
         try (OutputStream out = Files.newOutputStream(pending)) {
             out.write(new byte[headerLength]);
-            byte[] buffer = new byte[65536]; int n;
+            byte[] buffer = new byte[65536];
+            int n;
             while ((n = input.read(buffer)) != -1) {
                 count += n;
                 if (count > length || count > maxObject)
                     throw new StoreException(413, "EntityTooLarge", "Payload exceeds declared size");
-                sha.update(buffer, 0, n); md5.update(buffer, 0, n); out.write(buffer, 0, n);
+                sha.update(buffer, 0, n);
+                md5.update(buffer, 0, n);
+                out.write(buffer, 0, n);
             }
         }
         if (count != length) throw new StoreException(400, "IncompleteBody", "Payload length does not match Content-Length");
@@ -200,7 +206,10 @@ final class DiskStore implements ObjectStorage {
             try { input = new DataInputStream(Files.newInputStream(destination)); }
             catch (NoSuchFileException e) { throw new StoreException(404, "NoSuchKey", "Object not found"); }
             try { return new OpenObject(readRecord(input).metadata(), input); }
-            catch (IOException e) { input.close(); throw e; }
+            catch (IOException e) {
+                input.close();
+                throw e;
+            }
         }
     }
 
@@ -242,10 +251,21 @@ final class DiskStore implements ObjectStorage {
                 int at = key.indexOf(delimiter, prefix.length());
                 if (at >= 0) group = key.substring(0, at + delimiter.length());
             }
-            if (group != null && group.equals(activePrefix)) { lastKey = key; continue; }
-            if (entries.size() + prefixes.size() >= maxKeys) { truncated = true; break; }
-            if (group != null) { prefixes.add(group); activePrefix = group; }
-            else { entries.add(new ListedObject(key, meta)); activePrefix = null; }
+            if (group != null && group.equals(activePrefix)) {
+                lastKey = key;
+                continue;
+            }
+            if (entries.size() + prefixes.size() >= maxKeys) {
+                truncated = true;
+                break;
+            }
+            if (group != null) {
+                prefixes.add(group);
+                activePrefix = group;
+            } else {
+                entries.add(new ListedObject(key, meta));
+                activePrefix = null;
+            }
             lastKey = key;
         }
         return new ListPage(entries, prefixes, truncated ? lastKey : null, truncated);
@@ -256,7 +276,8 @@ final class DiskStore implements ObjectStorage {
         if (magic != MAGIC_V1 && magic != MAGIC_V2) throw new IOException("Invalid object record");
         long length = in.readLong(), modified = in.readLong();
         byte[] md5 = new byte[16], sha = new byte[32];
-        in.readFully(md5); in.readFully(sha);
+        in.readFully(md5);
+        in.readFully(sha);
         if (length < 0) throw new IOException("Invalid object record length");
         if (magic == MAGIC_V1)
             return new Record(new Metadata(length, modified, SigV4.hex(md5), sha,
