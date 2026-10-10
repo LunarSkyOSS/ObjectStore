@@ -126,9 +126,7 @@ final class NodeRegistry {
         for (URI url : urls) {
             NodeClient.Node node = stored.get(url.toString());
             if (node == null) throw new IOException("Unregistered storage node URL: " + url);
-            NodeIdentity actual = null;
-            try { actual = NodeClient.probe(url, token); }
-            catch (IOException offline) { }
+            NodeIdentity actual = NodeClient.probeIfAvailable(url, token);
             if (actual != null && (!actual.nodeId().equals(node.id()) || !actual.hostId().equals(node.hostId())))
                 throw new IOException("Storage node identity changed at " + url);
             configured.add(node);

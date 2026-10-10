@@ -74,6 +74,11 @@ final class NodeClient {
         }
     }
 
+    static NodeIdentity probeIfAvailable(URI url, String token) {
+        try { return probe(url, token); }
+        catch (IOException offline) { return null; }
+    }
+
     static void validateUrl(URI url) {
         if (url == null || !"http".equals(url.getScheme()) || url.getHost() == null ||
             url.getPort() < 1 || url.getRawUserInfo() != null ||
@@ -86,12 +91,11 @@ final class NodeClient {
         Set<UUID> healthy = new HashSet<>();
         for (int i = 0; i < nodes.size(); i++) {
             Node node = nodes.get(i);
-            try {
-                NodeIdentity actual = probe(node.url(), token);
-                if (actual.nodeId().equals(node.id()) && actual.hostId().equals(node.hostId()))
-                    healthy.add(faultDomain(i, testNodeDomains));
-                if (healthy.size() >= required) return true;
-            } catch (IOException error) { }
+            NodeIdentity actual = probeIfAvailable(node.url(), token);
+            if (actual == null) continue;
+            if (actual.nodeId().equals(node.id()) && actual.hostId().equals(node.hostId()))
+                healthy.add(faultDomain(i, testNodeDomains));
+            if (healthy.size() >= required) return true;
         }
         return false;
     }

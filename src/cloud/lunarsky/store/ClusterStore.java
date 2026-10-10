@@ -400,23 +400,21 @@ final class ClusterStore implements ObjectStorage {
                         for (UUID id : segment.replicas()) {
                             int node = nodes.index(id);
                             if (node < 0) continue;
-                            try {
-                                byte[] candidate = nodes.get(node, segment.id(), segment.length(), segment.hash());
-                                if (copy == null) copy = candidate;
-                                healthy.add(id);
-                                healthyHosts.add(nodes.faultDomain(node, testNodeDomains));
-                            } catch (IOException error) { }
+                            byte[] candidate = readableReplica(node, segment);
+                            if (candidate == null) continue;
+                            if (copy == null) copy = candidate;
+                            healthy.add(id);
+                            healthyHosts.add(nodes.faultDomain(node, testNodeDomains));
                         }
                         if (copy == null) { unrecoverable++; continue; }
                         for (int node : PlacementPolicy.candidates(segment.id(), nodes, testNodeDomains)) {
                             UUID host = nodes.faultDomain(node, testNodeDomains);
                             if (healthyHosts.contains(host)) continue;
-                            try {
-                                nodes.repair(node, segment.id(), copy, segment.hash());
+                            if (repairReplica(node, segment, copy)) {
                                 healthy.add(nodes.node(node).id());
                                 healthyHosts.add(host);
                                 restored++;
-                            } catch (IOException error) { }
+                            }
                             if (healthyHosts.size() == 3) break;
                         }
                         if (healthyHosts.size() < 3) underReplicated++;
@@ -439,6 +437,19 @@ final class ClusterStore implements ObjectStorage {
         } catch (SQLException error) { throw databaseError(error); }
         return new RepairReport(scanned, restored, underReplicated, unrecoverable);
     }
+
+    private byte[] readableReplica(int node, Segment segment) {
+        try { return nodes.get(node, segment.id(), segment.length(), segment.hash()); }
+        catch (IOException unavailable) { return null; }
+    }
+
+    private boolean repairReplica(int node, Segment segment, byte[] copy) {
+        try {
+            nodes.repair(node, segment.id(), copy, segment.hash());
+            return true;
+        } catch (IOException unavailable) { return false; }
+    }
+
     @Override public void close() {}
 
     private final class SegmentStream extends InputStream {
