@@ -79,6 +79,15 @@ public final class Cli {
         try (var paths = Files.walk(objects)) {
             for (Path path : paths.filter(Files::isRegularFile).toList()) inspectObject(objects, path, verify, report);
         }
+        Path versions = root.resolve("versions");
+        if (Files.isDirectory(versions)) {
+            try (var paths = Files.walk(versions)) {
+                for (Path path : paths.filter(Files::isRegularFile).toList()) {
+                    if (!path.getFileName().toString().equals("manifest"))
+                        inspectObject(versions, path, verify, report);
+                }
+            }
+        }
         Path multipart = root.resolve("multipart");
         if (Files.isDirectory(multipart)) {
             try (var uploads = Files.list(multipart)) {
@@ -100,7 +109,9 @@ public final class Cli {
             if (meta.key() == null) report.legacyObjects++;
             else {
                 String id = SigV4.hex(SigV4.hash((meta.bucket() + "/" + meta.key()).getBytes(StandardCharsets.UTF_8)));
-                Path expected = objects.resolve(id.substring(0, 2)).resolve(id);
+                Path expected = objects.getFileName().toString().equals("versions")
+                    ? objects.resolve(id.substring(0, 2)).resolve(id).resolve(path.getFileName())
+                    : objects.resolve(id.substring(0, 2)).resolve(id);
                 if (!path.equals(expected)) report.problem("Mismatched object path: " + path);
             }
             if (size - record.headerLength() != meta.length()) {

@@ -16,7 +16,10 @@ Source: [GitHub](https://github.com/LunarSkyOSS/ObjectStore) · [Gitea mirror](h
 - [S3 API support checklist](#s3-api-support-checklist)
 - [Tests](TESTS.md)
 - [Single-node setup](#single-node-setup)
+- [Access keys and ACLs](#access-keys-and-acls)
 - [CLI and tests](#cli-and-tests)
+- [Capability discovery](#capability-discovery)
+- [Java client](#java-client)
 - [Local cluster prototype](#local-cluster-prototype)
 - [Migrating a local cluster](#migrating-a-local-cluster)
 - [Adding a cluster node](#adding-a-cluster-node)
@@ -27,7 +30,7 @@ Source: [GitHub](https://github.com/LunarSkyOSS/ObjectStore) · [Gitea mirror](h
 
 ## Capability checklist
 
-ObjectStore serves one configured bucket.
+ObjectStore creates the configured default bucket at startup. Additional buckets share the configured capacity limit.
 
 - ✅ Persistent single-node storage with checksum verification
 - ✅ Configurable per-object and total logical size limits
@@ -35,26 +38,34 @@ ObjectStore serves one configured bucket.
 - ✅ Local cluster prototype with stable node IDs and host-aware placement code
 - ✅ Opt-in automatic repair, rebalance, and guarded garbage collection in the local cluster
 - ✅ Metadata backup and tested restore to a separate local PostgreSQL instance
+- ✅ Manual [two-machine durability and metadata-restore drill](tests/two-host/README.md)
 - ⬜ Production multi-server deployment and metadata failover
 
 New objects retain their content type and key. Objects written by the earlier single-node format remain readable, but cannot appear in listings until overwritten because their original keys were not stored.
 
 ## S3 API support checklist
 
-- ✅ Header-based AWS Signature Version 4 authentication
+- ✅ Header-based and presigned-query AWS Signature Version 4 authentication
 - ✅ `PutObject`, `GetObject`, `HeadObject`, and `DeleteObject` in both modes
 - ✅ Single-range GET and `ListObjectsV2` in both modes
 - ✅ SHA-256 payload verification and `x-amz-checksum-sha256` in both modes
-- ✅ `Content-MD5` and CRC32, CRC32C, SHA-1, SHA-256, SHA-512, and MD5 checksum headers on `PutObject` and `UploadPart`
+- ✅ `Content-MD5` and CRC32, CRC32C, CRC64NVME, XXHash64, XXHash3, XXHash128, SHA-1, SHA-256, SHA-512, and MD5 checksum headers on `PutObject` and `UploadPart`
 - ✅ `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, and `AbortMultipartUpload` in both modes
 - ✅ `ListParts` and `ListMultipartUploads` in both modes
-- ⬜ Presigned URLs and streaming Signature V4 uploads
-- ✅ `CopyObject` within the configured bucket, with `COPY` and `REPLACE` content-type behavior
-- ⬜ CRC64NVME and XXHash checksums, checksum trailers, and persisted non-SHA-256 checksum metadata
-- ⬜ Bucket creation and listing, object versioning, ACLs, tags, and user metadata
+- ✅ Presigned URLs and signed streaming Signature V4 uploads, including signed checksum trailers
+- ✅ `CreateBucket`, `HeadBucket`, `DeleteBucket`, and `ListBuckets` in both modes
+- ✅ `CopyObject` across owned buckets, with `COPY` and `REPLACE` content-type and user-metadata behavior
+- ✅ User metadata on object and multipart uploads; object tags on upload, copy, and the tagging subresource
+- ✅ CRC64NVME and XXHash checksums, checksum trailers, and persisted object checksum metadata
+- ✅ Bucket versioning with retained versions, delete markers, and version-specific reads, copies, deletes, and tags in both modes
+- ✅ Basic bucket and object ACL grants, public reads, and multiple access-key identities
+- ⬜ Full AWS ACL ownership controls, email grantees, and bucket policies
 
 This is an S3 API subset, not full AWS S3 compatibility. Unsupported S3 operations and Amazon-specific headers are rejected.
-Checksum values are validated before an object or part is published. Non-SHA-256 checksums are returned on upload but are not stored for later reads. Copies use the existing object size limit and do not support cross-bucket or versioned sources.
+Buckets use the same three-to-63-character lowercase names as the configured default bucket. The default bucket cannot be deleted through the API. Bucket creation currently accepts the empty-body request used for the configured region. Tags do not control access.
+Versioning supports enabled and suspended states, historical object versions, null versions, and delete markers. Retained versions count toward the capacity limit. Deleting a specific version is permanent. Lifecycle expiration, MFA Delete, and `ListObjectVersions` delimiter grouping are not supported yet.
+User metadata values currently accept printable ASCII only; non-ASCII metadata header encoding is not yet supported.
+Checksums supplied with `PutObject` are validated before publication and retained across restarts, copies, and object versions. When no checksum is supplied, ObjectStore calculates and stores CRC64NVME, including for completed multipart uploads. Request `x-amz-checksum-mode: ENABLED` on `GetObject` or `HeadObject` to receive the stored checksum. `UploadPart` checksums are validated but are not yet returned by `ListParts` or combined into a multipart checksum; the completed object's CRC64NVME covers its full content. Presigned URLs use query Signature V4 with a maximum seven-day expiry. Streaming uploads support signed `aws-chunked` payloads and one signed checksum trailer. Temporary credentials and other streaming payload modes remain unsupported. Copies use the existing object size limit.
 
 ## Single-node setup
 
@@ -70,6 +81,14 @@ Port 9000 binds to localhost. Data stays in the `object-data` Docker volume. `do
 
 The standalone defaults are 128 MiB per object and 2 GiB total. Set `MAX_OBJECT_BYTES` and `MAX_TOTAL_BYTES` in `.env` to change them. Incomplete multipart uploads consume space until aborted.
 
+## Access keys and ACLs
+
+`S3_ACCESS_KEY` is the owner identity. Its secret is `S3_SECRET_KEY`. Additional keys are optional: place one `ACCESSKEY:secret` pair per line in a file mounted read-only inside the container, and set `S3_CREDENTIALS_FILE=/run/secrets/s3-credentials` in the environment file. Use a Compose override to mount an absolute host path at `/run/secrets/s3-credentials` for the `objectstore` service (or `gateway` in cluster mode). Each access key needs 16–128 alphanumeric characters and each secret at least 32 characters. A restart loads changes to that file. Keep it outside Git and protect it as a secret. Additional identities have no access until the owner grants it.
+
+The owner can send `x-amz-acl: public-read` or signed `x-amz-grant-*` headers on bucket creation, object uploads, copies, and multipart initiation. `GET` and `PUT ?acl` support bucket and object ACLs; a PUT accepts either signed grant headers with an empty body or an XML `AccessControlPolicy`. A grantee ID is its configured access key. Supported permissions are `READ`, `WRITE`, `READ_ACP`, `WRITE_ACP`, and `FULL_CONTROL`. The `AllUsers` group is limited to `READ`; `AuthenticatedUsers` is also recognized. Anonymous reads work only where `AllUsers` has a read grant. Replacing an object starts with a private ACL unless the new upload supplies grants; older version ACLs remain attached to their versions.
+
+This is a deliberately limited ACL subset. The configured owner owns every bucket and object. A `WRITE_ACP` grantee can change an object ACL only on a retained, non-null version; updates to current unversioned and null versions require the owner key. List-versions, multipart inspection, tagging, versioning controls, bucket creation/deletion, and the capability endpoint remain owner-only. There are no IAM policies, email grantees, Object Ownership modes, Block Public Access settings, or temporary credentials. Granting public bucket `READ` exposes object names through `ListObjectsV2`; granting public object `READ` exposes that object's bytes. Review those grants before exposing a gateway to the internet.
+
 ## CLI and tests
 
 From the server shell, run the CLI inside the running container from the directory containing `compose.yaml`:
@@ -82,7 +101,19 @@ docker compose exec objectstore objectstore version
 
 The startup log shows the LunarSky banner, version, and a small storage summary (`docker compose logs --tail=20 objectstore`). `status` reports object and multipart usage. `verify` also checks stored payload hashes and exits nonzero on an error. Both commands can run while the service is live; they are not a snapshot or a backup.
 
+## Capability discovery
+
+ObjectStore provides a signed `GET /_objectstore/capabilities` endpoint. Use the same header-based Signature V4 authentication as the S3 API. It returns JSON with `schemaVersion: 1`, the service and software version, storage mode, supported operation names, and configured limits. The endpoint does not disclose credentials or cluster topology. The response has `Cache-Control: no-store` because limits can change after a restart.
+
+`operations` lists implemented API operations, not every AWS option for each operation or the caller's authorization to use them. `limits.maxObjectBytes` applies to a completed object and to each uploaded part; `limits.maxTotalBytes` is the logical storage limit; `limits.maxParts` is 10,000. Future schema version 1 responses may add fields. Clients should ignore unknown fields and treat unknown operation names as unsupported by their own implementation. This endpoint is an ObjectStore extension; a missing endpoint on another S3-compatible service does not prove that a feature is unavailable.
+
 Run `sh scripts/test.sh` with JDK 21 to test from source. See [TESTS.md](TESTS.md) for coverage, the disposable Docker cluster suite, and the limits of those tests.
+
+The server includes [hash4j](https://github.com/dynatrace-oss/hash4j) for streaming XXHash checksums. Its Apache-2.0 license is included at [lib/LICENSE.hash4j](lib/LICENSE.hash4j).
+
+## Java client
+
+The [JDK-only Java client](client/README.md) works with ObjectStore and other S3-compatible endpoints. It supports object transfers, listing, multipart uploads, and read-only capability discovery. An [AWT image manager](client/examples/README.md) provides a small desktop example. Run `bash client/scripts/build.sh` to produce its JAR and Javadoc locally.
 
 ## Local cluster prototype
 
@@ -129,6 +160,14 @@ sh scripts/backup-cluster-metadata.sh /path/to/cluster.env /path/to/metadata.dum
 The maintenance service is opt-in. It repairs missing or corrupt replicas and rebalances them every 60 seconds by default. Set `CLUSTER_MAINTENANCE_INTERVAL_SECONDS` to change the interval. The `gc` command is a dry run; use `gc --apply` only after checking its candidate count and keeping independent backups. Cleanup records each orphan on one pass and waits at least `CLUSTER_GC_MIN_AGE_SECONDS` before deleting it on a later pass. The default age is 14 days. To permit deletion, set `CLUSTER_BACKUP_RETENTION_SECONDS` to your actual backup retention in seconds; it must be at least one day and shorter than the cleanup age. Scheduled cleanup also requires `CLUSTER_GC_ENABLED=true` on the maintenance service. The backup command writes a verified PostgreSQL archive with private file permissions. Restore it to a separate database and point a gateway at that database only after validating the restore. A backup restore is manual recovery, not automatic failover.
 
 ## Limits and safety
+
+Public-client limits are **disabled by default**. The localhost Compose setup is unchanged. For an endpoint that accepts external clients, set one or both of `PUBLIC_REQUESTS_PER_SECOND` and `PUBLIC_BYTES_PER_SECOND` to a positive number in `.env`. The first limits requests per client IP with a token bucket; the second paces upload and download bytes through one shared per-IP budget. `PUBLIC_REQUEST_BURST` and `PUBLIC_BYTE_BURST` default to one second of their respective rates. `PUBLIC_MAX_IN_FLIGHT_PER_IP` defaults to 8 when either rate is enabled. Requests above the rate or concurrency limit receive S3 `503 SlowDown` and `Retry-After: 1`; an admitted transfer is paced rather than cut off. These are per-gateway limits, not cluster-wide quotas. The existing 16-request gateway cap and storage limits still apply.
+
+For example, to start with 100 requests per second and 16 MiB/s combined upload and download per IP, set `PUBLIC_REQUESTS_PER_SECOND=100` and `PUBLIC_BYTES_PER_SECOND=16777216`. Both start with a one-second burst. Adjust these numbers after measuring the actual workload; do not copy them as a universal production policy.
+
+ObjectStore uses the socket peer as the client IP and ignores forwarded-IP headers by default. If a reverse proxy sits between external clients and ObjectStore, set `PUBLIC_TRUSTED_PROXY_IPS` to the exact IP address that ObjectStore sees for that proxy and configure the proxy to **replace** `X-Real-IP` with its actual client IP. A request from that trusted peer without exactly one valid numeric `X-Real-IP` is rejected. Do not trust an address reachable by arbitrary clients, and preserve the original `Host` header for Signature V4. In Docker, the proxy's address as seen by the container may be a bridge address rather than `127.0.0.1`. If proxy trust is not configured, all clients behind that proxy share its budget; this is safe from header spoofing but may throttle them together.
+
+Enable these limits only on a deliberately public endpoint. They also apply to direct localhost storage calls to that same endpoint; leave them disabled for the local-only setup or run a separate local-only instance if local storage calls must be exempt. A direct loopback `/health` probe without a forwarded-IP header remains exempt. The byte limit is aggregate ingress plus egress for each IP, and several users behind one NAT share it. If a proxy buffers complete uploads before forwarding them, the upload byte limit controls proxy-to-ObjectStore traffic, not the client's initial upload speed; disable request buffering when end-to-end upload pacing is required. It is a fairness control, not a defense against connection floods before the Java handler runs. Put an internet-facing proxy or firewall in front of the gateway for TLS, connection limits, request timeouts, and buffering controls. Do not expose storage nodes or PostgreSQL publicly.
 
 The local cluster has no automatic metadata failover, private-network TLS, scoped credentials, or physical host verification. Garbage collection can remove data required by an older metadata backup, so its retention guard is essential. Host UUIDs are operator labels, not proof that machines have separate power, disks, or network paths. Keep `CLUSTER_LOCAL_DEV=true` limited to local tests.
 

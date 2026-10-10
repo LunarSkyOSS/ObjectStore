@@ -14,6 +14,8 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 final class NodeClient {
     record Node(UUID id, UUID hostId, URI url) {}
@@ -25,6 +27,10 @@ final class NodeClient {
     private final String token;
     private final String repairToken;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+    private final ConcurrentHashMap<UUID, Long> unreadableUntil = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, Long> healthyUntil = new ConcurrentHashMap<>();
+    private static final long READ_RETRY_NANOS = TimeUnit.SECONDS.toNanos(5);
+    private static final long HEALTH_FRESH_NANOS = TimeUnit.SECONDS.toNanos(3);
 
     NodeClient(List<Node> nodes, String token, String repairToken) {
         if (nodes.isEmpty() || nodes.stream().map(Node::id).distinct().count() != nodes.size() ||
@@ -97,12 +103,31 @@ final class NodeClient {
         for (int i = 0; i < nodes.size(); i++) {
             Node node = nodes.get(i);
             NodeIdentity actual = probeIfAvailable(node.url(), token);
-            if (actual == null) continue;
-            if (actual.nodeId().equals(node.id()) && actual.hostId().equals(node.hostId()))
-                healthy.add(faultDomain(i, testNodeDomains));
+            if (actual == null || !actual.nodeId().equals(node.id()) || !actual.hostId().equals(node.hostId())) {
+                markUnreadable(node);
+                continue;
+            }
+            unreadableUntil.remove(node.id());
+            healthyUntil.put(node.id(), System.nanoTime() + HEALTH_FRESH_NANOS);
+            healthy.add(faultDomain(i, testNodeDomains));
             if (healthy.size() >= required) return true;
         }
         return false;
+    }
+
+    private void markUnreadable(Node node) {
+        healthyUntil.remove(node.id());
+        unreadableUntil.put(node.id(), System.nanoTime() + READ_RETRY_NANOS);
+    }
+
+    private boolean unreadable(Node node) {
+        Long until = unreadableUntil.get(node.id());
+        return until != null && System.nanoTime() - until < 0;
+    }
+
+    private boolean recentlyHealthy(Node node) {
+        Long until = healthyUntil.get(node.id());
+        return until != null && System.nanoTime() - until < 0;
     }
 
     void put(int index, UUID id, byte[] data, byte[] sha256) throws IOException {
@@ -132,18 +157,39 @@ final class NodeClient {
     byte[] get(int index, UUID id, int length, byte[] sha256) throws IOException {
         if (length < 1 || length > ClusterNode.MAX_SEGMENT) throw new IOException("Invalid segment length");
         Node node = nodes.get(index);
+        if (unreadable(node)) throw new IOException("Storage node is temporarily unreachable");
+        if (!recentlyHealthy(node)) {
+            NodeIdentity actual = probeIfAvailable(node.url(), token);
+            if (actual == null || !actual.nodeId().equals(node.id()) || !actual.hostId().equals(node.hostId())) {
+                markUnreadable(node);
+                throw new IOException("Storage node is temporarily unreachable");
+            }
+            healthyUntil.put(node.id(), System.nanoTime() + HEALTH_FRESH_NANOS);
+        }
         HttpRequest request = HttpRequest.newBuilder(node.url().resolve("/segments/" + id))
             .timeout(Duration.ofSeconds(30)).header("X-Cluster-Token", token)
             .header("X-Cluster-Expected-Node", node.id().toString()).GET().build();
-        HttpResponse<InputStream> response = send(request, HttpResponse.BodyHandlers.ofInputStream());
-        try (InputStream body = response.body()) {
-            if (response.statusCode() != 200)
-                throw new IOException("Node " + node.id() + " has no verified copy of segment " + id);
-            byte[] bytes = body.readNBytes(length + 1);
-            if (bytes.length != length || !MessageDigest.isEqual(SigV4.hash(bytes), sha256))
-                throw new IOException("Node " + node.id() + " has no verified copy of segment " + id);
-            return bytes;
+        HttpResponse<InputStream> response;
+        try { response = send(request, HttpResponse.BodyHandlers.ofInputStream()); }
+        catch (IOException error) {
+            markUnreadable(node);
+            throw error;
         }
+        if (response.statusCode() != 200) {
+            response.body().close();
+            throw new IOException("Node " + node.id() + " has no verified copy of segment " + id);
+        }
+        byte[] bytes;
+        try (InputStream body = response.body()) { bytes = body.readNBytes(length + 1); }
+        catch (IOException error) {
+            markUnreadable(node);
+            throw error;
+        }
+        if (bytes.length != length || !MessageDigest.isEqual(SigV4.hash(bytes), sha256))
+            throw new IOException("Node " + node.id() + " has no verified copy of segment " + id);
+        unreadableUntil.remove(node.id());
+        healthyUntil.put(node.id(), System.nanoTime() + HEALTH_FRESH_NANOS);
+        return bytes;
     }
 
     List<StoredSegment> inventory(int index, String shard, UUID after) throws IOException {

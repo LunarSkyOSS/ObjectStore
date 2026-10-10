@@ -16,11 +16,13 @@ The script compiles the source and test programs into `out/classes`, then runs:
 
 | Test | Checks |
 | --- | --- |
-| `StoreTest` | Signature V4 test vector and tampering, local writes and reads, quotas, restart persistence, multipart recovery, legacy reads, locking, and corruption rejection. |
+| `StoreTest` | Signature V4 and signed-stream vectors, CRC64NVME and XXHash reference vectors, local writes and reads, quotas, restart persistence for objects, checksums, ACLs, attributes, buckets, and versions, multipart recovery, legacy reads, locking, and corruption rejection. |
 | `ConcurrencyTest` | Atomic local overwrites and consistent reads, listings, and deletes during concurrent access. |
-| `HttpTest` | Signed HTTP requests, object operations, same-bucket copies, checksum acceptance and rejection, ranges, listing, and multipart uploads in single-node mode. |
+| `HttpTest` | Signed capability discovery, presigned URLs, streaming uploads and trailers, object and bucket operations, ACL grants with a second access key and public reads, copies, checksum persistence and rejection, ranges, listing, metadata, tags, multipart uploads, and versioning in single-node mode. |
+| `ClientLimitsTest` | Disabled defaults, trusted-proxy address validation, ignored untrusted headers, per-IP request refusal, and paced response bytes. |
 | `ClusterNodeTest` | Node identity and locking, authenticated segment transfers, checksum rejection, repair authorization, inventory and guarded deletion, and restart cleanup. |
 | `CliTest` | Version, status, verification, and a nonzero result for corrupt data. |
+| `ClientTest` and `MultipartClientTest` | Java client request signing, capability discovery, error handling, and multipart operations. |
 
 The script exits nonzero on failure. The test programs use temporary local directories and loopback HTTP ports; they do not use an existing ObjectStore volume.
 
@@ -47,9 +49,13 @@ COMPOSE_PROJECT_NAME=objectstore-tests docker compose --env-file /tmp/objectstor
 
 If port 9001 is occupied, set `CLUSTER_HOST_PORT` to the same free port in both the environment file and the shell before running the script. The script reads that port from the shell; Compose reads it from the file.
 
-The Docker suite checks signed S3 operations, same-bucket copies, upload checksums, multi-segment objects, concurrent overwrites, multipart staging and listings, completion after a gateway restart and node loss, reads and writes with a node stopped, refusal to write without a storage quorum, restart recovery, corrupt-replica repair including staged parts, metadata unavailability, and placement on a newly joined node. It then checks rebalance to the fourth node, automatic repair, garbage collection dry run and delayed deletion, and a metadata backup restored to a separate PostgreSQL instance while the primary is stopped. It also checks that containers labeled as one physical host cannot satisfy the normal host quorum. Its local-only override permits the remaining phases to use containers as separate test domains.
+The Docker suite checks signed capability discovery and S3 operations, bucket creation and deletion, metadata and tags, public-read ACLs and anonymous access, copies, upload checksums, multi-segment objects, concurrent overwrites, multipart staging and listings, versioned reads and delete markers, versioned multipart completion, completion after a gateway restart and node loss, reads and writes with a node stopped, refusal to write without a storage quorum, restart recovery, corrupt-replica repair including staged parts, metadata unavailability, and placement on a newly joined node. It then checks rebalance to the fourth node, automatic repair, garbage collection dry run and delayed deletion, and a metadata backup restored to a separate PostgreSQL instance while the primary is stopped. Historical regular and multipart versions are checked after repair and cleanup. It also checks that containers labeled as one physical host cannot satisfy the normal host quorum. Its local-only override permits the remaining phases to use containers as separate test domains.
 
 `ClusterMigrationTest` is a separate legacy-format fixture and is **not** run by either test script. Do not run its `create` phase against a populated metadata database. The migration procedure is in the [README](README.md#migrating-a-local-cluster).
+
+## Two-machine durability drill
+
+The [manual two-machine drill](tests/two-host/README.md) uses machine A and machine B with disposable volumes. It records acknowledged writes during a machine interruption, checks reads and write rejection with either storage machine unavailable, restarts test containers during writes, and restores a metadata backup on machine B. This drill is not part of `scripts/test.sh` because it requires two machines and a coordinated interruption.
 
 ## What these tests do not prove
 

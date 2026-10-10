@@ -21,7 +21,7 @@ final class SchemaMigrator {
                     result.next();
                     version = result.getInt(1);
                 }
-                if (version > 4) throw new IOException("Metadata schema is newer than this ObjectStore build");
+                if (version > 10) throw new IOException("Metadata schema is newer than this ObjectStore build");
                 if (version < 1) {
                     statement.execute("CREATE TABLE IF NOT EXISTS cluster_usage (bucket text PRIMARY KEY, used_bytes bigint NOT NULL CHECK (used_bytes >= 0))");
                     statement.execute("CREATE TABLE IF NOT EXISTS cluster_objects (bucket text NOT NULL, object_key text COLLATE \"C\" NOT NULL, generation uuid NOT NULL, length bigint NOT NULL, modified bigint NOT NULL, etag text NOT NULL, sha256 bytea NOT NULL, content_type text NOT NULL, PRIMARY KEY (bucket, object_key))");
@@ -47,10 +47,67 @@ final class SchemaMigrator {
                     statement.execute("CREATE TABLE cluster_gc_candidates (node_id uuid NOT NULL, segment_id uuid NOT NULL, observed_mtime bigint NOT NULL, first_seen bigint NOT NULL, PRIMARY KEY (node_id, segment_id))");
                     statement.execute("INSERT INTO cluster_schema_migrations VALUES (4)");
                 }
+                if (version < 5) {
+                    statement.execute("ALTER TABLE cluster_objects ADD COLUMN user_metadata bytea");
+                    statement.execute("ALTER TABLE cluster_objects ADD COLUMN tags bytea");
+                    statement.execute("ALTER TABLE cluster_uploads ADD COLUMN user_metadata bytea");
+                    statement.execute("ALTER TABLE cluster_uploads ADD COLUMN tags bytea");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (5)");
+                }
+                if (version < 6) {
+                    statement.execute("CREATE TABLE cluster_buckets (name text PRIMARY KEY, created_at bigint NOT NULL)");
+                    statement.execute("INSERT INTO cluster_buckets SELECT DISTINCT bucket, " +
+                        "CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS bigint) FROM cluster_usage");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (6)");
+                }
+                if (version < 7) {
+                    statement.execute("ALTER TABLE cluster_buckets ADD COLUMN versioning_state text NOT NULL " +
+                        "DEFAULT 'NEVER' CHECK (versioning_state IN ('NEVER', 'ENABLED', 'SUSPENDED'))");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (7)");
+                }
+                if (version < 8) {
+                    statement.execute("CREATE TABLE cluster_object_versions (sequence bigint GENERATED ALWAYS AS IDENTITY, " +
+                        "bucket text NOT NULL, object_key text COLLATE \"C\" NOT NULL, version_id text NOT NULL, " +
+                        "delete_marker boolean NOT NULL, generation uuid, length bigint, modified bigint NOT NULL, " +
+                        "etag text, sha256 bytea, content_type text, user_metadata bytea, tags bytea, " +
+                        "PRIMARY KEY (bucket, object_key, version_id), " +
+                        "CHECK (delete_marker = (generation IS NULL)))");
+                    statement.execute("CREATE INDEX cluster_versions_order ON cluster_object_versions " +
+                        "(bucket, object_key, sequence DESC)");
+                    statement.execute("CREATE TABLE cluster_object_heads (bucket text NOT NULL, " +
+                        "object_key text COLLATE \"C\" NOT NULL, version_id text NOT NULL, " +
+                        "PRIMARY KEY (bucket, object_key), " +
+                        "FOREIGN KEY (bucket, object_key, version_id) REFERENCES cluster_object_versions " +
+                        "(bucket, object_key, version_id) DEFERRABLE INITIALLY DEFERRED)");
+                    statement.execute("INSERT INTO cluster_object_versions " +
+                        "(bucket, object_key, version_id, delete_marker, generation, length, modified, etag, " +
+                        "sha256, content_type, user_metadata, tags) " +
+                        "SELECT bucket, object_key, 'null', false, generation, length, modified, etag, sha256, " +
+                        "content_type, user_metadata, tags FROM cluster_objects");
+                    statement.execute("INSERT INTO cluster_object_heads " +
+                        "SELECT bucket, object_key, 'null' FROM cluster_objects");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (8)");
+                }
+                if (version < 9) {
+                    statement.execute("ALTER TABLE cluster_object_versions ADD COLUMN checksum_metadata bytea");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (9)");
+                }
+                if (version < 10) {
+                    statement.execute("ALTER TABLE cluster_buckets ADD COLUMN acl bytea");
+                    statement.execute("ALTER TABLE cluster_object_versions ADD COLUMN acl bytea");
+                    statement.execute("ALTER TABLE cluster_uploads ADD COLUMN acl bytea");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (10)");
+                }
                 statement.execute("INSERT INTO cluster_format SELECT 1, CASE WHEN EXISTS (SELECT 1 FROM cluster_segments WHERE replica_ids IS NULL) THEN 1 ELSE 2 END WHERE NOT EXISTS (SELECT 1 FROM cluster_format)");
             }
             try (PreparedStatement insert = connection.prepareStatement("INSERT INTO cluster_usage VALUES (?, 0) ON CONFLICT DO NOTHING")) {
                 insert.setString(1, bucket);
+                insert.executeUpdate();
+            }
+            try (PreparedStatement insert = connection.prepareStatement(
+                "INSERT INTO cluster_buckets (name, created_at) VALUES (?, ?) ON CONFLICT DO NOTHING")) {
+                insert.setString(1, bucket);
+                insert.setLong(2, System.currentTimeMillis());
                 insert.executeUpdate();
             }
             int format;

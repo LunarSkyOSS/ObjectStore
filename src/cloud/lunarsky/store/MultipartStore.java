@@ -8,12 +8,16 @@ import cloud.lunarsky.store.MultipartStorage.Part;
 
 final class MultipartStore implements MultipartStorage {
     private static final int MAGIC = 0x4c534d50;
+    private static final int MAGIC_V2 = 0x4c534d51;
+    private static final int MAGIC_V3 = 0x4c534d52;
     private final DiskStore store;
     private final Path root;
     private long staged;
     private int active;
 
-    private record Upload(String bucket, String key, String contentType) {}
+    private record Upload(String bucket, String key, String contentType,
+                          Map<String, String> userMetadata, Map<String, String> tags,
+                          Map<String, String> acl) {}
 
     MultipartStore(DiskStore store) throws IOException {
         this.store = store;
@@ -42,17 +46,29 @@ final class MultipartStore implements MultipartStorage {
         if (staged > store.maxTotal()) throw new IOException("Multipart staging limit exceeded");
     }
 
-    public synchronized String create(String bucket, String key, String contentType) throws IOException {
+    public synchronized String create(String bucket, String key, String contentType,
+                                      Map<String, String> userMetadata, Map<String, String> tags,
+                                      Map<String, String> acl) throws IOException {
+        if (Files.exists(store.root().resolve("buckets.bin"))) store.bucket(bucket);
         if (active >= 32) throw new StoreException(503, "SlowDown", "Too many active uploads");
         String id = UUID.randomUUID().toString();
         Path pending = root.resolve(".creating-" + id), dir = root.resolve(id);
         Files.createDirectory(pending);
         try {
             try (var output = new DataOutputStream(Files.newOutputStream(pending.resolve("manifest"), StandardOpenOption.CREATE_NEW))) {
-                output.writeInt(MAGIC);
+                output.writeInt(MAGIC_V3);
                 output.writeUTF(bucket);
                 output.writeUTF(key);
                 output.writeUTF(contentType);
+                byte[] custom = ObjectAttributes.encode(userMetadata, 4096);
+                byte[] encodedTags = ObjectAttributes.encode(tags, 8192);
+                output.writeShort(custom.length);
+                output.write(custom);
+                output.writeShort(encodedTags.length);
+                output.write(encodedTags);
+                byte[] encodedAcl = ObjectAttributes.encode(acl, 2048);
+                output.writeShort(encodedAcl.length);
+                output.write(encodedAcl);
             }
             try (var channel = java.nio.channels.FileChannel.open(pending.resolve("manifest"), StandardOpenOption.READ)) {
                 channel.force(true);
@@ -109,7 +125,7 @@ final class MultipartStore implements MultipartStorage {
             }
             if (count != length) throw new StoreException(400, "IncompleteBody", "Part length does not match Content-Length");
             byte[] actual = sha.digest();
-            if (!MessageDigest.isEqual(actual, HexFormat.of().parseHex(expectedHash)))
+            if (expectedHash != null && !MessageDigest.isEqual(actual, HexFormat.of().parseHex(expectedHash)))
                 throw new StoreException(400, "XAmzContentSHA256Mismatch", "Part hash mismatch");
             if (checksum != null && !Base64.getEncoder().encodeToString(actual).equals(checksum))
                 throw new StoreException(400, "BadDigest", "SHA-256 checksum mismatch");
@@ -153,8 +169,9 @@ final class MultipartStore implements MultipartStorage {
         }
         ObjectStorage.Metadata result;
         try (InputStream input = new PartsInput(paths)) {
+            Upload upload = readUpload(dir);
             result = store.put(bucket, key, input, total, SigV4.hex(sha.digest()), null, false,
-                readUpload(dir).contentType());
+                upload.contentType(), upload.userMetadata(), upload.tags(), Map::of, upload.acl());
         }
         remove(dir);
         return result;
@@ -217,8 +234,14 @@ final class MultipartStore implements MultipartStorage {
     }
     private static Upload readUpload(Path dir) throws IOException {
         try (var input = new DataInputStream(Files.newInputStream(dir.resolve("manifest")))) {
-            if (input.readInt() != MAGIC) throw new IOException("Invalid multipart upload manifest");
-            Upload upload = new Upload(input.readUTF(), input.readUTF(), input.readUTF());
+            int magic = input.readInt();
+            if (magic != MAGIC && magic != MAGIC_V2 && magic != MAGIC_V3)
+                throw new IOException("Invalid multipart upload manifest");
+            String bucket = input.readUTF(), key = input.readUTF(), type = input.readUTF();
+            Map<String, String> custom = magic != MAGIC ? ObjectAttributes.decode(input.readNBytes(input.readUnsignedShort())) : Map.of();
+            Map<String, String> tags = magic != MAGIC ? ObjectAttributes.decode(input.readNBytes(input.readUnsignedShort())) : Map.of();
+            Map<String, String> acl = magic == MAGIC_V3 ? ObjectAttributes.decode(input.readNBytes(input.readUnsignedShort())) : Map.of();
+            Upload upload = new Upload(bucket, key, type, custom, tags, acl);
             if (input.read() != -1) throw new IOException("Invalid multipart upload manifest");
             return upload;
         }

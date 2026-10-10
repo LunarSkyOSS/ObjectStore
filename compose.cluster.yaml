@@ -12,8 +12,15 @@ services:
       S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY}
       S3_BUCKET: ${S3_BUCKET:-objects}
       S3_REGION: ${S3_REGION:-us-east-1}
+      S3_CREDENTIALS_FILE: ${S3_CREDENTIALS_FILE:-}
       MAX_OBJECT_BYTES: ${MAX_OBJECT_BYTES:-134217728}
       MAX_TOTAL_BYTES: ${MAX_TOTAL_BYTES:-2147483648}
+      PUBLIC_REQUESTS_PER_SECOND: ${PUBLIC_REQUESTS_PER_SECOND:-0}
+      PUBLIC_REQUEST_BURST: ${PUBLIC_REQUEST_BURST:-}
+      PUBLIC_BYTES_PER_SECOND: ${PUBLIC_BYTES_PER_SECOND:-0}
+      PUBLIC_BYTE_BURST: ${PUBLIC_BYTE_BURST:-}
+      PUBLIC_MAX_IN_FLIGHT_PER_IP: ${PUBLIC_MAX_IN_FLIGHT_PER_IP:-}
+      PUBLIC_TRUSTED_PROXY_IPS: ${PUBLIC_TRUSTED_PROXY_IPS:-}
       CLUSTER_TOKEN: ${CLUSTER_TOKEN:?Set CLUSTER_TOKEN}
       CLUSTER_NODES: ${CLUSTER_NODES:-http://node-a:9100,http://node-b:9100,http://node-c:9100}
       POSTGRES_JDBC_URL: jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10
@@ -31,7 +38,7 @@ services:
       node-c:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/ready"]
+      test: ["CMD", "wget", "-qO-", "--header", "X-Real-IP: 127.0.0.1", "http://127.0.0.1:9000/ready"]
       interval: 10s
       timeout: 4s
       retries: 3

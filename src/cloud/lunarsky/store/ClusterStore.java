@@ -23,13 +23,15 @@ import java.util.HexFormat;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
 final class ClusterStore implements ObjectStorage, MultipartStorage {
     private record Segment(UUID id, int length, byte[] hash, List<UUID> replicas) {}
     private record RepairTarget(UUID id, int part, int ordinal, long version, Segment segment) {}
-    private record Upload(String contentType) {}
+    private record Upload(String contentType, Map<String, String> userMetadata,
+                          Map<String, String> tags, Map<String, String> acl) {}
     private record StoredPart(long length, String etag, List<Segment> segments) {}
     record RepairReport(int scanned, int restored, int rebalanced, int underReplicated, int unrecoverable) {}
     record GcReport(int scanned, int eligible, int deleted, int unavailableNodes) {}
@@ -59,6 +61,168 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
 
     private Connection connect() throws SQLException { return DriverManager.getConnection(jdbcUrl, user, password); }
 
+    @Override public Limits limits() { return new Limits(maxObject, maxTotal); }
+
+    @Override public void ensureBucket(String bucket) throws IOException {
+        try { bucket(bucket); }
+        catch (StoreException error) {
+            if (error.status != 404) throw error;
+            try { createBucket(bucket); }
+            catch (StoreException created) {
+                if (created.status != 409) throw created;
+            }
+        }
+    }
+
+    @Override public Bucket bucket(String name) throws IOException {
+        try (Connection connection = connect(); PreparedStatement query = connection.prepareStatement(
+            "SELECT created_at, versioning_state, acl FROM cluster_buckets WHERE name=?")) {
+            query.setString(1, name);
+            try (ResultSet result = query.executeQuery()) {
+                if (!result.next()) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+                return new Bucket(name, result.getLong(1), VersioningState.valueOf(result.getString(2)),
+                    ObjectAttributes.decode(result.getBytes(3)));
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public List<Bucket> buckets() throws IOException {
+        List<Bucket> result = new ArrayList<>();
+        try (Connection connection = connect(); var query = connection.createStatement();
+             ResultSet rows = query.executeQuery("SELECT name, created_at, versioning_state, acl FROM cluster_buckets ORDER BY name")) {
+            while (rows.next()) result.add(new Bucket(rows.getString(1), rows.getLong(2),
+                VersioningState.valueOf(rows.getString(3)), ObjectAttributes.decode(rows.getBytes(4))));
+            return result;
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public void setVersioning(String bucket, VersioningState state) throws IOException {
+        if (state == VersioningState.NEVER)
+            throw new StoreException(400, "InvalidArgument", "Versioning cannot be disabled after it is enabled");
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                lockUsage(connection, bucket);
+                VersioningState old = versioningState(connection, bucket);
+                if (old == VersioningState.NEVER && state == VersioningState.SUSPENDED)
+                    throw new StoreException(400, "InvalidArgument", "Enable versioning before suspending it");
+                try (PreparedStatement update = connection.prepareStatement(
+                    "UPDATE cluster_buckets SET versioning_state=? WHERE name=?")) {
+                    update.setString(1, state.name());
+                    update.setString(2, bucket);
+                    update.executeUpdate();
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException error) {
+                connection.rollback();
+                if (error instanceof SQLException sql) throw databaseError(sql);
+                throw error;
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public void setBucketAcl(String bucket, Map<String, String> acl) throws IOException {
+        try (Connection connection = connect(); PreparedStatement update = connection.prepareStatement(
+            "UPDATE cluster_buckets SET acl=? WHERE name=?")) {
+            update.setBytes(1, ObjectAttributes.encode(acl, 2048));
+            update.setString(2, bucket);
+            if (update.executeUpdate() == 0)
+                throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    private static VersioningState versioningState(Connection connection, String bucket) throws SQLException {
+        try (PreparedStatement query = connection.prepareStatement(
+            "SELECT versioning_state FROM cluster_buckets WHERE name=? FOR UPDATE")) {
+            query.setString(1, bucket);
+            try (ResultSet result = query.executeQuery()) {
+                if (!result.next()) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+                return VersioningState.valueOf(result.getString(1));
+            }
+        }
+    }
+
+    private static VersioningState readVersioningState(Connection connection, String bucket) throws SQLException {
+        try (PreparedStatement query = connection.prepareStatement(
+            "SELECT versioning_state FROM cluster_buckets WHERE name=?")) {
+            query.setString(1, bucket);
+            try (ResultSet result = query.executeQuery()) {
+                if (!result.next()) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+                return VersioningState.valueOf(result.getString(1));
+            }
+        }
+    }
+
+    @Override public void createBucket(String name) throws IOException {
+        if (!name.matches("[a-z0-9][a-z0-9-]{1,61}[a-z0-9]"))
+            throw new StoreException(400, "InvalidBucketName", "Invalid bucket name");
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                try (var statement = connection.createStatement()) {
+                    statement.execute("SELECT pg_advisory_xact_lock(6834071092784)");
+                }
+                try (var statement = connection.createStatement();
+                     ResultSet count = statement.executeQuery("SELECT count(*) FROM cluster_buckets")) {
+                    count.next();
+                    if (count.getLong(1) >= 1000)
+                        throw new StoreException(400, "TooManyBuckets", "Bucket limit reached");
+                }
+                try (PreparedStatement insert = connection.prepareStatement(
+                    "INSERT INTO cluster_buckets (name, created_at) VALUES (?, ?) ON CONFLICT DO NOTHING")) {
+                    insert.setString(1, name);
+                    insert.setLong(2, Instant.now().toEpochMilli());
+                    if (insert.executeUpdate() == 0)
+                        throw new StoreException(409, "BucketAlreadyOwnedByYou", "Bucket already exists");
+                }
+                try (PreparedStatement insert = connection.prepareStatement(
+                    "INSERT INTO cluster_usage VALUES (?, 0)")) {
+                    insert.setString(1, name);
+                    insert.executeUpdate();
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException error) {
+                connection.rollback();
+                if (error instanceof SQLException sql) throw databaseError(sql);
+                throw error;
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public void deleteBucket(String name) throws IOException {
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                lockUsage(connection, name);
+                try (PreparedStatement check = connection.prepareStatement(
+                    "SELECT EXISTS (SELECT 1 FROM cluster_object_versions WHERE bucket=?) OR EXISTS " +
+                    "(SELECT 1 FROM cluster_uploads WHERE bucket=?)")) {
+                    check.setString(1, name);
+                    check.setString(2, name);
+                    try (ResultSet result = check.executeQuery()) {
+                        result.next();
+                        if (result.getBoolean(1))
+                            throw new StoreException(409, "BucketNotEmpty", "Bucket contains objects or uploads");
+                    }
+                }
+                try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_buckets WHERE name=?")) {
+                    delete.setString(1, name);
+                    if (delete.executeUpdate() == 0)
+                        throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+                }
+                try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_usage WHERE bucket=?")) {
+                    delete.setString(1, name);
+                    delete.executeUpdate();
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException error) {
+                connection.rollback();
+                if (error instanceof SQLException sql) throw databaseError(sql);
+                throw error;
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
     private static void lockGc(Connection connection, boolean shared) throws SQLException {
         try (var statement = connection.createStatement()) {
             statement.execute("SELECT pg_advisory_lock" + (shared ? "_shared" : "") + "(6834071092783)");
@@ -66,26 +230,33 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     }
 
     @Override public Metadata put(String bucket, String key, InputStream input, long length, String expectedHash,
-                                  String checksum, boolean createOnly, String contentType) throws IOException {
+                                  String checksum, boolean createOnly, String contentType,
+                                  Map<String, String> userMetadata, Map<String, String> tags,
+                                  java.util.function.Supplier<Map<String, String>> checksums,
+                                  Map<String, String> acl) throws IOException {
         validatePut(bucket, length, contentType);
         MessageDigest md5 = digest("MD5");
+        Crc64Nvme crc64 = new Crc64Nvme();
         Path staged = Files.createTempFile("objectstore-cluster-", ".pending");
         try {
-            byte[] fullHash = stageInput(staged, input, length, expectedHash, checksum, md5);
+            byte[] fullHash = stageInput(staged, input, length, expectedHash, checksum, md5, crc64);
+            Map<String, String> suppliedChecksums = checksums.get();
+            Map<String, String> storedChecksums = suppliedChecksums.isEmpty() ?
+                Map.of("x-amz-checksum-crc64nvme", crc64.encoded()) : Map.copyOf(suppliedChecksums);
             checkCapacity(bucket, key, length, createOnly);
             try (Connection connection = connect()) {
                 lockGc(connection, true);
                 List<Segment> segments = uploadSegments(staged, length);
                 Metadata metadata = new Metadata(length, Instant.now().toEpochMilli(),
-                    HexFormat.of().formatHex(md5.digest()), fullHash, bucket, key, contentType);
-                persistObject(connection, metadata, segments, createOnly);
-                return metadata;
+                    HexFormat.of().formatHex(md5.digest()), fullHash, bucket, key, contentType,
+                    Map.copyOf(userMetadata), Map.copyOf(tags), null, storedChecksums, Map.copyOf(acl));
+                return persistObject(connection, metadata, segments, createOnly);
             } catch (SQLException error) { throw databaseError(error); }
         } finally { Files.deleteIfExists(staged); }
     }
 
-    private void validatePut(String bucket, long length, String contentType) {
-        if (!configuredBucket.equals(bucket)) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+    private void validatePut(String bucket, long length, String contentType) throws IOException {
+        bucket(bucket);
         if (length < 0) throw new StoreException(411, "MissingContentLength", "Content-Length is required");
         if (length > maxObject) throw new StoreException(413, "EntityTooLarge", "Object exceeds the configured size limit");
         if (!nodes.availableHostsAtLeast(2, testNodeDomains))
@@ -95,7 +266,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     }
 
     private byte[] stageInput(Path staged, InputStream input, long length, String expectedHash,
-                              String checksum, MessageDigest md5) throws IOException {
+                              String checksum, MessageDigest md5, Crc64Nvme crc64) throws IOException {
         MessageDigest sha = digest("SHA-256");
         try (OutputStream output = Files.newOutputStream(staged)) {
             byte[] buffer = new byte[65536];
@@ -106,13 +277,14 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                 if (count == 0) continue;
                 sha.update(buffer, 0, count);
                 md5.update(buffer, 0, count);
+                crc64.update(buffer, 0, count);
                 output.write(buffer, 0, count);
                 remaining -= count;
             }
         }
         if (input.read() != -1) throw new StoreException(413, "EntityTooLarge", "Payload exceeds declared size");
         byte[] fullHash = sha.digest();
-        if (!HexFormat.of().formatHex(fullHash).equals(expectedHash))
+        if (expectedHash != null && !HexFormat.of().formatHex(fullHash).equals(expectedHash))
             throw new StoreException(400, "XAmzContentSHA256Mismatch", "Payload hash mismatch");
         if (checksum != null && !Base64.getEncoder().encodeToString(fullHash).equals(checksum))
             throw new StoreException(400, "BadDigest", "SHA-256 checksum mismatch");
@@ -121,18 +293,14 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
 
     private void checkCapacity(String bucket, String key, long length, boolean createOnly) throws IOException {
         try (Connection connection = connect()) {
+            bucket(bucket);
             long previous = currentLength(connection, bucket, key);
             if (createOnly && previous >= 0)
                 throw new StoreException(412, "PreconditionFailed", "Object already exists");
-            try (PreparedStatement query = connection.prepareStatement("SELECT used_bytes FROM cluster_usage WHERE bucket=?")) {
-                query.setString(1, bucket);
-                try (ResultSet result = query.executeQuery()) {
-                    if (!result.next()) throw new SQLException("Bucket quota row is missing");
-                    if (maxTotal - (result.getLong(1) - Math.max(0, previous)) -
-                        stagedBytes(connection, bucket) < length)
-                        throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
-                }
-            }
+            long replaced = readVersioningState(connection, bucket) == VersioningState.ENABLED ? 0 :
+                nullVersionLength(connection, bucket, key);
+            if (maxTotal - (occupiedBytes(connection) - replaced) < length)
+                throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
         } catch (SQLException error) { throw databaseError(error); }
     }
 
@@ -170,8 +338,8 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         return segments;
     }
 
-    private void persistObject(Connection connection, Metadata metadata, List<Segment> segments,
-                               boolean createOnly) throws IOException {
+    private Metadata persistObject(Connection connection, Metadata metadata, List<Segment> segments,
+                                   boolean createOnly) throws IOException {
         String bucket = metadata.bucket(), key = metadata.key();
         long length = metadata.length();
         UUID generation = UUID.randomUUID();
@@ -179,11 +347,12 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
             connection.setAutoCommit(false);
             try {
                 long used = lockUsage(connection, bucket);
+                VersioningState state = versioningState(connection, bucket);
                 long previous = currentLength(connection, bucket, key);
                 if (createOnly && previous >= 0)
                     throw new StoreException(412, "PreconditionFailed", "Object already exists");
-                if (maxTotal - (used - Math.max(0, previous)) -
-                    stagedBytes(connection, bucket) < length)
+                long replaced = state == VersioningState.ENABLED ? 0 : nullVersionLength(connection, bucket, key);
+                if (maxTotal - (occupiedBytes(connection) - replaced) < length)
                     throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
                 try (PreparedStatement insert = connection.prepareStatement(
                     "INSERT INTO cluster_segments (generation, ordinal, segment_id, length, sha256, replicas, replica_ids) VALUES (?, ?, ?, ?, ?, 'v2', ?)")) {
@@ -199,22 +368,9 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                     }
                     insert.executeBatch();
                 }
-                try (PreparedStatement update = connection.prepareStatement(
-                    "INSERT INTO cluster_objects VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bucket, object_key) DO UPDATE SET generation=EXCLUDED.generation, length=EXCLUDED.length, modified=EXCLUDED.modified, etag=EXCLUDED.etag, sha256=EXCLUDED.sha256, content_type=EXCLUDED.content_type")) {
-                    bindObject(update, metadata, generation);
-                    update.executeUpdate();
-                }
-                try (PreparedStatement update = connection.prepareStatement("UPDATE cluster_usage SET used_bytes=? WHERE bucket=?")) {
-                    update.setLong(1, used - Math.max(0, previous) + length);
-                    update.setString(2, bucket);
-                    update.executeUpdate();
-                }
-                try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_tombstones WHERE bucket=? AND object_key=?")) {
-                    delete.setString(1, bucket);
-                    delete.setString(2, key);
-                    delete.executeUpdate();
-                }
+                Metadata stored = publishObject(connection, metadata, generation, used, replaced, state);
                 connection.commit();
+                return stored;
             } catch (SQLException | RuntimeException error) {
                 connection.rollback();
                 if (error instanceof SQLException sql) throw databaseError(sql);
@@ -223,8 +379,96 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         } catch (SQLException error) { throw databaseError(error); }
     }
 
-    @Override public String create(String bucket, String key, String contentType) throws IOException {
-        if (!configuredBucket.equals(bucket)) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+    private static long nullVersionLength(Connection connection, String bucket, String key) throws SQLException {
+        try (PreparedStatement query = connection.prepareStatement(
+            "SELECT length FROM cluster_object_versions WHERE bucket=? AND object_key=? AND version_id='null'")) {
+            query.setString(1, bucket);
+            query.setString(2, key);
+            try (ResultSet result = query.executeQuery()) {
+                return result.next() ? result.getLong(1) : 0;
+            }
+        }
+    }
+
+    private Metadata publishObject(Connection connection, Metadata metadata, UUID generation,
+                                   long used, long replaced, VersioningState state) throws SQLException {
+        String bucket = metadata.bucket(), key = metadata.key();
+        String id = state == VersioningState.ENABLED ? UUID.randomUUID().toString() : "null";
+        if (id.equals("null")) {
+            try (PreparedStatement delete = connection.prepareStatement(
+                "DELETE FROM cluster_object_versions WHERE bucket=? AND object_key=? AND version_id='null'")) {
+                delete.setString(1, bucket);
+                delete.setString(2, key);
+                delete.executeUpdate();
+            }
+        }
+        try (PreparedStatement insert = connection.prepareStatement(
+            "INSERT INTO cluster_object_versions (bucket, object_key, version_id, delete_marker, generation, " +
+            "length, modified, etag, sha256, content_type, user_metadata, tags, checksum_metadata, acl) " +
+            "VALUES (?, ?, ?, false, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+            insert.setString(1, bucket);
+            insert.setString(2, key);
+            insert.setString(3, id);
+            insert.setObject(4, generation);
+            insert.setLong(5, metadata.length());
+            insert.setLong(6, metadata.modified());
+            insert.setString(7, metadata.etag());
+            insert.setBytes(8, metadata.sha256());
+            insert.setString(9, metadata.contentType());
+            insert.setBytes(10, ObjectAttributes.encode(metadata.userMetadata(), 4096));
+            insert.setBytes(11, ObjectAttributes.encode(metadata.tags(), 8192));
+            insert.setBytes(12, ObjectAttributes.encode(metadata.checksums(), 512));
+            insert.setBytes(13, ObjectAttributes.encode(metadata.acl(), 2048));
+            insert.executeUpdate();
+        }
+        setHead(connection, bucket, key, id);
+        writeCurrentObject(connection, metadata, generation);
+        try (PreparedStatement update = connection.prepareStatement(
+            "UPDATE cluster_usage SET used_bytes=? WHERE bucket=?")) {
+            update.setLong(1, used - replaced + metadata.length());
+            update.setString(2, bucket);
+            update.executeUpdate();
+        }
+        try (PreparedStatement delete = connection.prepareStatement(
+            "DELETE FROM cluster_tombstones WHERE bucket=? AND object_key=?")) {
+            delete.setString(1, bucket);
+            delete.setString(2, key);
+            delete.executeUpdate();
+        }
+        return new Metadata(metadata.length(), metadata.modified(), metadata.etag(), metadata.sha256(),
+            bucket, key, metadata.contentType(), metadata.userMetadata(), metadata.tags(),
+            state == VersioningState.NEVER ? null : id, metadata.checksums(), metadata.acl());
+    }
+
+    private static void setHead(Connection connection, String bucket, String key, String id) throws SQLException {
+        try (PreparedStatement update = connection.prepareStatement(
+            "INSERT INTO cluster_object_heads VALUES (?, ?, ?) ON CONFLICT (bucket, object_key) " +
+            "DO UPDATE SET version_id=EXCLUDED.version_id")) {
+            update.setString(1, bucket);
+            update.setString(2, key);
+            update.setString(3, id);
+            update.executeUpdate();
+        }
+    }
+
+    private static void writeCurrentObject(Connection connection, Metadata metadata,
+                                           UUID generation) throws SQLException {
+        try (PreparedStatement update = connection.prepareStatement(
+            "INSERT INTO cluster_objects (bucket, object_key, generation, length, modified, etag, sha256, " +
+            "content_type, user_metadata, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+            "ON CONFLICT (bucket, object_key) DO UPDATE SET generation=EXCLUDED.generation, " +
+            "length=EXCLUDED.length, modified=EXCLUDED.modified, etag=EXCLUDED.etag, " +
+            "sha256=EXCLUDED.sha256, content_type=EXCLUDED.content_type, " +
+            "user_metadata=EXCLUDED.user_metadata, tags=EXCLUDED.tags")) {
+            bindObject(update, metadata, generation);
+            update.executeUpdate();
+        }
+    }
+
+    @Override public String create(String bucket, String key, String contentType,
+                                   Map<String, String> userMetadata, Map<String, String> tags,
+                                   Map<String, String> acl) throws IOException {
+        bucket(bucket);
         if (contentType == null || contentType.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 255)
             throw new StoreException(400, "InvalidArgument", "Invalid Content-Type");
         UUID id = UUID.randomUUID();
@@ -241,12 +485,15 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                     }
                 }
                 try (PreparedStatement insert = connection.prepareStatement(
-                    "INSERT INTO cluster_uploads VALUES (?, ?, ?, ?, ?)")) {
+                    "INSERT INTO cluster_uploads (upload_id, bucket, object_key, content_type, created_at, user_metadata, tags, acl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")) {
                     insert.setObject(1, id);
                     insert.setString(2, bucket);
                     insert.setString(3, key);
                     insert.setString(4, contentType);
                     insert.setLong(5, Instant.now().toEpochMilli());
+                    insert.setBytes(6, ObjectAttributes.encode(userMetadata, 4096));
+                    insert.setBytes(7, ObjectAttributes.encode(tags, 8192));
+                    insert.setBytes(8, ObjectAttributes.encode(acl, 2048));
                     insert.executeUpdate();
                 }
                 connection.commit();
@@ -269,7 +516,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         Path staged = Files.createTempFile("objectstore-part-", ".pending");
         MessageDigest md5 = digest("MD5");
         try {
-            stageInput(staged, input, length, expectedHash, checksum, md5);
+            stageInput(staged, input, length, expectedHash, checksum, md5, new Crc64Nvme());
             try (Connection connection = connect()) {
                 lockGc(connection, true);
                 List<Segment> segments = uploadSegments(staged, length);
@@ -279,7 +526,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                     long used = lockUsage(connection, bucket);
                     upload(connection, uploadId, bucket, key, true);
                     long previous = partLength(connection, uploadId, number);
-                    if (maxTotal - used - (stagedBytes(connection, bucket) - previous) < length)
+                    if (maxTotal - (occupiedBytes(connection) - previous) < length)
                         throw new StoreException(507, "InsufficientStorage", "Multipart staging limit reached");
                     try (PreparedStatement insert = connection.prepareStatement(
                         "INSERT INTO cluster_upload_parts VALUES (?, ?, ?, ?, ?) ON CONFLICT (upload_id, part_number) DO UPDATE SET length=EXCLUDED.length, etag=EXCLUDED.etag, modified=EXCLUDED.modified")) {
@@ -330,11 +577,12 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
             connection.setAutoCommit(false);
             try {
                 long used = lockUsage(connection, bucket);
+                VersioningState state = versioningState(connection, bucket);
                 Upload upload = upload(connection, uploadId, bucket, key, true);
-                long staged = stagedBytes(connection, bucket);
                 long uploadBytes = uploadLength(connection, uploadId);
                 MessageDigest fullHash = digest("SHA-256");
                 MessageDigest etagHash = digest("MD5");
+                Crc64Nvme crc64 = new Crc64Nvme();
                 List<Segment> selected = new ArrayList<>();
                 long total = 0;
                 int last = 0;
@@ -353,6 +601,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                         byte[] bytes = readableSegment(segment);
                         if (bytes == null) throw new StoreException(503, "SlowDown", "A part has no verified replica");
                         fullHash.update(bytes);
+                        crc64.update(bytes, 0, bytes.length);
                         partHash.update(bytes);
                         selected.add(segment);
                     }
@@ -361,12 +610,13 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                         throw new StoreException(503, "SlowDown", "A part failed integrity verification");
                     etagHash.update(md5);
                 }
-                long previous = currentLength(connection, bucket, key);
-                if (maxTotal - (used - Math.max(0, previous)) - (staged - uploadBytes) < total)
+                long replaced = state == VersioningState.ENABLED ? 0 : nullVersionLength(connection, bucket, key);
+                if (maxTotal - (occupiedBytes(connection) - replaced - uploadBytes) < total)
                     throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
                 Metadata metadata = new Metadata(total, Instant.now().toEpochMilli(),
                     HexFormat.of().formatHex(etagHash.digest()) + "-" + parts.size(), fullHash.digest(),
-                    bucket, key, upload.contentType());
+                    bucket, key, upload.contentType(), upload.userMetadata(), upload.tags(), null,
+                    Map.of("x-amz-checksum-crc64nvme", crc64.encoded()), upload.acl());
                 UUID generation = UUID.randomUUID();
                 try (PreparedStatement insert = connection.prepareStatement(
                     "INSERT INTO cluster_segments (generation, ordinal, segment_id, length, sha256, replicas, replica_ids) VALUES (?, ?, ?, ?, ?, 'v2', ?)")) {
@@ -382,27 +632,13 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                     }
                     insert.executeBatch();
                 }
-                try (PreparedStatement update = connection.prepareStatement(
-                    "INSERT INTO cluster_objects VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bucket, object_key) DO UPDATE SET generation=EXCLUDED.generation, length=EXCLUDED.length, modified=EXCLUDED.modified, etag=EXCLUDED.etag, sha256=EXCLUDED.sha256, content_type=EXCLUDED.content_type")) {
-                    bindObject(update, metadata, generation);
-                    update.executeUpdate();
-                }
-                try (PreparedStatement update = connection.prepareStatement("UPDATE cluster_usage SET used_bytes=? WHERE bucket=?")) {
-                    update.setLong(1, used - Math.max(0, previous) + total);
-                    update.setString(2, bucket);
-                    update.executeUpdate();
-                }
-                try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_tombstones WHERE bucket=? AND object_key=?")) {
-                    delete.setString(1, bucket);
-                    delete.setString(2, key);
-                    delete.executeUpdate();
-                }
+                Metadata stored = publishObject(connection, metadata, generation, used, replaced, state);
                 try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_uploads WHERE upload_id=?")) {
                     delete.setObject(1, uploadId);
                     delete.executeUpdate();
                 }
                 connection.commit();
-                return metadata;
+                return stored;
             } catch (SQLException | IOException | RuntimeException error) {
                 connection.rollback();
                 if (error instanceof SQLException sql) throw databaseError(sql);
@@ -460,7 +696,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     }
 
     @Override public List<UploadInfo> listUploads(String bucket, String prefix) throws IOException {
-        if (!configuredBucket.equals(bucket)) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+        bucket(bucket);
         List<UploadInfo> uploads = new ArrayList<>();
         try (Connection connection = connect(); PreparedStatement query = connection.prepareStatement(
             "SELECT upload_id, object_key, created_at FROM cluster_uploads WHERE bucket=?")) {
@@ -494,6 +730,10 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     }
 
     @Override public OpenObject open(String bucket, String key) throws IOException {
+        return open(bucket, key, null);
+    }
+
+    @Override public OpenObject open(String bucket, String key, String versionId) throws IOException {
         try (Connection connection = connect()) {
             connection.setAutoCommit(false);
             connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
@@ -502,14 +742,32 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                 Metadata metadata;
                 UUID generation;
                 try (PreparedStatement query = connection.prepareStatement(
-                    "SELECT generation, length, modified, etag, sha256, content_type FROM cluster_objects WHERE bucket=? AND object_key=?")) {
+                    versionId == null ?
+                    "SELECT v.version_id, v.delete_marker, v.generation, v.length, v.modified, v.etag, " +
+                    "v.sha256, v.content_type, v.user_metadata, v.tags, v.checksum_metadata, v.acl FROM cluster_object_heads h " +
+                    "JOIN cluster_object_versions v ON v.bucket=h.bucket AND v.object_key=h.object_key " +
+                    "AND v.version_id=h.version_id WHERE h.bucket=? AND h.object_key=?" :
+                    "SELECT version_id, delete_marker, generation, length, modified, etag, sha256, " +
+                    "content_type, user_metadata, tags, checksum_metadata, acl FROM cluster_object_versions WHERE bucket=? " +
+                    "AND object_key=? AND version_id=?")) {
                     query.setString(1, bucket);
                     query.setString(2, key);
+                    if (versionId != null) query.setString(3, versionId);
                     try (ResultSet result = query.executeQuery()) {
-                        if (!result.next()) throw new StoreException(404, "NoSuchKey", "Object not found");
-                        generation = (UUID) result.getObject(1);
-                        metadata = new Metadata(result.getLong(2), result.getLong(3), result.getString(4),
-                            result.getBytes(5), bucket, key, result.getString(6));
+                        if (!result.next()) throw new StoreException(404,
+                            versionId == null ? "NoSuchKey" : "NoSuchVersion", "Object version not found");
+                        if (result.getBoolean(2))
+                            throw StoreException.deletedVersion(result.getString(1), result.getLong(5),
+                                versionId != null);
+                        generation = (UUID) result.getObject(3);
+                        String storedId = result.getString(1);
+                        boolean unversioned = versionId == null && storedId.equals("null") &&
+                            readVersioningState(connection, bucket) == VersioningState.NEVER;
+                        metadata = new Metadata(result.getLong(4), result.getLong(5), result.getString(6),
+                            result.getBytes(7), bucket, key, result.getString(8),
+                            ObjectAttributes.decode(result.getBytes(9)), ObjectAttributes.decode(result.getBytes(10)),
+                            unversioned ? null : storedId, ObjectAttributes.decode(result.getBytes(11)),
+                            ObjectAttributes.decode(result.getBytes(12)));
                     }
                 }
                 List<Segment> parts = new ArrayList<>();
@@ -539,30 +797,253 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     }
 
     @Override public void delete(String bucket, String key) throws IOException {
+        delete(bucket, key, null);
+    }
+
+    @Override public DeleteResult delete(String bucket, String key, String versionId) throws IOException {
         try (Connection connection = connect()) {
             connection.setAutoCommit(false);
             try {
                 long used = lockUsage(connection, bucket);
-                long previous = currentLength(connection, bucket, key);
-                try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_objects WHERE bucket=? AND object_key=?")) {
-                    delete.setString(1, bucket);
-                    delete.setString(2, key);
-                    delete.executeUpdate();
+                VersioningState state = versioningState(connection, bucket);
+                long removedLength = 0;
+                boolean removedMarker = false;
+                String resultId = null;
+                if (versionId != null) {
+                    try (PreparedStatement query = connection.prepareStatement(
+                        "SELECT delete_marker, length FROM cluster_object_versions WHERE bucket=? " +
+                        "AND object_key=? AND version_id=?")) {
+                        query.setString(1, bucket);
+                        query.setString(2, key);
+                        query.setString(3, versionId);
+                        try (ResultSet result = query.executeQuery()) {
+                            if (!result.next())
+                                throw new StoreException(404, "NoSuchVersion", "Object version not found");
+                            removedMarker = result.getBoolean(1);
+                            removedLength = removedMarker ? 0 : result.getLong(2);
+                        }
+                    }
+                    removeVersionRow(connection, bucket, key, versionId);
+                    refreshCurrent(connection, bucket, key);
+                    resultId = versionId;
+                } else if (state == VersioningState.NEVER) {
+                    removedLength = nullVersionLength(connection, bucket, key);
+                    removeVersionRow(connection, bucket, key, "null");
+                    refreshCurrent(connection, bucket, key);
+                } else {
+                    resultId = state == VersioningState.ENABLED ? UUID.randomUUID().toString() : "null";
+                    if (state == VersioningState.SUSPENDED) {
+                        removedLength = nullVersionLength(connection, bucket, key);
+                        removeVersionRow(connection, bucket, key, "null");
+                    }
+                    try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO cluster_object_versions (bucket, object_key, version_id, " +
+                        "delete_marker, modified) VALUES (?, ?, ?, true, ?)")) {
+                        insert.setString(1, bucket);
+                        insert.setString(2, key);
+                        insert.setString(3, resultId);
+                        insert.setLong(4, Instant.now().toEpochMilli());
+                        insert.executeUpdate();
+                    }
+                    setHead(connection, bucket, key, resultId);
+                    removeCurrentObject(connection, bucket, key);
+                    recordTombstone(connection, bucket, key);
                 }
                 try (PreparedStatement update = connection.prepareStatement(
-                    "INSERT INTO cluster_tombstones VALUES (?, ?, ?, ?) ON CONFLICT (bucket, object_key) DO UPDATE SET generation=EXCLUDED.generation, deleted_at=EXCLUDED.deleted_at")) {
-                    update.setString(1, bucket);
-                    update.setString(2, key);
-                    update.setObject(3, UUID.randomUUID());
-                    update.setLong(4, Instant.now().toEpochMilli());
+                    "UPDATE cluster_usage SET used_bytes=? WHERE bucket=?")) {
+                    update.setLong(1, used - removedLength);
+                    update.setString(2, bucket);
                     update.executeUpdate();
                 }
-                if (previous >= 0) {
-                    try (PreparedStatement update = connection.prepareStatement("UPDATE cluster_usage SET used_bytes=? WHERE bucket=?")) {
-                        update.setLong(1, used - previous);
-                        update.setString(2, bucket);
-                        update.executeUpdate();
+                connection.commit();
+                return new DeleteResult(resultId, versionId == null && state != VersioningState.NEVER || removedMarker);
+            } catch (SQLException | IOException | RuntimeException error) {
+                connection.rollback();
+                if (error instanceof SQLException sql) throw databaseError(sql);
+                if (error instanceof IOException io) throw io;
+                throw error;
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    private static void removeVersionRow(Connection connection, String bucket, String key,
+                                         String versionId) throws SQLException {
+        try (PreparedStatement delete = connection.prepareStatement(
+            "DELETE FROM cluster_object_versions WHERE bucket=? AND object_key=? AND version_id=?")) {
+            delete.setString(1, bucket);
+            delete.setString(2, key);
+            delete.setString(3, versionId);
+            delete.executeUpdate();
+        }
+    }
+
+    private static void removeCurrentObject(Connection connection, String bucket, String key) throws SQLException {
+        try (PreparedStatement delete = connection.prepareStatement(
+            "DELETE FROM cluster_objects WHERE bucket=? AND object_key=?")) {
+            delete.setString(1, bucket);
+            delete.setString(2, key);
+            delete.executeUpdate();
+        }
+    }
+
+    private static void recordTombstone(Connection connection, String bucket, String key) throws SQLException {
+        try (PreparedStatement update = connection.prepareStatement(
+            "INSERT INTO cluster_tombstones VALUES (?, ?, ?, ?) ON CONFLICT (bucket, object_key) " +
+            "DO UPDATE SET generation=EXCLUDED.generation, deleted_at=EXCLUDED.deleted_at")) {
+            update.setString(1, bucket);
+            update.setString(2, key);
+            update.setObject(3, UUID.randomUUID());
+            update.setLong(4, Instant.now().toEpochMilli());
+            update.executeUpdate();
+        }
+    }
+
+    private static void refreshCurrent(Connection connection, String bucket, String key)
+        throws SQLException, IOException {
+        try (PreparedStatement latest = connection.prepareStatement(
+            "SELECT version_id, delete_marker, generation, length, modified, etag, sha256, " +
+            "content_type, user_metadata, tags FROM cluster_object_versions WHERE bucket=? " +
+            "AND object_key=? ORDER BY sequence DESC LIMIT 1")) {
+            latest.setString(1, bucket);
+            latest.setString(2, key);
+            try (ResultSet result = latest.executeQuery()) {
+                if (!result.next()) {
+                    try (PreparedStatement delete = connection.prepareStatement(
+                        "DELETE FROM cluster_object_heads WHERE bucket=? AND object_key=?")) {
+                        delete.setString(1, bucket);
+                        delete.setString(2, key);
+                        delete.executeUpdate();
                     }
+                    removeCurrentObject(connection, bucket, key);
+                    recordTombstone(connection, bucket, key);
+                    return;
+                }
+                setHead(connection, bucket, key, result.getString(1));
+                if (result.getBoolean(2)) {
+                    removeCurrentObject(connection, bucket, key);
+                    recordTombstone(connection, bucket, key);
+                } else {
+                    Metadata metadata = new Metadata(result.getLong(4), result.getLong(5),
+                        result.getString(6), result.getBytes(7), bucket, key, result.getString(8),
+                        ObjectAttributes.decode(result.getBytes(9)), ObjectAttributes.decode(result.getBytes(10)));
+                    writeCurrentObject(connection, metadata, (UUID) result.getObject(3));
+                    try (PreparedStatement delete = connection.prepareStatement(
+                        "DELETE FROM cluster_tombstones WHERE bucket=? AND object_key=?")) {
+                        delete.setString(1, bucket);
+                        delete.setString(2, key);
+                        delete.executeUpdate();
+                    }
+                }
+            }
+        }
+    }
+
+    @Override public Map<String, String> tags(String bucket, String key) throws IOException {
+        return tags(bucket, key, null);
+    }
+
+    @Override public Map<String, String> tags(String bucket, String key, String versionId) throws IOException {
+        try (Connection connection = connect(); PreparedStatement query = connection.prepareStatement(
+            versionId == null ? "SELECT v.tags, v.delete_marker FROM cluster_object_heads h " +
+                "JOIN cluster_object_versions v ON v.bucket=h.bucket AND v.object_key=h.object_key " +
+                "AND v.version_id=h.version_id WHERE h.bucket=? AND h.object_key=?" :
+                "SELECT tags, delete_marker FROM cluster_object_versions WHERE bucket=? AND object_key=? " +
+                "AND version_id=?")) {
+            query.setString(1, bucket);
+            query.setString(2, key);
+            if (versionId != null) query.setString(3, versionId);
+            try (ResultSet result = query.executeQuery()) {
+                if (!result.next() || result.getBoolean(2))
+                    throw new StoreException(404, versionId == null ? "NoSuchKey" : "NoSuchVersion",
+                        "Object version not found");
+                return ObjectAttributes.decode(result.getBytes(1));
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public void setTags(String bucket, String key, Map<String, String> tags) throws IOException {
+        setTags(bucket, key, null, tags);
+    }
+
+    @Override public void setTags(String bucket, String key, String versionId,
+                                  Map<String, String> tags) throws IOException {
+        byte[] encoded = ObjectAttributes.encode(tags, 8192);
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                lockUsage(connection, bucket);
+                String selected = versionId;
+                if (selected == null) {
+                    try (PreparedStatement head = connection.prepareStatement(
+                        "SELECT version_id FROM cluster_object_heads WHERE bucket=? AND object_key=?")) {
+                        head.setString(1, bucket);
+                        head.setString(2, key);
+                        try (ResultSet result = head.executeQuery()) {
+                            if (!result.next()) throw new StoreException(404, "NoSuchKey", "Object not found");
+                            selected = result.getString(1);
+                        }
+                    }
+                }
+                try (PreparedStatement update = connection.prepareStatement(
+                    "UPDATE cluster_object_versions SET tags=? WHERE bucket=? AND object_key=? " +
+                    "AND version_id=? AND NOT delete_marker")) {
+                    update.setBytes(1, encoded);
+                    update.setString(2, bucket);
+                    update.setString(3, key);
+                    update.setString(4, selected);
+                    if (update.executeUpdate() == 0)
+                        throw new StoreException(404, versionId == null ? "NoSuchKey" : "NoSuchVersion",
+                            "Object version not found");
+                }
+                try (PreparedStatement update = connection.prepareStatement(
+                    "UPDATE cluster_objects SET tags=? WHERE bucket=? AND object_key=? AND EXISTS " +
+                    "(SELECT 1 FROM cluster_object_heads WHERE bucket=? AND object_key=? AND version_id=?)")) {
+                    update.setBytes(1, encoded);
+                    update.setString(2, bucket);
+                    update.setString(3, key);
+                    update.setString(4, bucket);
+                    update.setString(5, key);
+                    update.setString(6, selected);
+                    update.executeUpdate();
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException error) {
+                connection.rollback();
+                if (error instanceof SQLException sql) throw databaseError(sql);
+                throw error;
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public void setObjectAcl(String bucket, String key, String versionId,
+                                       Map<String, String> acl) throws IOException {
+        byte[] encoded = ObjectAttributes.encode(acl, 2048);
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                lockUsage(connection, bucket);
+                String selected = versionId;
+                if (selected == null) {
+                    try (PreparedStatement head = connection.prepareStatement(
+                        "SELECT version_id FROM cluster_object_heads WHERE bucket=? AND object_key=?")) {
+                        head.setString(1, bucket);
+                        head.setString(2, key);
+                        try (ResultSet result = head.executeQuery()) {
+                            if (!result.next()) throw new StoreException(404, "NoSuchKey", "Object not found");
+                            selected = result.getString(1);
+                        }
+                    }
+                }
+                try (PreparedStatement update = connection.prepareStatement(
+                    "UPDATE cluster_object_versions SET acl=? WHERE bucket=? AND object_key=? " +
+                    "AND version_id=? AND NOT delete_marker")) {
+                    update.setBytes(1, encoded);
+                    update.setString(2, bucket);
+                    update.setString(3, key);
+                    update.setString(4, selected);
+                    if (update.executeUpdate() == 0)
+                        throw new StoreException(404, versionId == null ? "NoSuchKey" : "NoSuchVersion",
+                            "Object version not found");
                 }
                 connection.commit();
             } catch (SQLException | RuntimeException error) {
@@ -590,6 +1071,61 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
             connection.commit();
             return page;
         } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public VersionPage listVersions(String bucket, String prefix, String keyMarker,
+                                              String versionMarker, int maxKeys) throws IOException {
+        if (versionMarker != null && keyMarker == null)
+            throw new StoreException(400, "InvalidArgument", "Version marker requires a key marker");
+        bucket(bucket);
+        if (maxKeys == 0) return new VersionPage(List.of(), null, null, false);
+        List<VersionEntry> page = new ArrayList<>();
+        String nextKey = null, nextVersion = null;
+        boolean truncated = false;
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try (PreparedStatement query = connection.prepareStatement(
+                "SELECT v.object_key, v.version_id, v.delete_marker, v.length, v.modified, v.etag, " +
+                "v.sha256, v.content_type, v.user_metadata, v.tags, h.version_id=v.version_id, " +
+                "v.checksum_metadata " +
+                "FROM cluster_object_versions v LEFT JOIN cluster_object_heads h ON " +
+                "h.bucket=v.bucket AND h.object_key=v.object_key WHERE v.bucket=? AND v.object_key>=? " +
+                "ORDER BY v.object_key, v.sequence DESC")) {
+                query.setString(1, bucket);
+                query.setString(2, keyMarker != null && keyMarker.compareTo(prefix) > 0 ? keyMarker : prefix);
+                query.setFetchSize(128);
+                try (ResultSet rows = query.executeQuery()) {
+                    boolean pastMarker = versionMarker == null;
+                    while (rows.next()) {
+                        String key = rows.getString(1), id = rows.getString(2);
+                        if (!key.startsWith(prefix)) break;
+                        if (keyMarker != null && key.compareTo(keyMarker) < 0) continue;
+                        if (keyMarker != null && key.compareTo(keyMarker) > 0) pastMarker = true;
+                        if (keyMarker != null && key.equals(keyMarker)) {
+                            if (versionMarker == null) continue;
+                            if (!pastMarker) {
+                                if (id.equals(versionMarker)) pastMarker = true;
+                                continue;
+                            }
+                        }
+                        if (page.size() == maxKeys) {
+                            truncated = true;
+                            break;
+                        }
+                        boolean marker = rows.getBoolean(3);
+                        Metadata metadata = marker ? null : new Metadata(rows.getLong(4), rows.getLong(5),
+                            rows.getString(6), rows.getBytes(7), bucket, key, rows.getString(8),
+                            ObjectAttributes.decode(rows.getBytes(9)), ObjectAttributes.decode(rows.getBytes(10)),
+                            id, ObjectAttributes.decode(rows.getBytes(12)));
+                        page.add(new VersionEntry(key, id, rows.getLong(5), marker, rows.getBoolean(11), metadata));
+                        nextKey = key;
+                        nextVersion = id;
+                    }
+                }
+            }
+            connection.commit();
+        } catch (SQLException error) { throw databaseError(error); }
+        return new VersionPage(page, truncated ? nextKey : null, truncated ? nextVersion : null, truncated);
     }
 
     private static ListPage readListPage(ResultSet result, String bucket, String prefix, String delimiter,
@@ -631,12 +1167,24 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     }
 
     private long lockUsage(Connection connection, String bucket) throws SQLException {
+        try (var statement = connection.createStatement()) {
+            statement.execute("SELECT pg_advisory_xact_lock(6834071092784)");
+        }
         try (PreparedStatement query = connection.prepareStatement("SELECT used_bytes FROM cluster_usage WHERE bucket=? FOR UPDATE")) {
             query.setString(1, bucket);
             try (ResultSet result = query.executeQuery()) {
-                if (!result.next()) throw new SQLException("Bucket quota row is missing");
+                if (!result.next()) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
                 return result.getLong(1);
             }
+        }
+    }
+
+    private static long occupiedBytes(Connection connection) throws SQLException {
+        try (var statement = connection.createStatement(); ResultSet result = statement.executeQuery(
+            "SELECT (SELECT COALESCE(sum(used_bytes), 0) FROM cluster_usage) + " +
+            "(SELECT COALESCE(sum(length), 0) FROM cluster_upload_parts)")) {
+            result.next();
+            return result.getLong(1);
         }
     }
 
@@ -650,15 +1198,16 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     }
 
     private static Upload upload(Connection connection, UUID id, String bucket, String key, boolean lock)
-            throws SQLException {
-        String sql = "SELECT bucket, object_key, content_type, created_at FROM cluster_uploads WHERE upload_id=?" +
+            throws SQLException, IOException {
+        String sql = "SELECT bucket, object_key, content_type, created_at, user_metadata, tags, acl FROM cluster_uploads WHERE upload_id=?" +
             (lock ? " FOR UPDATE" : "");
         try (PreparedStatement query = connection.prepareStatement(sql)) {
             query.setObject(1, id);
             try (ResultSet result = query.executeQuery()) {
                 if (!result.next() || !result.getString(1).equals(bucket) || !result.getString(2).equals(key))
                     throw new StoreException(404, "NoSuchUpload", "Upload not found");
-                return new Upload(result.getString(3));
+                return new Upload(result.getString(3), ObjectAttributes.decode(result.getBytes(5)),
+                    ObjectAttributes.decode(result.getBytes(6)), ObjectAttributes.decode(result.getBytes(7)));
             }
         }
     }
@@ -755,6 +1304,8 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         update.setString(6, data.etag());
         update.setBytes(7, data.sha256());
         update.setString(8, data.contentType());
+        update.setBytes(9, ObjectAttributes.encode(data.userMetadata(), 4096));
+        update.setBytes(10, ObjectAttributes.encode(data.tags(), 8192));
     }
     private static List<UUID> replicaIds(ResultSet result, int column) throws SQLException, IOException {
         java.sql.Array value = result.getArray(column);
@@ -809,7 +1360,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
             }
             try (PreparedStatement query = reader.prepareStatement(
                 "SELECT s.generation, 0, s.ordinal, s.segment_id, s.length, s.sha256, s.replica_ids, s.placement_version " +
-                "FROM cluster_segments s JOIN cluster_objects o ON o.generation=s.generation " +
+                "FROM cluster_segments s JOIN cluster_object_versions o ON o.generation=s.generation " +
                 "UNION ALL SELECT s.upload_id, s.part_number, s.ordinal, s.segment_id, s.length, s.sha256, " +
                 "s.replica_ids, s.placement_version FROM cluster_upload_segments s " +
                 "ORDER BY 1, 2, 3")) {
@@ -924,7 +1475,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
             }
             lockGc(connection, false);
             try (PreparedStatement referenced = connection.prepareStatement(
-                "SELECT EXISTS (SELECT 1 FROM cluster_segments s JOIN cluster_objects o " +
+                "SELECT EXISTS (SELECT 1 FROM cluster_segments s JOIN cluster_object_versions o " +
                 "ON o.generation=s.generation WHERE s.segment_id=? AND ?=ANY(s.replica_ids) " +
                 "UNION ALL SELECT 1 FROM cluster_upload_segments s " +
                 "WHERE s.segment_id=? AND ?=ANY(s.replica_ids))");

@@ -44,6 +44,21 @@ public final class CliTest {
             int status = Cli.run(new String[]{"verify"}, root, new PrintStream(output), new PrintStream(output));
             if (status != 1 || !output.toString().contains("Object checksum mismatch"))
                 throw new AssertionError("CLI missed corrupted payload");
+            Path versionRoot = root.resolve("versioned");
+            try (var store = new DiskStore(versionRoot, 100, 1000)) {
+                store.createBucket("versioned-bucket");
+                store.setVersioning("versioned-bucket", ObjectStorage.VersioningState.ENABLED);
+                for (byte[] body : new byte[][]{"first".getBytes(StandardCharsets.UTF_8),
+                    "second".getBytes(StandardCharsets.UTF_8)}) {
+                    store.put("versioned-bucket", "example", new ByteArrayInputStream(body), body.length,
+                        SigV4.hex(SigV4.hash(body)), null, false, "text/plain");
+                }
+                output.reset();
+                status = Cli.run(new String[]{"verify"}, versionRoot,
+                    new PrintStream(output), new PrintStream(output));
+                if (status != 0 || !output.toString().contains("verified_objects=2"))
+                    throw new AssertionError("CLI did not inspect retained versions");
+            }
             System.out.println("CLI tests passed: version, live status, verification, corruption exit code");
         } finally {
             try (var paths = Files.walk(root)) {

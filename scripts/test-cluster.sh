@@ -14,7 +14,7 @@ trap restore EXIT
 compose up -d --build
 run_phase() {
   compose exec -T gateway java --add-modules jdk.httpserver,java.net.http \
-    -cp /app:/app/postgresql.jar cloud.lunarsky.store.ClusterIntegrationTest "$1"
+    -cp /app:/app/postgresql.jar:/app/hash4j.jar cloud.lunarsky.store.ClusterIntegrationTest "$1"
 }
 wait_ready() {
   attempt=0
@@ -115,6 +115,7 @@ printf '%s\n' "$first_gc" | grep -q '^segments_deleted=0$'
 second_gc=$(compose run --rm -T gc --apply)
 printf '%s\n' "$second_gc" | grep -q '^segments_deleted=[1-9]'
 run_phase recovered
+python3 scripts/test-cluster-http.py "$env_file" version-survivor
 run_phase verify-expanded
 backup_dir=$(mktemp -d)
 sh scripts/backup-cluster-metadata.sh "$env_file" "$backup_dir/metadata.dump"
@@ -125,7 +126,7 @@ compose stop metadata
 compose run --rm -T --no-deps \
   -e 'POSTGRES_JDBC_URL=jdbc:postgresql://metadata-recovery:5432/objectstore?connectTimeout=3&socketTimeout=10' \
   --entrypoint java gateway --add-modules jdk.httpserver,java.net.http \
-  -cp /app:/app/postgresql.jar cloud.lunarsky.store.ClusterIntegrationTest recovered
+  -cp /app:/app/postgresql.jar:/app/hash4j.jar cloud.lunarsky.store.ClusterIntegrationTest recovered
 compose start metadata
 wait_ready
 echo 'Cluster failure tests passed'

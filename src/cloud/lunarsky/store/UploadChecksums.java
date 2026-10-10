@@ -41,8 +41,16 @@ final class UploadChecksums {
             encoded = SigV4.single(headers, name);
         }
         String selected = SigV4.single(headers, "x-amz-sdk-checksum-algorithm");
-        if (selected != null && (algorithm == null || !selected.equals(algorithm.name())))
-            throw new StoreException(400, "InvalidRequest", "Checksum algorithm and value must match");
+        if (selected != null) {
+            String trailer = SigV4.single(headers, "x-amz-trailer");
+            if (algorithm == null && trailer != null) {
+                Algorithm declared = algorithm(trailer);
+                if (!selected.equals(declared.name()))
+                    throw new StoreException(400, "InvalidRequest", "Checksum algorithm and trailer must match");
+            } else if (algorithm == null || !selected.equals(algorithm.name())) {
+                throw new StoreException(400, "InvalidRequest", "Checksum algorithm and value must match");
+            }
+        }
         byte[] expected = algorithm == null ? null : decode(encoded, algorithm.length());
         return new UploadChecksums(contentMd5, algorithm, expected, encoded);
     }
@@ -51,6 +59,10 @@ final class UploadChecksums {
         return switch (header) {
             case "x-amz-checksum-crc32" -> new Algorithm("CRC32", header, 4);
             case "x-amz-checksum-crc32c" -> new Algorithm("CRC32C", header, 4);
+            case "x-amz-checksum-crc64nvme" -> new Algorithm("CRC64NVME", header, 8);
+            case "x-amz-checksum-xxhash64" -> new Algorithm("XXHASH64", header, 8);
+            case "x-amz-checksum-xxhash3" -> new Algorithm("XXHASH3", header, 8);
+            case "x-amz-checksum-xxhash128" -> new Algorithm("XXHASH128", header, 16);
             case "x-amz-checksum-sha1" -> new Algorithm("SHA1", header, 20);
             case "x-amz-checksum-sha256" -> new Algorithm("SHA256", header, 32);
             case "x-amz-checksum-sha512" -> new Algorithm("SHA512", header, 64);
@@ -69,6 +81,10 @@ final class UploadChecksums {
 
     String sha256() {
         return algorithm != null && algorithm.name().equals("SHA256") ? encoded : null;
+    }
+
+    java.util.Map<String, String> metadata() {
+        return algorithm == null ? java.util.Map.of() : java.util.Map.of(algorithm.header(), encoded);
     }
 
     void response(Headers headers) {
@@ -91,8 +107,11 @@ final class UploadChecksums {
         private final Checksum crc = algorithm == null ? null : switch (algorithm.name()) {
             case "CRC32" -> new CRC32();
             case "CRC32C" -> new CRC32C();
+            case "CRC64NVME" -> new Crc64Nvme();
             default -> null;
         };
+        private final XxHashes xxhash = algorithm != null && algorithm.name().startsWith("XXHASH")
+            ? new XxHashes(algorithm.name()) : null;
         private boolean checked;
 
         private VerifiedInput(InputStream input) { super(input); }
@@ -115,6 +134,7 @@ final class UploadChecksums {
             if (md5 != null) md5.update(bytes, offset, length);
             if (hash != null) hash.update(bytes, offset, length);
             if (crc != null) crc.update(bytes, offset, length);
+            if (xxhash != null) xxhash.update(bytes, offset, length);
         }
 
         private void verify() {
@@ -127,9 +147,13 @@ final class UploadChecksums {
             byte[] actual;
             if (crc != null) {
                 long value = crc.getValue();
-                actual = new byte[]{(byte) (value >>> 24), (byte) (value >>> 16),
-                    (byte) (value >>> 8), (byte) value};
+                actual = new byte[algorithm.length()];
+                for (int i = actual.length - 1; i >= 0; i--) {
+                    actual[i] = (byte) value;
+                    value >>>= 8;
+                }
             } else if (algorithm.name().equals("MD5")) actual = actualMd5;
+            else if (xxhash != null) actual = xxhash.digest();
             else actual = hash.digest();
             if (!MessageDigest.isEqual(expected, actual))
                 throw new StoreException(400, "BadDigest", algorithm.name() + " checksum mismatch");

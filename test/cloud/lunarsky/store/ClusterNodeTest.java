@@ -138,7 +138,25 @@ public final class ClusterNodeTest {
                 throw new AssertionError("Oversized segment response was accepted");
             } catch (IOException expected) { }
         } finally { oversized.stop(0); }
-        System.out.println("Cluster node tests passed: lock, authenticated roundtrip, checksums, restart cleanup");
+        URI stopped = URI.create("http://127.0.0.1:" + oversized.getAddress().getPort());
+        NodeClient readOnly = new NodeClient(List.of(new NodeClient.Node(nodeId, hostId, stopped)), token, null);
+        try {
+            readOnly.get(0, id, value.length, SigV4.hash(value));
+            throw new AssertionError("Read-only access did not detect a stopped node");
+        } catch (IOException expected) {
+            require(expected.getMessage().contains("temporarily unreachable"),
+                "Read-only access did not use the short health probe");
+        }
+        NodeClient offline = new NodeClient(List.of(new NodeClient.Node(nodeId, hostId, stopped)), token, null);
+        require(!offline.availableHostsAtLeast(1, false), "Stopped node was reported healthy");
+        try {
+            offline.get(0, id, value.length, SigV4.hash(value));
+            throw new AssertionError("Stopped node was read after a failed health check");
+        } catch (IOException expected) {
+            require(expected.getMessage().contains("temporarily unreachable"),
+                "Read did not skip a recently failed node");
+        }
+        System.out.println("Cluster node tests passed: lock, authenticated roundtrip, checksums, restart cleanup, outage fallback");
     }
     private static void require(boolean condition, String message) {
         if (!condition) throw new AssertionError(message);
