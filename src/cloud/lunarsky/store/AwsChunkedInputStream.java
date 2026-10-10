@@ -105,42 +105,51 @@ final class AwsChunkedInputStream extends FilterInputStream {
         catch (NumberFormatException error) { throw invalid("Invalid signed chunk size"); }
         if (chunkLeft > decodedLength - decoded) throw invalid("Signed chunks exceed decoded length");
         chunkHash.reset();
-        if (chunkLeft == 0) {
-            finishChunk();
-            if (decoded != decodedLength) throw invalid("Decoded length mismatch");
-            if (trailerName == null) {
-                if (!line().isEmpty()) throw invalid("Invalid signed chunk ending");
-            } else {
-                String trailer = line();
-                if (!trailer.startsWith(trailerName + ":")) throw invalid("Missing signed checksum trailer");
-                trailerValue = trailer.substring(trailerName.length() + 1);
-                byte[] actual;
-                if (trailerCrc != null) {
-                    long value = trailerCrc.getValue();
-                    actual = new byte[trailerName.equals("x-amz-checksum-crc64nvme") ? 8 : 4];
-                    for (int i = actual.length - 1; i >= 0; i--) {
-                        actual[i] = (byte) value;
-                        value >>>= 8;
-                    }
-                } else actual = trailerXxhash != null ? trailerXxhash.digest() : trailerHash.digest();
-                if (!Base64.getEncoder().encodeToString(actual).equals(trailerValue))
-                    throw new StoreException(400, "BadDigest", "Checksum trailer mismatch");
-                String signature = line();
-                if (!signature.matches("x-amz-trailer-signature=[0-9a-f]{64}"))
-                    throw invalid("Missing trailer signature");
-                String toSign = "AWS4-HMAC-SHA256-TRAILER\n" + authorization.date() + "\n" +
-                    authorization.scope() + "\n" + previousSignature + "\n" +
-                    SigV4.hex(SigV4.hash((trailerName + ":" + trailerValue + "\n")
-                        .getBytes(StandardCharsets.UTF_8)));
-                String expected = SigV4.hex(SigV4.hmac(authorization.signingKey(), toSign));
-                if (!MessageDigest.isEqual(expected.getBytes(StandardCharsets.US_ASCII),
-                    signature.substring(24).getBytes(StandardCharsets.US_ASCII)))
-                    throw invalid("Trailer signature mismatch");
-                if (!line().isEmpty()) throw invalid("Invalid trailer ending");
-            }
-            if (in.read() != -1) throw invalid("Extra bytes after signed payload");
-            finished = true;
+        if (chunkLeft == 0) finishPayload();
+    }
+
+    private void finishPayload() throws IOException {
+        finishChunk();
+        if (decoded != decodedLength) throw invalid("Decoded length mismatch");
+        if (trailerName == null) {
+            if (!line().isEmpty()) throw invalid("Invalid signed chunk ending");
+        } else {
+            verifyTrailer();
         }
+        if (in.read() != -1) throw invalid("Extra bytes after signed payload");
+        finished = true;
+    }
+
+    private void verifyTrailer() throws IOException {
+        String trailer = line();
+        if (!trailer.startsWith(trailerName + ":")) throw invalid("Missing signed checksum trailer");
+        trailerValue = trailer.substring(trailerName.length() + 1);
+        if (!Base64.getEncoder().encodeToString(trailerChecksum()).equals(trailerValue))
+            throw new StoreException(400, "BadDigest", "Checksum trailer mismatch");
+        String signature = line();
+        if (!signature.matches("x-amz-trailer-signature=[0-9a-f]{64}"))
+            throw invalid("Missing trailer signature");
+        String toSign = "AWS4-HMAC-SHA256-TRAILER\n" + authorization.date() + "\n" +
+            authorization.scope() + "\n" + previousSignature + "\n" +
+            SigV4.hex(SigV4.hash((trailerName + ":" + trailerValue + "\n")
+                .getBytes(StandardCharsets.UTF_8)));
+        String expected = SigV4.hex(SigV4.hmac(authorization.signingKey(), toSign));
+        if (!MessageDigest.isEqual(expected.getBytes(StandardCharsets.US_ASCII),
+            signature.substring(24).getBytes(StandardCharsets.US_ASCII)))
+            throw invalid("Trailer signature mismatch");
+        if (!line().isEmpty()) throw invalid("Invalid trailer ending");
+    }
+
+    private byte[] trailerChecksum() {
+        if (trailerCrc == null)
+            return trailerXxhash != null ? trailerXxhash.digest() : trailerHash.digest();
+        long value = trailerCrc.getValue();
+        byte[] actual = new byte[trailerName.equals("x-amz-checksum-crc64nvme") ? 8 : 4];
+        for (int i = actual.length - 1; i >= 0; i--) {
+            actual[i] = (byte) value;
+            value >>>= 8;
+        }
+        return actual;
     }
 
     private void finishChunk() throws IOException {

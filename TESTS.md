@@ -28,7 +28,7 @@ The script exits nonzero on failure. The test programs use temporary local direc
 
 ## Disposable Docker cluster tests
 
-Requires Docker with Compose, Python 3, `curl`, and a free local port 9001. Make a test-only environment file from `.env.cluster.example` and fill in all five blank credentials with test-only values. Keep that file private and out of Git.
+Requires Docker with Compose, Python 3.9 or newer, `curl`, and a free local port 9001. Make a test-only environment file from `.env.cluster.example` and fill in all five blank credentials with test-only values. Keep that file private and out of Git.
 
 ```sh
 cp .env.cluster.example /tmp/objectstore-cluster-tests.env

@@ -114,29 +114,7 @@ final class ClientLimits {
         if (exchange.getRemoteAddress().getAddress().isLoopbackAddress() &&
             exchange.getRequestHeaders().get("X-Real-IP") == null &&
             path.equals("/health")) return null;
-        String address = address(exchange);
-        Client client;
-        synchronized (this) {
-            long now = System.nanoTime();
-            if (++admissions % 1024 == 0 || clients.size() >= MAX_CLIENTS)
-                clients.entrySet().removeIf(entry -> entry.getValue().inFlight == 0 &&
-                    now - entry.getValue().lastSeen > IDLE_NANOS);
-            client = clients.get(address);
-            if (client == null) {
-                if (clients.size() >= MAX_CLIENTS)
-                    throw new StoreException(503, "SlowDown", "Client limit table is full");
-                client = new Client(now, requestBurst, byteBurst);
-                clients.put(address, client);
-            }
-            refill(client, now);
-            client.lastSeen = now;
-            if (maxInFlight > 0 && client.inFlight >= maxInFlight)
-                throw new StoreException(503, "SlowDown", "Too many concurrent requests from this client");
-            if (requestsPerSecond > 0 && client.requestTokens < 1)
-                throw new StoreException(503, "SlowDown", "Client request rate exceeded");
-            if (requestsPerSecond > 0) client.requestTokens--;
-            client.inFlight++;
-        }
+        Client client = admit(address(exchange));
         if (bytesPerSecond > 0) {
             try {
                 exchange.setStreams(new LimitedInput(exchange.getRequestBody(), client),
@@ -146,6 +124,30 @@ final class ClientLimits {
                 throw error;
             }
         }
+        return client;
+    }
+
+    private synchronized Client admit(String address) {
+        Client client;
+        long now = System.nanoTime();
+        if (++admissions % 1024 == 0 || clients.size() >= MAX_CLIENTS)
+            clients.entrySet().removeIf(entry -> entry.getValue().inFlight == 0 &&
+                now - entry.getValue().lastSeen > IDLE_NANOS);
+        client = clients.get(address);
+        if (client == null) {
+            if (clients.size() >= MAX_CLIENTS)
+                throw new StoreException(503, "SlowDown", "Client limit table is full");
+            client = new Client(now, requestBurst, byteBurst);
+            clients.put(address, client);
+        }
+        refill(client, now);
+        client.lastSeen = now;
+        if (maxInFlight > 0 && client.inFlight >= maxInFlight)
+            throw new StoreException(503, "SlowDown", "Too many concurrent requests from this client");
+        if (requestsPerSecond > 0 && client.requestTokens < 1)
+            throw new StoreException(503, "SlowDown", "Client request rate exceeded");
+        if (requestsPerSecond > 0) client.requestTokens--;
+        client.inFlight++;
         return client;
     }
 

@@ -22,10 +22,29 @@ port = int(values.get("CLUSTER_HOST_PORT", "9001"))
 if not 1 <= port <= 65535:
     raise ValueError("CLUSTER_HOST_PORT must be between 1 and 65535")
 host = f"127.0.0.1:{port}"
+MAX_RESPONSE_BYTES = 1024 * 1024
 
 
 def sign(key, message):
     return hmac.new(key, message.encode(), hashlib.sha256).digest()
+
+
+def parse_xml(content):
+    if len(content) > MAX_RESPONSE_BYTES:
+        raise ValueError("Unsafe XML response from test server")
+    text = content.decode("utf-8")
+    if "<!DOCTYPE" in text or "<!ENTITY" in text:
+        raise ValueError("Unsafe XML response from test server")
+    parser = ET.XMLParser()
+    parser.feed(text)
+    return parser.close()
+
+
+def read_response(response):
+    content = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(content) > MAX_RESPONSE_BYTES:
+        raise ValueError("Oversized response from test server")
+    return content
 
 
 def request(method, path, body=b"", extra=None):
@@ -50,7 +69,7 @@ def request(method, path, body=b"", extra=None):
     try:
         connection.request(method, path, body=body if method in ("PUT", "POST") else None, headers=headers)
         response = connection.getresponse()
-        return response.status, response.read(), response.headers
+        return response.status, read_response(response), response.headers
     finally:
         connection.close()
 
@@ -60,7 +79,7 @@ def anonymous(method, path):
     try:
         connection.request(method, path)
         response = connection.getresponse()
-        return response.status, response.read()
+        return response.status, read_response(response)
     finally:
         connection.close()
 
@@ -75,7 +94,7 @@ if len(sys.argv) > 2 and sys.argv[2] == "acl":
     path = f"/{bucket}/cluster-test/acl-multipart"
     status, content, _ = request("POST", path + "?uploads", extra={"x-amz-acl": "public-read"})
     assert status == 200, (status, content)
-    upload_id = ET.fromstring(content).findtext("UploadId")
+    upload_id = parse_xml(content).findtext("UploadId")
     status, _, headers = request("PUT", path + f"?partNumber=1&uploadId={upload_id}", b"public part")
     assert status == 200, status
     completion = ("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" +
@@ -102,9 +121,9 @@ if len(sys.argv) > 4 and sys.argv[2] == "status":
 if len(sys.argv) > 2 and sys.argv[2] == "version-survivor":
     status, listing, _ = request("GET", "/version-bucket?versions")
     assert status == 200, status
-    root = ET.fromstring(listing)
+    root = parse_xml(listing)
     namespace = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
-    expected_etag = '"' + hashlib.md5(b"older cluster version").hexdigest() + '"'
+    expected_etag = '"' + hashlib.md5(b"older cluster version", usedforsecurity=False).hexdigest() + '"'
     versions = [version for version in root.findall("s3:Version", namespace)
                 if version.findtext("s3:ETag", namespaces=namespace) == expected_etag]
     assert len(versions) == 1, listing
@@ -166,7 +185,7 @@ copy_source = f"/{bucket}/cluster-test/copy-source.txt"
 copy_target = f"/{bucket}/cluster-test/copied.txt"
 body = b"cluster copy and checksum test"
 crc32 = base64.b64encode(zlib.crc32(body).to_bytes(4, "big")).decode()
-md5 = base64.b64encode(hashlib.md5(body).digest()).decode()
+md5 = base64.b64encode(hashlib.md5(body, usedforsecurity=False).digest()).decode()
 status, _, headers = request("PUT", copy_source, body,
                              {"content-type": "text/plain", "content-md5": md5,
                               "x-amz-checksum-crc32": crc32,
@@ -257,7 +276,7 @@ assert status == 200 and b"<DeleteMarker>" in content and old_version.encode() i
 versioned_multipart = "/version-bucket/multipart.txt"
 status, content, _ = request("POST", versioned_multipart + "?uploads")
 assert status == 200, (status, content)
-versioned_upload = ET.fromstring(content).findtext("UploadId")
+versioned_upload = parse_xml(content).findtext("UploadId")
 assert versioned_upload, content
 versioned_part = b"retained multipart version"
 status, _, headers = request("PUT", versioned_multipart +

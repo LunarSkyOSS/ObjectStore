@@ -371,7 +371,9 @@ public final class ImageManager extends Frame {
                     Object value = event.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
                     List<?> dropped = (List<?>) value;
                     List<java.io.File> files = new ArrayList<>();
-                    for (Object item : dropped) if (item instanceof java.io.File file) files.add(file);
+                    for (Object item : dropped) {
+                        if (item instanceof java.io.File file) files.add(file);
+                    }
                     event.dropComplete(true);
                     EventQueue.invokeLater(() -> uploadImages(files));
                 } catch (Exception error) {
@@ -391,7 +393,10 @@ public final class ImageManager extends Frame {
         Button cancel = new Button("Cancel");
         Button proceed = new Button("Continue");
         cancel.addActionListener(event -> dialog.dispose());
-        proceed.addActionListener(event -> { accepted[0] = true; dialog.dispose(); });
+        proceed.addActionListener(event -> {
+            accepted[0] = true;
+            dialog.dispose();
+        });
         buttons.add(cancel);
         buttons.add(proceed);
         dialog.add(buttons, BorderLayout.SOUTH);

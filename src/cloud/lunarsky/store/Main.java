@@ -63,55 +63,10 @@ public final class Main {
             admitted = slots.tryAcquire();
             if (!admitted) throw new StoreException(503, "SlowDown", "Too many concurrent requests");
             if (handleStatus(exchange)) return;
-            SigV4.Verified verified = anonymousRead(exchange)
-                ? new SigV4.Verified("UNSIGNED-PAYLOAD", exchange.getRequestURI().getRawQuery(),
-                    null, null, null, null, null)
-                : authentication.verifyRequest(exchange.getRequestMethod(),
-                    exchange.getRequestURI(), exchange.getRequestHeaders());
-            String hash = verified.payload();
-            String principal = verified.principal();
-            String path = SigV4.decode(exchange.getRequestURI().getRawPath());
-            Map<String, String> query = query(verified.applicationQuery());
-            if (path.equals(CAPABILITIES_PATH)) {
-                requireOwner(principal);
-                if (!exchange.getRequestMethod().equals("GET")) unsupported("Capability operation");
-                if (!query.isEmpty())
-                    throw new StoreException(400, "InvalidArgument", "Capability request has unsupported query parameters");
-                requireEmptyBody(exchange, hash);
-                capabilities(exchange);
-            } else if (path.equals("/")) {
-                requireOwner(principal);
-                if (!exchange.getRequestMethod().equals("GET") ||
-                    !(query.isEmpty() || query.size() == 1 && "ListBuckets".equals(query.get("x-id"))))
-                    unsupported("Service operation");
-                requireEmptyBody(exchange, hash);
-                listBuckets(exchange);
-            } else {
-                int slash = path.indexOf('/', 1);
-                String requestedBucket = slash < 0 ? path.substring(1) : path.substring(1, slash);
-                if (requestedBucket.isEmpty()) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
-                if (slash < 0 || slash == path.length() - 1) {
-                    handleBucket(exchange, query, hash, requestedBucket, principal);
-                } else {
-                    store.bucket(requestedBucket);
-                    handleObject(exchange, path.substring(slash + 1), query, verified, requestedBucket);
-                }
-            }
+            dispatch(exchange);
         } catch (StoreException error) {
-            if (error.status == 503 && error.code.equals("SlowDown"))
-                exchange.getResponseHeaders().set("Retry-After", "1");
-            if (anonymousRead(exchange) && error.status == 404)
-                error = new StoreException(403, "AccessDenied", "Access denied");
-            if (error.deleteMarker) {
-                exchange.getResponseHeaders().set("x-amz-delete-marker", "true");
-                exchange.getResponseHeaders().set("x-amz-version-id", error.versionId);
-                if (error.modified >= 0) exchange.getResponseHeaders().set("Last-Modified",
-                    DateTimeFormatter.RFC_1123_DATE_TIME.withZone(ZoneOffset.UTC)
-                        .format(Instant.ofEpochMilli(error.modified)));
-            }
-            sendError(exchange, error.status, error.code, error.getMessage(), requestId);
-        }
-        catch (Exception error) {
+            sendStoreError(exchange, error, requestId);
+        } catch (Exception error) {
             System.err.println("ObjectStore request failed: " + requestId + " " + error.getClass().getSimpleName());
             sendError(exchange, 500, "InternalError", "Storage operation failed", requestId);
         } finally {
@@ -121,6 +76,58 @@ public final class Main {
                 clientLimits.leave(client);
             }
         }
+    }
+
+    private void dispatch(HttpExchange exchange) throws IOException {
+        SigV4.Verified verified = anonymousRead(exchange)
+            ? new SigV4.Verified("UNSIGNED-PAYLOAD", exchange.getRequestURI().getRawQuery(),
+                null, null, null, null, null)
+            : authentication.verifyRequest(exchange.getRequestMethod(),
+                exchange.getRequestURI(), exchange.getRequestHeaders());
+        String path = SigV4.decode(exchange.getRequestURI().getRawPath());
+        Map<String, String> query = query(verified.applicationQuery());
+        if (path.equals(CAPABILITIES_PATH)) {
+            requireOwner(verified.principal());
+            if (!exchange.getRequestMethod().equals("GET")) unsupported("Capability operation");
+            if (!query.isEmpty())
+                throw new StoreException(400, "InvalidArgument", "Capability request has unsupported query parameters");
+            requireEmptyBody(exchange, verified.payload());
+            capabilities(exchange);
+            return;
+        }
+        if (path.equals("/")) {
+            requireOwner(verified.principal());
+            if (!exchange.getRequestMethod().equals("GET") ||
+                !(query.isEmpty() || query.size() == 1 && "ListBuckets".equals(query.get("x-id"))))
+                unsupported("Service operation");
+            requireEmptyBody(exchange, verified.payload());
+            listBuckets(exchange);
+            return;
+        }
+        int slash = path.indexOf('/', 1);
+        String requestedBucket = slash < 0 ? path.substring(1) : path.substring(1, slash);
+        if (requestedBucket.isEmpty()) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+        if (slash < 0 || slash == path.length() - 1) {
+            handleBucket(exchange, query, verified.payload(), requestedBucket, verified.principal());
+        } else {
+            store.bucket(requestedBucket);
+            handleObject(exchange, path.substring(slash + 1), query, verified, requestedBucket);
+        }
+    }
+
+    private void sendStoreError(HttpExchange exchange, StoreException error, String requestId) throws IOException {
+        if (error.status == 503 && error.code.equals("SlowDown"))
+            exchange.getResponseHeaders().set("Retry-After", "1");
+        if (anonymousRead(exchange) && error.status == 404)
+            error = new StoreException(403, "AccessDenied", "Access denied");
+        if (error.deleteMarker) {
+            exchange.getResponseHeaders().set("x-amz-delete-marker", "true");
+            exchange.getResponseHeaders().set("x-amz-version-id", error.versionId);
+            if (error.modified >= 0) exchange.getResponseHeaders().set("Last-Modified",
+                DateTimeFormatter.RFC_1123_DATE_TIME.withZone(ZoneOffset.UTC)
+                    .format(Instant.ofEpochMilli(error.modified)));
+        }
+        sendError(exchange, error.status, error.code, error.getMessage(), requestId);
     }
 
     private static boolean anonymousRead(HttpExchange exchange) {

@@ -74,10 +74,36 @@ final class SigV4 {
 
     private Verified verifyPresigned(String method, URI uri, Headers headers) {
         if (headers.containsKey("authorization")) denied("Use one authentication method");
+        PresignedQuery query = presignedQuery(uri.getRawQuery());
+        Map<String, String> fields = query.fields();
+        if (!fields.keySet().equals(Set.of("X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date",
+                "X-Amz-Expires", "X-Amz-SignedHeaders", "X-Amz-Signature")) ||
+            !"AWS4-HMAC-SHA256".equals(fields.get("X-Amz-Algorithm")))
+            denied("Invalid presigned parameters");
+        String[] credential = credentialScope(fields.get("X-Amz-Credential"));
+        String date = fields.get("X-Amz-Date");
+        validatePresignedTime(date, credential[1], fields.get("X-Amz-Expires"));
+        String signedHeaders = fields.get("X-Amz-SignedHeaders");
+        String canonicalHeaders = canonicalHeaders(headers, signedHeaders, Set.of("host"));
+        String scope = String.join("/", Arrays.copyOfRange(credential, 1, 5));
+        String canonical = method + "\n" + encode(decode(uri.getRawPath()), true) + "\n"
+            + canonicalQuery(query.signed()) + "\n" + canonicalHeaders + "\n"
+            + signedHeaders + "\nUNSIGNED-PAYLOAD";
+        String toSign = "AWS4-HMAC-SHA256\n" + date + "\n" + scope + "\n"
+            + hex(hash(canonical.getBytes(StandardCharsets.UTF_8)));
+        String signature = fields.get("X-Amz-Signature");
+        byte[] key = signingKey(secret(credential[0]), credential[1], region);
+        if (!HEX.matcher(signature).matches() ||
+            !MessageDigest.isEqual(hmac(key, toSign), HexFormat.of().parseHex(signature)))
+            denied("Signature mismatch");
+        return new Verified("UNSIGNED-PAYLOAD", query.application(), key, date, scope, signature, credential[0]);
+    }
+
+    private static PresignedQuery presignedQuery(String rawQuery) {
         Map<String, String> fields = new TreeMap<>();
         StringBuilder application = new StringBuilder();
         StringBuilder signed = new StringBuilder();
-        for (String part : uri.getRawQuery().split("&", -1)) {
+        for (String part : rawQuery.split("&", -1)) {
             String[] pair = part.split("=", 2);
             String name = decode(pair[0]);
             String value = decode(pair.length == 2 ? pair[1] : "");
@@ -89,17 +115,19 @@ final class SigV4 {
                 appendQuery(signed, part);
             }
         }
-        if (!fields.keySet().equals(Set.of("X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date",
-                "X-Amz-Expires", "X-Amz-SignedHeaders", "X-Amz-Signature")) ||
-            !"AWS4-HMAC-SHA256".equals(fields.get("X-Amz-Algorithm")))
-            denied("Invalid presigned parameters");
-        String[] credential = credentialScope(fields.get("X-Amz-Credential"));
-        String date = fields.get("X-Amz-Date");
-        if (!date.matches("[0-9]{8}T[0-9]{6}Z") || !date.startsWith(credential[1]))
+        return new PresignedQuery(fields, application.toString(), signed.toString());
+    }
+
+    private void validatePresignedTime(String date, String scopeDate, String rawExpires) {
+        if (!date.matches("[0-9]{8}T[0-9]{6}Z") || !date.startsWith(scopeDate))
             denied("Invalid signing date");
         long expires;
-        try { expires = Long.parseLong(fields.get("X-Amz-Expires")); }
-        catch (NumberFormatException error) { denied("Invalid presigned expiry"); return null; }
+        try {
+            expires = Long.parseLong(rawExpires);
+        } catch (NumberFormatException error) {
+            denied("Invalid presigned expiry");
+            return;
+        }
         if (expires < 1 || expires > 604800) denied("Invalid presigned expiry");
         try {
             Instant start = Instant.from(DATE.parse(date));
@@ -107,21 +135,9 @@ final class SigV4 {
             if (now.isBefore(start.minus(Duration.ofMinutes(5))) || now.isAfter(start.plusSeconds(expires)))
                 denied("Presigned URL has expired or is not yet valid");
         } catch (java.time.DateTimeException error) { denied("Invalid signing date"); }
-        String signedHeaders = fields.get("X-Amz-SignedHeaders");
-        String canonicalHeaders = canonicalHeaders(headers, signedHeaders, Set.of("host"));
-        String scope = String.join("/", Arrays.copyOfRange(credential, 1, 5));
-        String canonical = method + "\n" + encode(decode(uri.getRawPath()), true) + "\n"
-            + canonicalQuery(signed.toString()) + "\n" + canonicalHeaders + "\n"
-            + signedHeaders + "\nUNSIGNED-PAYLOAD";
-        String toSign = "AWS4-HMAC-SHA256\n" + date + "\n" + scope + "\n"
-            + hex(hash(canonical.getBytes(StandardCharsets.UTF_8)));
-        String signature = fields.get("X-Amz-Signature");
-        byte[] key = signingKey(secret(credential[0]), credential[1], region);
-        if (!HEX.matcher(signature).matches() ||
-            !MessageDigest.isEqual(hmac(key, toSign), HexFormat.of().parseHex(signature)))
-            denied("Signature mismatch");
-        return new Verified("UNSIGNED-PAYLOAD", application.toString(), key, date, scope, signature, credential[0]);
     }
+
+    private record PresignedQuery(Map<String, String> fields, String application, String signed) { }
 
     private static boolean hasPresignedQuery(String raw) {
         return raw != null && (raw.startsWith("X-Amz-Algorithm=") || raw.contains("&X-Amz-Algorithm="));

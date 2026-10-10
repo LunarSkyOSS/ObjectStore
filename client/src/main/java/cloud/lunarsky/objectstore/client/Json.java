@@ -124,7 +124,10 @@ final class Json {
                     return result.toString();
                 }
                 if (current < 0x20) throw new ProtocolException("Unescaped control character in JSON string");
-                if (current != '\\') { result.append(current); continue; }
+                if (current != '\\') {
+                    result.append(current);
+                    continue;
+                }
                 if (index >= source.length()) throw new ProtocolException("Incomplete JSON escape");
                 char escaped = source.charAt(index++);
                 switch (escaped) {
@@ -159,31 +162,42 @@ final class Json {
         private BigDecimal number() throws ProtocolException {
             int start = index;
             if (take('-') && index >= source.length()) throw new ProtocolException("Invalid JSON number");
+            integerDigits();
+            if (take('.')) requireDigits("Invalid JSON fraction");
+            if (take('e') || take('E')) {
+                if (!take('+')) take('-');
+                requireDigits("Invalid JSON exponent");
+            }
+            try { return new BigDecimal(source.substring(start, index)); }
+            catch (NumberFormatException e) { throw new ProtocolException("Invalid JSON number", e); }
+        }
+
+        private void integerDigits() throws ProtocolException {
             if (take('0')) {
                 if (index < source.length() && Character.isDigit(source.charAt(index)))
                     throw new ProtocolException("Invalid JSON number");
             } else {
                 if (index >= source.length() || source.charAt(index) < '1' || source.charAt(index) > '9')
                     throw new ProtocolException("Invalid JSON number");
-                while (index < source.length() && source.charAt(index) >= '0' && source.charAt(index) <= '9') index++;
+                scanDigits();
             }
-            if (take('.')) {
-                int first = index;
-                while (index < source.length() && source.charAt(index) >= '0' && source.charAt(index) <= '9') index++;
-                if (first == index) throw new ProtocolException("Invalid JSON fraction");
-            }
-            if (take('e') || take('E')) {
-                if (!take('+')) take('-');
-                int first = index;
-                while (index < source.length() && source.charAt(index) >= '0' && source.charAt(index) <= '9') index++;
-                if (first == index) throw new ProtocolException("Invalid JSON exponent");
-            }
-            try { return new BigDecimal(source.substring(start, index)); }
-            catch (NumberFormatException e) { throw new ProtocolException("Invalid JSON number", e); }
+        }
+
+        private void requireDigits(String message) throws ProtocolException {
+            int first = index;
+            scanDigits();
+            if (first == index) throw new ProtocolException(message);
+        }
+
+        private void scanDigits() {
+            while (index < source.length() && source.charAt(index) >= '0' && source.charAt(index) <= '9') index++;
         }
 
         private boolean take(char value) {
-            if (index < source.length() && source.charAt(index) == value) { index++; return true; }
+            if (index < source.length() && source.charAt(index) == value) {
+                index++;
+                return true;
+            }
             return false;
         }
 
