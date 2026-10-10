@@ -24,6 +24,8 @@ public final class ClusterMigrate {
             (args.length != 2 || !args[0].equals("--apply")))
             throw new IllegalArgumentException("Usage: objectstore cluster-migrate --check | --apply node-id-0,node-id-1,node-id-2");
         Map<String, String> env = System.getenv();
+        EncryptedVolume.requireConfigured(env,
+            java.nio.file.Path.of(System.getProperty("java.io.tmpdir")));
         if (!"cluster".equals(env.get("STORE_MODE")) || !"true".equals(env.get("CLUSTER_LOCAL_DEV")))
             throw new IllegalArgumentException("Migration is enabled only in local cluster mode");
         List<URI> urls = Arrays.stream(env.get("CLUSTER_NODES").split(",", -1)).map(URI::create).toList();

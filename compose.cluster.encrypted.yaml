@@ -1,0 +1,114 @@
+x-encrypted-id: &encrypted-id ${ENCRYPTED_VOLUME_ID:?Set ENCRYPTED_VOLUME_ID}
+x-encrypted-data: &encrypted-data
+  ENCRYPTED_VOLUME_ID: *encrypted-id
+  ENCRYPTED_VOLUME_MARKER_FILE: /data/.objectstore-encrypted
+x-encrypted-staging: &encrypted-staging
+  ENCRYPTED_VOLUME_ID: *encrypted-id
+  ENCRYPTED_VOLUME_MARKER_FILE: /tmp/.objectstore-encrypted
+x-metadata-entrypoint: &metadata-entrypoint
+  - /bin/sh
+  - -ec
+  - |
+    test -f /var/lib/postgresql/data/.objectstore-encrypted &&
+    test ! -L /var/lib/postgresql/data/.objectstore-encrypted &&
+    printf '%s\n' "$(printenv ENCRYPTED_VOLUME_ID)" | grep -Eq '^[a-f0-9]{32}$' &&
+    grep -Fxq -e "$(printenv ENCRYPTED_VOLUME_ID)" /var/lib/postgresql/data/.objectstore-encrypted ||
+      { echo 'Encrypted metadata volume unavailable' >&2; exit 1; }
+    exec docker-entrypoint.sh postgres
+
+services:
+  gateway:
+    environment: *encrypted-staging
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/gateway-staging
+        target: /tmp
+        bind:
+          create_host_path: false
+
+  metadata:
+    environment:
+      ENCRYPTED_VOLUME_ID: *encrypted-id
+      PGDATA: /var/lib/postgresql/data/pgdata
+    entrypoint: *metadata-entrypoint
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/metadata
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+
+  metadata-recovery:
+    environment:
+      ENCRYPTED_VOLUME_ID: *encrypted-id
+      PGDATA: /var/lib/postgresql/data/pgdata
+    entrypoint: *metadata-entrypoint
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/metadata-recovery
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+
+  repair:
+    environment: *encrypted-staging
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/repair-staging
+        target: /tmp
+        bind:
+          create_host_path: false
+
+  gc:
+    environment: *encrypted-staging
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/gc-staging
+        target: /tmp
+        bind:
+          create_host_path: false
+
+  maintenance:
+    environment: *encrypted-staging
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/maintenance-staging
+        target: /tmp
+        bind:
+          create_host_path: false
+
+  node-a:
+    environment: *encrypted-data
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/node-a
+        target: /data
+        bind:
+          create_host_path: false
+
+  node-b:
+    environment: *encrypted-data
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/node-b
+        target: /data
+        bind:
+          create_host_path: false
+
+  node-c:
+    environment: *encrypted-data
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/node-c
+        target: /data
+        bind:
+          create_host_path: false
+
+  node-d:
+    environment: *encrypted-data
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/node-d
+        target: /data
+        bind:
+          create_host_path: false

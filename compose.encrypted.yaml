@@ -1,0 +1,11 @@
+services:
+  objectstore:
+    environment:
+      ENCRYPTED_VOLUME_ID: ${ENCRYPTED_VOLUME_ID:?Set ENCRYPTED_VOLUME_ID}
+      ENCRYPTED_VOLUME_MARKER_FILE: /data/.objectstore-encrypted
+    volumes:
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/single
+        target: /data
+        bind:
+          create_host_path: false

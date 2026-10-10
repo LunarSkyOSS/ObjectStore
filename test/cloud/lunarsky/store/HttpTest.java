@@ -806,15 +806,70 @@ public final class HttpTest {
             throw new AssertionError("Completed multipart version was not retained");
     }
 
+    private static int virtualHostPut(int port, String host, String signedHost, byte[] body) throws Exception {
+        URI signed = URI.create("http://" + signedHost + ":" + port + "/photos/cat.jpg");
+        HttpRequest request = signedUri(signed, "PUT", body, Map.of());
+        String headers = "PUT /photos/cat.jpg HTTP/1.1\r\nHost: " + host + ":" + port +
+            "\r\nAuthorization: " + request.headers().firstValue("authorization").orElseThrow() +
+            "\r\nx-amz-date: " + request.headers().firstValue("x-amz-date").orElseThrow() +
+            "\r\nx-amz-content-sha256: " + request.headers().firstValue("x-amz-content-sha256").orElseThrow() +
+            "\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n";
+        try (var socket = new java.net.Socket("127.0.0.1", port)) {
+            socket.setSoTimeout(5000);
+            socket.getOutputStream().write(headers.getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().write(body);
+            String response = new String(socket.getInputStream().readAllBytes(), StandardCharsets.ISO_8859_1);
+            return Integer.parseInt(response.split(" ", 3)[1]);
+        }
+    }
+
+    private static void testGatewayConcurrency(DiskStore store, HttpClient client,
+                                               java.util.concurrent.Executor executor) throws Exception {
+        HttpServer limited = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 16);
+        var app = new Main(store, new MultipartStore(store),
+            new SigV4(ACCESS, SECRET, REGION, Clock.systemUTC()), "objects",
+            ClientLimits.disabled(), 1, "");
+        limited.setExecutor(executor);
+        limited.createContext("/", app::handle);
+        limited.start();
+        int port = limited.getAddress().getPort();
+        String base = "http://127.0.0.1:" + port;
+        byte[] body = {42};
+        HttpRequest request = signedUri(URI.create(base + "/objects/held"), "PUT", body, Map.of());
+        try (var socket = new java.net.Socket("127.0.0.1", port)) {
+            socket.setSoTimeout(5000);
+            String headers = "PUT /objects/held HTTP/1.1\r\nHost: 127.0.0.1:" + port +
+                "\r\nAuthorization: " + request.headers().firstValue("authorization").orElseThrow() +
+                "\r\nx-amz-date: " + request.headers().firstValue("x-amz-date").orElseThrow() +
+                "\r\nx-amz-content-sha256: " + request.headers().firstValue("x-amz-content-sha256").orElseThrow() +
+                "\r\nContent-Length: 1\r\nConnection: close\r\n\r\n";
+            socket.getOutputStream().write(headers.getBytes(StandardCharsets.US_ASCII));
+            boolean refused = false;
+            for (int attempt = 0; attempt < 50 && !refused; attempt++) {
+                int status = client.send(HttpRequest.newBuilder(URI.create(base + "/health")).GET().build(),
+                    HttpResponse.BodyHandlers.discarding()).statusCode();
+                refused = status == 503;
+                if (!refused) Thread.sleep(10);
+            }
+            if (!refused) throw new AssertionError("Configured gateway concurrency cap was not enforced");
+            socket.getOutputStream().write(body);
+            String finished = new String(socket.getInputStream().readAllBytes(), StandardCharsets.ISO_8859_1);
+            if (!finished.startsWith("HTTP/1.1 200 "))
+                throw new AssertionError("Held request did not complete after releasing its body");
+        } finally {
+            limited.stop(0);
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         Path root = Files.createTempDirectory("store-http-test-");
         var executor = Executors.newVirtualThreadPerTaskExecutor();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 16);
         DiskStore store = new DiskStore(root, 1024, 4096);
         try {
-            var app = new Main(store,
+            var app = new Main(store, new MultipartStore(store),
                 new SigV4(Map.of(ACCESS, SECRET, SECONDARY, SECONDARY_SECRET),
-                    ACCESS, REGION, Clock.systemUTC()), "objects");
+                    ACCESS, REGION, Clock.systemUTC()), "objects", ClientLimits.disabled(), 16, "s3.test");
             server.setExecutor(executor);
             server.createContext("/", app::handle);
             server.start();
@@ -834,6 +889,17 @@ public final class HttpTest {
             testBuckets(client, base);
             testVersioning(client, base);
             testAcl(client, base);
+            byte[] hostedBody = "virtual host".getBytes(StandardCharsets.UTF_8);
+            int port = server.getAddress().getPort();
+            if (virtualHostPut(port, "objects.s3.test", "objects.s3.test", hostedBody) != 200)
+                throw new AssertionError("Signed virtual-hosted upload failed");
+            try (var opened = store.open("objects", "photos/cat.jpg")) {
+                if (!java.util.Arrays.equals(hostedBody, opened.stream().readAllBytes()))
+                    throw new AssertionError("Virtual-hosted bucket or key was parsed incorrectly");
+            }
+            if (virtualHostPut(port, "objects.s3.test", "other.s3.test", hostedBody) != 403)
+                throw new AssertionError("Changing a signed virtual hostname was accepted");
+            testGatewayConcurrency(store, client, executor);
             System.out.println("HTTP tests passed: capabilities, objects, copy, checksums, listing, multipart, attributes, buckets, versioning, ACLs");
         } finally {
             server.stop(0);

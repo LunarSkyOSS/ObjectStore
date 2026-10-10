@@ -43,6 +43,8 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     ClusterStore(String jdbcUrl, String user, String password, String bucket,
                  List<URI> nodeUrls, String token, String repairToken, long maxObject, long maxTotal,
                  boolean testNodeDomains) throws IOException {
+        EncryptedVolume.requireConfigured(System.getenv(),
+            java.nio.file.Path.of(System.getProperty("java.io.tmpdir")));
         if (jdbcUrl == null || !jdbcUrl.startsWith("jdbc:postgresql://") || user == null || password == null)
             throw new IllegalArgumentException("Invalid metadata database configuration");
         this.jdbcUrl = jdbcUrl;

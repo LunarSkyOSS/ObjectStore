@@ -15,6 +15,7 @@ public final class ClusterGc {
         if (!"cluster".equals(env.get("STORE_MODE")) || !"true".equals(env.get("CLUSTER_LOCAL_DEV")))
             throw new IllegalArgumentException("Cluster garbage collection is only enabled in local cluster mode");
         boolean testDomains = "true".equals(env.get("CLUSTER_TEST_NODE_DOMAINS"));
+        ObjectStorage.Limits limits = StorageLimits.fromEnvironment(env);
         boolean disposableTest = testDomains && "true".equals(env.get("CLUSTER_GC_TEST_MODE"));
         long age = Long.parseLong(env.getOrDefault("CLUSTER_GC_MIN_AGE_SECONDS", "1209600"));
         long backupRetention = Long.parseLong(env.getOrDefault("CLUSTER_BACKUP_RETENTION_SECONDS", "0"));
@@ -25,7 +26,8 @@ public final class ClusterGc {
         try (ClusterStore store = new ClusterStore(env.get("POSTGRES_JDBC_URL"), env.get("POSTGRES_USER"),
                 env.get("POSTGRES_PASSWORD"), env.get("S3_BUCKET"),
                 Arrays.stream(env.get("CLUSTER_NODES").split(",")).map(URI::create).toList(),
-                env.get("CLUSTER_TOKEN"), env.get("CLUSTER_REPAIR_TOKEN"), 134217728, 2147483648L,
+                env.get("CLUSTER_TOKEN"), env.get("CLUSTER_REPAIR_TOKEN"),
+                limits.maxObjectBytes(), limits.maxTotalBytes(),
                 testDomains)) {
             if (apply) {
                 var repair = store.repairOnce();

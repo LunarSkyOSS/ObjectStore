@@ -12,6 +12,8 @@ public final class ClusterJoin {
         if (args.length != 2)
             throw new IllegalArgumentException("Usage: objectstore cluster-join node-url expected-host-uuid");
         Map<String, String> env = System.getenv();
+        EncryptedVolume.requireConfigured(env,
+            java.nio.file.Path.of(System.getProperty("java.io.tmpdir")));
         if (!"cluster".equals(env.get("STORE_MODE")) || !"true".equals(env.get("CLUSTER_LOCAL_DEV")))
             throw new IllegalArgumentException("Node registration is only enabled in local cluster mode");
         URI url = URI.create(args[0]);

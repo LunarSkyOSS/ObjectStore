@@ -48,6 +48,7 @@ final class DiskStore implements ObjectStorage {
     private record VersionRecord(String id, String storageId, boolean marker, long modified) {}
 
     DiskStore(Path root, long maxObject, long maxTotal) throws IOException {
+        EncryptedVolume.requireConfigured(System.getenv(), root);
         this.root = root;
         objects = root.resolve("objects");
         temporary = root.resolve("pending");

@@ -12,6 +12,7 @@ public final class ClusterRepair {
         if (!"cluster".equals(env.get("STORE_MODE")) || !"true".equals(env.get("CLUSTER_LOCAL_DEV")))
             throw new IllegalArgumentException("Cluster repair is only enabled in local cluster mode");
         boolean loop = args.length == 1;
+        ObjectStorage.Limits limits = StorageLimits.fromEnvironment(env);
         long seconds = Long.parseLong(env.getOrDefault("CLUSTER_MAINTENANCE_INTERVAL_SECONDS", "60"));
         if (seconds < 1 || seconds > 3600) throw new IllegalArgumentException("Invalid maintenance interval");
         boolean gcEnabled = loop && "true".equals(env.get("CLUSTER_GC_ENABLED"));
@@ -23,7 +24,8 @@ public final class ClusterRepair {
             try (ClusterStore store = new ClusterStore(env.get("POSTGRES_JDBC_URL"), env.get("POSTGRES_USER"),
                     env.get("POSTGRES_PASSWORD"), env.get("S3_BUCKET"),
                     Arrays.stream(env.get("CLUSTER_NODES").split(",")).map(URI::create).toList(),
-                    env.get("CLUSTER_TOKEN"), env.get("CLUSTER_REPAIR_TOKEN"), 134217728, 2147483648L,
+                    env.get("CLUSTER_TOKEN"), env.get("CLUSTER_REPAIR_TOKEN"),
+                    limits.maxObjectBytes(), limits.maxTotalBytes(),
                     "true".equals(env.get("CLUSTER_TEST_NODE_DOMAINS")))) {
                 var report = store.repairOnce();
                 System.out.println("segments_scanned=" + report.scanned());

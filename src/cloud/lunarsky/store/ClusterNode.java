@@ -32,6 +32,7 @@ public final class ClusterNode implements AutoCloseable {
     private final FileLock lock;
 
     ClusterNode(Path root, String token, String repairToken, UUID hostId) throws IOException {
+        EncryptedVolume.requireConfigured(System.getenv(), root);
         if (token == null || token.length() < 32) throw new IllegalArgumentException("Cluster token must have at least 32 characters");
         if (repairToken == null || repairToken.length() < 32 || repairToken.equals(token))
             throw new IllegalArgumentException("A separate repair token of at least 32 characters is required");

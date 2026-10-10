@@ -36,7 +36,8 @@ public final class Main {
     private final String bucket;
     private final MultipartStorage multipart;
     private final ClientLimits clientLimits;
-    private final Semaphore slots = new Semaphore(16);
+    private final Semaphore slots;
+    private final String virtualHostSuffix;
 
     Main(DiskStore store, SigV4 authentication, String bucket) throws IOException {
         this(store, new MultipartStore(store), authentication, bucket);
@@ -48,12 +49,21 @@ public final class Main {
 
     Main(ObjectStorage store, MultipartStorage multipart, SigV4 authentication, String bucket,
          ClientLimits clientLimits) throws IOException {
+        this(store, multipart, authentication, bucket, clientLimits, 16, "");
+    }
+
+    Main(ObjectStorage store, MultipartStorage multipart, SigV4 authentication, String bucket,
+         ClientLimits clientLimits, int maxInFlight, String virtualHostSuffix) throws IOException {
+        if (maxInFlight < 1 || maxInFlight > 1024)
+            throw new IllegalArgumentException("MAX_IN_FLIGHT_REQUESTS must be between 1 and 1024");
         this.store = store;
         this.multipart = multipart;
         this.authentication = authentication;
         this.owner = authentication.root();
         this.bucket = bucket;
         this.clientLimits = clientLimits;
+        this.slots = new Semaphore(maxInFlight);
+        this.virtualHostSuffix = validateVirtualHostSuffix(virtualHostSuffix);
         store.ensureBucket(bucket);
     }
 
@@ -102,7 +112,8 @@ public final class Main {
             capabilities(exchange);
             return;
         }
-        if (path.equals("/")) {
+        String hostBucket = virtualHostBucket(exchange);
+        if (path.equals("/") && hostBucket == null) {
             requireOwner(verified.principal());
             if (!exchange.getRequestMethod().equals("GET") ||
                 !(query.isEmpty() || query.size() == 1 && "ListBuckets".equals(query.get("x-id"))))
@@ -112,14 +123,39 @@ public final class Main {
             return;
         }
         int slash = path.indexOf('/', 1);
-        String requestedBucket = slash < 0 ? path.substring(1) : path.substring(1, slash);
+        String requestedBucket = hostBucket == null ?
+            (slash < 0 ? path.substring(1) : path.substring(1, slash)) : hostBucket;
         if (requestedBucket.isEmpty()) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
-        if (slash < 0 || slash == path.length() - 1) {
+        if (hostBucket != null ? path.equals("/") : slash < 0 || slash == path.length() - 1) {
             handleBucket(exchange, query, verified.payload(), requestedBucket, verified.principal());
         } else {
             store.bucket(requestedBucket);
-            handleObject(exchange, path.substring(slash + 1), query, verified, requestedBucket);
+            handleObject(exchange, hostBucket == null ? path.substring(slash + 1) : path.substring(1),
+                query, verified, requestedBucket);
         }
+    }
+
+    private static String validateVirtualHostSuffix(String value) {
+        if (value == null || value.isBlank()) return "";
+        String suffix = value.toLowerCase(Locale.ROOT);
+        if (suffix.length() > 253 || !suffix.matches("[a-z0-9-]+(?:\\.[a-z0-9-]+)*") ||
+            java.util.Arrays.stream(suffix.split("\\.")).anyMatch(
+                label -> label.length() > 63 || label.startsWith("-") || label.endsWith("-")))
+            throw new IllegalArgumentException("Invalid S3_VIRTUAL_HOST_SUFFIX");
+        return suffix;
+    }
+
+    private String virtualHostBucket(HttpExchange exchange) {
+        if (virtualHostSuffix.isEmpty()) return null;
+        String host = exchange.getRequestHeaders().getFirst("Host");
+        if (host == null) throw new StoreException(400, "InvalidRequest", "Missing Host header");
+        host = host.toLowerCase(Locale.ROOT).replaceFirst(":\\d+$", "");
+        String ending = "." + virtualHostSuffix;
+        if (!host.endsWith(ending)) return null;
+        String bucketName = host.substring(0, host.length() - ending.length());
+        if (!bucketName.matches("[a-z0-9][a-z0-9-]{1,61}[a-z0-9]"))
+            throw new StoreException(400, "InvalidRequest", "Invalid bucket hostname");
+        return bucketName;
     }
 
     private void sendStoreError(HttpExchange exchange, StoreException error, String requestId) throws IOException {
@@ -1197,10 +1233,8 @@ public final class Main {
         if (!access.matches("[A-Za-z0-9]{16,128}") || secret.length() < 32 ||
             !bucket.matches("[a-z0-9][a-z0-9-]{1,61}[a-z0-9]"))
             throw new IllegalArgumentException("Invalid storage credentials/bucket configuration");
-        long maxObject = Long.parseLong(env.getOrDefault("MAX_OBJECT_BYTES", "134217728"));
-        long maxTotal = Long.parseLong(env.getOrDefault("MAX_TOTAL_BYTES", "2147483648"));
-        if (maxObject < 1 || maxObject > 1073741824L || maxTotal < maxObject)
-            throw new IllegalArgumentException("Invalid size limits");
+        ObjectStorage.Limits limits = StorageLimits.fromEnvironment(env);
+        long maxObject = limits.maxObjectBytes(), maxTotal = limits.maxTotalBytes();
         String mode = env.getOrDefault("STORE_MODE", "disk");
         ObjectStorage store;
         MultipartStorage multipart;
@@ -1220,11 +1254,13 @@ public final class Main {
             multipart = new MultipartStore(disk);
         } else throw new IllegalArgumentException("Invalid STORE_MODE");
         var app = new Main(store, multipart, new SigV4(identities(env, access, secret),
-            access, region, Clock.systemUTC()), bucket, ClientLimits.fromEnvironment(env));
+            access, region, Clock.systemUTC()), bucket, ClientLimits.fromEnvironment(env),
+            positiveInt(env, "MAX_IN_FLIGHT_REQUESTS", 16, 1024),
+            env.getOrDefault("S3_VIRTUAL_HOST_SUFFIX", ""));
         int port = Integer.parseInt(env.getOrDefault("PORT", "9000"));
         var server = HttpServer.create(mode.equals("cluster")
             ? new InetSocketAddress(env.getOrDefault("BIND_ADDRESS", "127.0.0.1"), port)
-            : new InetSocketAddress(port), 64);
+            : new InetSocketAddress(port), positiveInt(env, "HTTP_BACKLOG", 64, 4096));
         var executor = Executors.newVirtualThreadPerTaskExecutor();
         server.setExecutor(executor);
         server.createContext("/", app::handle);
@@ -1290,5 +1326,17 @@ public final class Main {
         String value = env.get(key);
         if (value == null || value.isBlank()) throw new IllegalArgumentException("Missing " + key);
         return value;
+    }
+
+    private static int positiveInt(Map<String, String> env, String key, int fallback, int maximum) {
+        String configured = env.get(key);
+        if (configured == null || configured.isBlank()) return fallback;
+        try {
+            int value = Integer.parseInt(configured);
+            if (value < 1 || value > maximum) throw new NumberFormatException();
+            return value;
+        } catch (NumberFormatException error) {
+            throw new IllegalArgumentException(key + " must be between 1 and " + maximum, error);
+        }
     }
 }

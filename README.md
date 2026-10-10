@@ -16,6 +16,7 @@ Source: [GitHub](https://github.com/LunarSkyOSS/ObjectStore) · [Gitea mirror](h
 - [S3 API support checklist](#s3-api-support-checklist)
 - [Tests](TESTS.md)
 - [Single-node setup](#single-node-setup)
+- [Encrypted storage](#encrypted-storage)
 - [Access keys and ACLs](#access-keys-and-acls)
 - [CLI and tests](#cli-and-tests)
 - [Capability discovery](#capability-discovery)
@@ -35,6 +36,7 @@ Source: [GitHub](https://github.com/LunarSkyOSS/ObjectStore) · [Gitea mirror](h
 ObjectStore creates the configured default bucket at startup. Additional buckets share the configured capacity limit.
 
 - ✅ Persistent single-node storage with checksum verification
+- ✅ Optional dm-crypt-backed data mounts with startup guards
 - ✅ Configurable per-object and total logical size limits
 - ✅ CLI status, version, and full payload verification
 - ✅ Local cluster prototype with stable node IDs and host-aware placement code
@@ -49,6 +51,7 @@ New objects retain their content type and key. Objects written by the earlier si
 ## S3 API support checklist
 
 - ✅ Header-based and presigned-query AWS Signature Version 4 authentication
+- ✅ Path-style and configurable virtual-hosted-style bucket addresses
 - ✅ `PutObject`, `GetObject`, `HeadObject`, and `DeleteObject` in both modes
 - ✅ Single-range GET and `ListObjectsV2` in both modes
 - ✅ SHA-256 payload verification and `x-amz-checksum-sha256` in both modes
@@ -83,6 +86,23 @@ curl http://127.0.0.1:9000/health
 Port 9000 binds to localhost. Data stays in the `object-data` Docker volume. `docker compose down -v` deletes that volume.
 
 The standalone defaults are 128 MiB per object and 2 GiB total. Set `MAX_OBJECT_BYTES` and `MAX_TOTAL_BYTES` in `.env` to change them. Incomplete multipart uploads consume space until aborted.
+
+## Encrypted storage
+
+At-rest encryption is an **opt-in deployment setting** backed by a host-mounted dm-crypt/LUKS filesystem. ObjectStore does not encrypt bytes itself or store an encryption key in its environment. Prepare and unlock the LUKS filesystem outside Docker, then set `ENCRYPTED_STORAGE_ROOT` to its exact mount point and `ENCRYPTED_VOLUME_ID` to a stable 32-character lowercase hex identifier in your private environment file. Generate the identifier with `openssl rand -hex 16`; it is a mount guard, **not** a cryptographic key. Keep the LUKS recovery key separately from the data and backups.
+
+With the encrypted filesystem mounted, prepare empty directories using `sh scripts/prepare-encrypted-storage.sh single /path/to/objectstore.env` or `sh scripts/prepare-encrypted-storage.sh cluster /path/to/cluster.env`. The script reads only the two encryption settings from that file; it does not execute it. It requires an active dm-crypt-backed mount at `ENCRYPTED_STORAGE_ROOT` and refuses to mark a nonempty directory. Run it with permission to create the directories and set container ownership. Enable the matching Compose override:
+
+```sh
+docker compose --env-file /path/to/objectstore.env -f compose.yaml -f compose.encrypted.yaml up -d --build
+docker compose --env-file /path/to/cluster.env -f compose.cluster.yaml -f compose.cluster.encrypted.yaml up -d --build
+```
+
+Use the first command for single-node mode or the second for the **local development cluster**, not both. The overrides bind encrypted directories for object data, cluster nodes, PostgreSQL, and cluster staging files. Each process checks a marker stored on its mounted directory before opening data; PostgreSQL checks before starting. If a mount is missing after reboot, the service refuses to start instead of silently creating a new plaintext store. Provision an unlock-and-mount service before starting Compose; a container restart cannot unlock LUKS. The preparation script checks the host mount, while the runtime marker is only a guard against an absent or wrong mount.
+
+**Existing Docker volumes are not migrated automatically.** Stop the stack, take and verify a backup, prepare the empty encrypted directories, then copy the stopped volumes into their corresponding directories before starting with the override. For PostgreSQL, copy the existing data directory into `cluster/metadata/pgdata` because the encrypted override changes `PGDATA`. Verify the restored objects and database before retiring the original volumes. The cluster overlay places all local test containers on one encrypted host; a future multi-host deployment needs an encrypted data mount and key recovery plan on each host.
+
+This covers the specified data and staging mounts, but not Docker logs, host swap, other temporary files, external backups, or a compromised running host. Encrypt those separately as appropriate, use TLS for network paths, restrict access, and test backup recovery. Encryption at rest is one security measure; enabling it does not by itself establish GDPR compliance.
 
 ## Access keys and ACLs
 
@@ -191,7 +211,11 @@ The maintenance service is opt-in. It repairs missing or corrupt replicas and re
 
 ## Limits and safety
 
-Public-client limits are **disabled by default**. The localhost Compose setup is unchanged. For an endpoint that accepts external clients, set one or both of `PUBLIC_REQUESTS_PER_SECOND` and `PUBLIC_BYTES_PER_SECOND` to a positive number in `.env`. The first limits requests per client IP with a token bucket; the second paces upload and download bytes through one shared per-IP budget. `PUBLIC_REQUEST_BURST` and `PUBLIC_BYTE_BURST` default to one second of their respective rates. `PUBLIC_MAX_IN_FLIGHT_PER_IP` defaults to 8 when either rate is enabled. Requests above the rate or concurrency limit receive S3 `503 SlowDown` and `Retry-After: 1`; an admitted transfer is paced rather than cut off. These are per-gateway limits, not cluster-wide quotas. The existing 16-request gateway cap and storage limits still apply.
+Public-client limits are **disabled by default**. The localhost Compose setup is unchanged. For an endpoint that accepts external clients, set one or both of `PUBLIC_REQUESTS_PER_SECOND` and `PUBLIC_BYTES_PER_SECOND` to a positive number in `.env`. The first limits requests per client IP with a token bucket; the second paces upload and download bytes through one shared per-IP budget. `PUBLIC_REQUEST_BURST` and `PUBLIC_BYTE_BURST` default to one second of their respective rates. `PUBLIC_MAX_IN_FLIGHT_PER_IP` defaults to 8 when either rate is enabled. Requests above the rate or concurrency limit receive S3 `503 SlowDown` and `Retry-After: 1`; an admitted transfer is paced rather than cut off. These are per-gateway limits, not cluster-wide quotas.
+
+`MAX_IN_FLIGHT_REQUESTS` controls the per-gateway concurrency cap (default 16, range 1–1024); an additional request receives `503 SlowDown`. `HTTP_BACKLOG` controls the listening socket backlog (default 64, range 1–4096). Raise either only after a mixed upload/download load test, because each active request can hold memory, disk space, and database connections. The configured object and total storage limits still apply. `MAX_OBJECT_BYTES` currently cannot exceed 1 GiB.
+
+Set `S3_VIRTUAL_HOST_SUFFIX` to a DNS suffix such as `s3.example.com` to accept `bucket.s3.example.com/key` alongside path-style `/bucket/key`. Configure DNS and TLS for the bucket hostnames, and preserve the client's original `Host` header through the proxy; Signature V4 signs it. The suffix is empty by default. This changes request parsing, not bucket naming rules or DNS configuration.
 
 For example, to start with 100 requests per second and 16 MiB/s combined upload and download per IP, set `PUBLIC_REQUESTS_PER_SECOND=100` and `PUBLIC_BYTES_PER_SECOND=16777216`. Both start with a one-second burst. Adjust these numbers after measuring the actual workload; do not copy them as a universal production policy.
 
