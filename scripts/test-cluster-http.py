@@ -6,6 +6,7 @@ import http.client
 import pathlib
 import sys
 import urllib.parse
+import xml.etree.ElementTree as ET
 
 
 values = dict(line.strip().split("=", 1) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
@@ -43,7 +44,7 @@ def request(method, path, body=b"", extra=None):
                                 f"SignedHeaders={signed_names},Signature={signature}")
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     try:
-        connection.request(method, path, body=body if method == "PUT" else None, headers=headers)
+        connection.request(method, path, body=body if method in ("PUT", "POST") else None, headers=headers)
         response = connection.getresponse()
         return response.status, response.read(), response.headers
     finally:
@@ -81,4 +82,29 @@ status, _, _ = request("DELETE", key)
 assert status == 204, status
 status, _, _ = request("GET", key)
 assert status == 404, status
-print("Cluster HTTP tests passed: signed PUT, GET, range, HEAD, LIST, DELETE")
+
+multipart_key = f"/{bucket}/cluster-test/http-multipart.txt"
+status, content, _ = request("POST", multipart_key + "?uploads")
+assert status == 200, (status, content)
+upload_id = ET.fromstring(content).findtext("UploadId")
+assert upload_id, content
+part_etags = []
+for number, part in enumerate((b"hello ", b"world"), start=1):
+    status, _, headers = request("PUT", multipart_key + f"?partNumber={number}&uploadId={upload_id}", part)
+    assert status == 200, status
+    part_etags.append(headers["etag"])
+status, content, _ = request("GET", multipart_key + f"?uploadId={upload_id}&max-parts=1")
+assert status == 200 and b"<IsTruncated>true</IsTruncated>" in content, (status, content)
+status, content, _ = request("GET", f"/{bucket}?uploads&prefix=cluster-test%2Fhttp-multipart")
+assert status == 200 and upload_id.encode() in content, (status, content)
+completion = "<CompleteMultipartUpload>" + "".join(
+    f"<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+    for number, etag in enumerate(part_etags, start=1)) + "</CompleteMultipartUpload>"
+status, content, _ = request("POST", multipart_key + f"?uploadId={upload_id}", completion.encode(),
+                             {"content-type": "application/xml"})
+assert status == 200 and b"<CompleteMultipartUploadResult>" in content, (status, content)
+status, content, _ = request("GET", multipart_key)
+assert status == 200 and content == b"hello world", (status, content)
+status, content, _ = request("GET", f"/{bucket}?uploads&prefix=cluster-test%2Fhttp-multipart")
+assert status == 200 and upload_id.encode() not in content, (status, content)
+print("Cluster HTTP tests passed: signed object and multipart operations")

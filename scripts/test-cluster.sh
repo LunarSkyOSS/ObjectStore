@@ -20,10 +20,24 @@ wait_ready() {
   done
 }
 run_phase basic
+run_phase multipart-stage
+compose restart gateway
+wait_ready
+part_segment=$(compose exec -T metadata psql -U objectstore -d objectstore -At -c \
+  "SELECT segment_id FROM cluster_upload_segments LIMIT 1")
+printf '%s\n' "$part_segment" | grep -Eq '^[0-9a-f-]{36}$'
+part_shard=$(printf '%s' "$part_segment" | cut -c1-2)
+compose exec -T node-a sh -c 'printf corrupted > "/data/segments/$1/$2"' _ "$part_shard" "$part_segment"
+compose run --rm -T repair
+part_expected=$(compose exec -T metadata psql -U objectstore -d objectstore -At -c \
+  "SELECT encode(sha256,'hex') FROM cluster_upload_segments WHERE segment_id='$part_segment'")
+part_actual=$(compose exec -T node-a sha256sum "/data/segments/$part_shard/$part_segment" | cut -d' ' -f1)
+[ "$part_expected" = "$part_actual" ]
 run_phase same-host
 run_phase concurrent
 compose stop node-a
 run_phase degraded
+run_phase multipart-complete
 compose stop node-b
 run_phase quorum-lost
 compose start node-a node-b

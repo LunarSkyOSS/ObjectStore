@@ -164,6 +164,48 @@ final class MultipartStore implements MultipartStorage {
         remove(upload(id, bucket, key));
     }
 
+    @Override public synchronized PartPage listParts(String id, String bucket, String key,
+                                                     int marker, int maxParts) throws IOException {
+        Path dir = upload(id, bucket, key);
+        List<PartInfo> parts = new ArrayList<>();
+        boolean truncated = false;
+        try (var files = Files.list(dir)) {
+            for (Path file : files.filter(path -> path.getFileName().toString().matches("part-[0-9]{5}"))
+                    .sorted().toList()) {
+                int number = Integer.parseInt(file.getFileName().toString().substring(5));
+                if (number <= marker) continue;
+                if (parts.size() == maxParts) {
+                    truncated = true;
+                    break;
+                }
+                MessageDigest md5 = digest("MD5");
+                try (InputStream input = Files.newInputStream(file)) {
+                    byte[] buffer = new byte[65536];
+                    int count;
+                    while ((count = input.read(buffer)) != -1) md5.update(buffer, 0, count);
+                }
+                parts.add(new PartInfo(number, Files.size(file), SigV4.hex(md5.digest()),
+                    Files.getLastModifiedTime(file).toMillis()));
+            }
+        }
+        int next = parts.isEmpty() ? marker : parts.getLast().number();
+        return new PartPage(parts, next, truncated);
+    }
+
+    @Override public synchronized List<UploadInfo> listUploads(String bucket, String prefix) throws IOException {
+        List<UploadInfo> uploads = new ArrayList<>();
+        try (var dirs = Files.list(root)) {
+            for (Path dir : dirs.filter(Files::isDirectory).toList()) {
+                Upload upload = readUpload(dir);
+                if (upload.bucket().equals(bucket) && upload.key().startsWith(prefix))
+                    uploads.add(new UploadInfo(dir.getFileName().toString(), upload.key(),
+                        Files.getLastModifiedTime(dir.resolve("manifest")).toMillis()));
+            }
+        }
+        uploads.sort(Comparator.comparing(UploadInfo::key).thenComparing(UploadInfo::id));
+        return uploads;
+    }
+
     private Path upload(String id, String bucket, String key) throws IOException {
         if (!id.matches("[0-9a-f-]{36}")) throw new StoreException(404, "NoSuchUpload", "Upload not found");
         Path dir = root.resolve(id);

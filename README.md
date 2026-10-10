@@ -43,10 +43,10 @@ New objects retain their content type and key. Objects written by the earlier si
 - ✅ `PutObject`, `GetObject`, `HeadObject`, and `DeleteObject` in both modes
 - ✅ Single-range GET and `ListObjectsV2` in both modes
 - ✅ SHA-256 payload verification and `x-amz-checksum-sha256` in both modes
-- ✅ `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, and `AbortMultipartUpload` in single-node mode
-- ⬜ Multipart uploads in cluster mode
+- ✅ `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, and `AbortMultipartUpload` in both modes
+- ✅ `ListParts` and `ListMultipartUploads` in both modes
 - ⬜ Presigned URLs and streaming Signature V4 uploads
-- ⬜ `CopyObject`, `ListParts`, and `ListMultipartUploads`
+- ⬜ `CopyObject`
 - ⬜ `Content-MD5` and checksum algorithms other than SHA-256
 - ⬜ Bucket creation and listing, object versioning, ACLs, tags, and user metadata
 
@@ -91,6 +91,8 @@ docker compose --env-file /path/to/cluster.env -f compose.cluster.yaml run --rm 
 ```
 
 The cluster S3 endpoint binds to `127.0.0.1:9001`; storage nodes and PostgreSQL have no published ports. The separate repair container holds the repair credential and restores missing or corrupt replicas.
+
+Multipart parts are stored on cluster nodes and indexed in PostgreSQL. Incomplete uploads count toward the logical capacity limit; abort them to release that capacity. Repair includes staged parts. The gateway upgrades the metadata schema when it starts, so back up the database before upgrading an existing cluster.
 
 Node UUIDs persist on their volumes, and replica manifests use those UUIDs so reordering configured URLs cannot move an existing replica. Each node also has an operator-assigned physical host UUID. New writes require acknowledgements from two different host UUIDs. The optional `CLUSTER_TEST_NODE_DOMAINS=true` override counts containers instead, solely for local process tests; all containers in this Compose file share one physical host.
 

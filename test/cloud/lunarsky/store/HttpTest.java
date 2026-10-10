@@ -144,6 +144,16 @@ public final class HttpTest {
             "?partNumber=2&uploadId=" + upload), "PUT", second, Map.of()), HttpResponse.BodyHandlers.ofByteArray());
         status(200, partOne);
         status(200, partTwo);
+        var parts = client.send(signedUri(URI.create(base + "/objects/" + movie +
+            "?uploadId=" + upload + "&max-parts=1"), "GET", new byte[0], Map.of()),
+            HttpResponse.BodyHandlers.ofString());
+        if (parts.statusCode() != 200 || !parts.body().contains("<IsTruncated>true</IsTruncated>") ||
+            !parts.body().contains("<PartNumber>1</PartNumber>"))
+            throw new AssertionError("Multipart part listing failed: " + parts.body());
+        var uploads = client.send(signedUri(URI.create(base + "/objects?uploads&prefix=folder%2F"),
+            "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
+        if (uploads.statusCode() != 200 || !uploads.body().contains("<UploadId>" + upload + "</UploadId>"))
+            throw new AssertionError("Multipart upload listing failed: " + uploads.body());
         String completion = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" +
             partOne.headers().firstValue("etag").orElseThrow() +
             "</ETag></Part><Part><PartNumber>2</PartNumber><ETag>" +
@@ -156,6 +166,8 @@ public final class HttpTest {
         if (!"hello world".equals(new String(assembled.body(), StandardCharsets.UTF_8)) ||
             !"video/mp4".equals(assembled.headers().firstValue("content-type").orElse("")))
             throw new AssertionError("Completed multipart object mismatch");
+        status(404, client.send(signedUri(URI.create(base + "/objects/" + movie + "?uploadId=" + upload),
+            "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofByteArray()));
         var abandoned = client.send(signedUri(URI.create(base + "/objects/abandoned?uploads="),
             "POST", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
         String abandonedId = abandoned.body().split("<UploadId>")[1].split("</UploadId>")[0];

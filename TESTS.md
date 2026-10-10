@@ -18,7 +18,7 @@ The script compiles the source and test programs into `out/classes`, then runs:
 | --- | --- |
 | `StoreTest` | Signature V4 test vector and tampering, local writes and reads, quotas, restart persistence, multipart recovery, legacy reads, locking, and corruption rejection. |
 | `ConcurrencyTest` | Atomic local overwrites and consistent reads, listings, and deletes during concurrent access. |
-| `HttpTest` | Signed HTTP requests, object operations, ranges, listing, and single-node multipart uploads. |
+| `HttpTest` | Signed HTTP requests, object operations, ranges, listing, multipart uploads, and multipart listings in single-node mode. |
 | `ClusterNodeTest` | Node identity and locking, authenticated segment transfers, checksum rejection, repair authorization, and restart cleanup. |
 | `CliTest` | Version, status, verification, and a nonzero result for corrupt data. |
 
@@ -47,7 +47,7 @@ COMPOSE_PROJECT_NAME=objectstore-tests docker compose --env-file /tmp/objectstor
 
 If port 9001 is occupied, set `CLUSTER_HOST_PORT` to the same free port in both the environment file and the shell before running the script. The script reads that port from the shell; Compose reads it from the file.
 
-The Docker suite checks signed S3 operations, multi-segment objects, concurrent overwrites, reads and writes with a node stopped, refusal to write without a storage quorum, restart recovery, corrupt-replica repair, metadata unavailability, and placement on a newly joined node. It also checks that containers labeled as one physical host cannot satisfy the normal host quorum. Its local-only override permits the remaining phases to use containers as separate test domains.
+The Docker suite checks signed S3 operations, multi-segment objects, concurrent overwrites, multipart staging and listings, completion after a gateway restart and node loss, reads and writes with a node stopped, refusal to write without a storage quorum, restart recovery, corrupt-replica repair including staged parts, metadata unavailability, and placement on a newly joined node. It also checks that containers labeled as one physical host cannot satisfy the normal host quorum. Its local-only override permits the remaining phases to use containers as separate test domains.
 
 `ClusterMigrationTest` is a separate legacy-format fixture and is **not** run by either test script. Do not run its `create` phase against a populated metadata database. The migration procedure is in the [README](README.md#migrating-a-local-cluster).
 

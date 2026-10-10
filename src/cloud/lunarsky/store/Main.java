@@ -86,6 +86,16 @@ public final class Main {
     }
 
     private void handleBucket(HttpExchange exchange, Map<String, String> query, String hash) throws IOException {
+        if (exchange.getRequestMethod().equals("GET") && query.containsKey("uploads")) {
+            if (!query.get("uploads").isEmpty() ||
+                !query.keySet().stream().allMatch(java.util.Set.of("uploads", "prefix", "key-marker",
+                    "upload-id-marker", "max-uploads", "x-id")::contains) ||
+                (query.containsKey("x-id") && !"ListMultipartUploads".equals(query.get("x-id"))))
+                unsupported("Bucket operation");
+            requireEmptyBody(exchange, hash);
+            listUploads(exchange, query);
+            return;
+        }
         if (!exchange.getRequestMethod().equals("GET") || !"2".equals(query.get("list-type")) ||
             !query.keySet().stream().allMatch(java.util.Set.of("list-type", "prefix", "delimiter", "max-keys",
                 "continuation-token", "start-after", "encoding-type", "x-id")::contains) ||
@@ -183,12 +193,16 @@ public final class Main {
                 query.keySet().stream().allMatch(java.util.Set.of("uploads", "x-id")::contains) &&
                 (!query.containsKey("x-id") || query.get("x-id").equals("CreateMultipartUpload"));
         if (!query.containsKey("uploadId") ||
-            !query.keySet().stream().allMatch(java.util.Set.of("uploadId", "partNumber", "x-id")::contains))
+            !query.keySet().stream().allMatch(java.util.Set.of("uploadId", "partNumber",
+                "part-number-marker", "max-parts", "x-id")::contains))
             return false;
         String xId = query.get("x-id");
         if (method.equals("PUT")) return query.containsKey("partNumber") &&
+            !query.containsKey("part-number-marker") && !query.containsKey("max-parts") &&
             (xId == null || xId.equals("UploadPart"));
         if (query.containsKey("partNumber")) return false;
+        if (method.equals("GET")) return xId == null || xId.equals("ListParts");
+        if (query.containsKey("part-number-marker") || query.containsKey("max-parts")) return false;
         return (method.equals("POST") && (xId == null || xId.equals("CompleteMultipartUpload"))) ||
             (method.equals("DELETE") && (xId == null || xId.equals("AbortMultipartUpload")));
     }
@@ -231,8 +245,79 @@ public final class Main {
                 multipart.abort(id, bucket, key);
                 exchange.sendResponseHeaders(204, -1);
             }
+            case "GET" -> {
+                requireEmptyBody(exchange, hash);
+                listParts(exchange, id, key, query);
+            }
             default -> unsupported("Multipart operation");
         }
+    }
+
+    private void listParts(HttpExchange exchange, String id, String key, Map<String, String> query) throws IOException {
+        int marker = boundedNumber(query.get("part-number-marker"), 0, 10000, 0);
+        int maxParts = boundedNumber(query.get("max-parts"), 1, 1000, 1000);
+        MultipartStorage.PartPage page = multipart.listParts(id, bucket, key, marker, maxParts);
+        StringBuilder body = new StringBuilder("<ListPartsResult><Bucket>").append(xml(bucket))
+            .append("</Bucket><Key>").append(xml(key)).append("</Key><UploadId>").append(xml(id))
+            .append("</UploadId><PartNumberMarker>").append(marker)
+            .append("</PartNumberMarker><NextPartNumberMarker>").append(page.nextMarker())
+            .append("</NextPartNumberMarker><MaxParts>").append(maxParts)
+            .append("</MaxParts><IsTruncated>").append(page.truncated()).append("</IsTruncated>");
+        for (MultipartStorage.PartInfo part : page.parts()) {
+            body.append("<Part><PartNumber>").append(part.number()).append("</PartNumber><LastModified>")
+                .append(Instant.ofEpochMilli(part.modified())).append("</LastModified><ETag>&quot;")
+                .append(part.etag()).append("&quot;</ETag><Size>").append(part.length()).append("</Size></Part>");
+        }
+        sendXml(exchange, 200, body.append("</ListPartsResult>").toString());
+    }
+
+    private void listUploads(HttpExchange exchange, Map<String, String> query) throws IOException {
+        String prefix = query.getOrDefault("prefix", "");
+        String marker = query.getOrDefault("key-marker", "");
+        String uploadMarker = query.getOrDefault("upload-id-marker", "");
+        if (!uploadMarker.isEmpty() && marker.isEmpty())
+            throw new StoreException(400, "InvalidArgument", "Upload ID marker requires a key marker");
+        int maximum = boundedNumber(query.get("max-uploads"), 1, 1000, 1000);
+        List<MultipartStorage.UploadInfo> uploads = multipart.listUploads(bucket, prefix);
+        List<MultipartStorage.UploadInfo> page = new ArrayList<>();
+        boolean truncated = false;
+        for (MultipartStorage.UploadInfo upload : uploads) {
+            if (upload.key().compareTo(marker) < 0 ||
+                (upload.key().equals(marker) && upload.id().compareTo(uploadMarker) <= 0)) continue;
+            if (page.size() == maximum) {
+                truncated = true;
+                break;
+            }
+            page.add(upload);
+        }
+        StringBuilder body = new StringBuilder("<ListMultipartUploadsResult><Bucket>").append(xml(bucket))
+            .append("</Bucket><KeyMarker>").append(xml(marker)).append("</KeyMarker><UploadIdMarker>")
+            .append(xml(uploadMarker)).append("</UploadIdMarker><MaxUploads>").append(maximum)
+            .append("</MaxUploads><IsTruncated>").append(truncated).append("</IsTruncated>");
+        if (truncated) {
+            MultipartStorage.UploadInfo last = page.getLast();
+            body.append("<NextKeyMarker>").append(xml(last.key())).append("</NextKeyMarker><NextUploadIdMarker>")
+                .append(xml(last.id())).append("</NextUploadIdMarker>");
+        }
+        for (MultipartStorage.UploadInfo upload : page) {
+            body.append("<Upload><Key>").append(xml(upload.key())).append("</Key><UploadId>")
+                .append(xml(upload.id())).append("</UploadId><Initiated>")
+                .append(Instant.ofEpochMilli(upload.created())).append("</Initiated></Upload>");
+        }
+        sendXml(exchange, 200, body.append("</ListMultipartUploadsResult>").toString());
+    }
+
+    private static int boundedNumber(String text, int minimum, int maximum, int defaultValue) {
+        if (text == null) return defaultValue;
+        int value;
+        try {
+            value = Integer.parseInt(text);
+        } catch (NumberFormatException error) {
+            throw new StoreException(400, "InvalidArgument", "Invalid listing limit or marker");
+        }
+        if (value < minimum || value > maximum)
+            throw new StoreException(400, "InvalidArgument", "Invalid listing limit or marker");
+        return value;
     }
 
     private static long contentLength(com.sun.net.httpserver.Headers headers) {
@@ -489,7 +574,7 @@ public final class Main {
                 required(env, "POSTGRES_PASSWORD"), bucket,
                 java.util.Arrays.stream(urls).map(URI::create).toList(), required(env, "CLUSTER_TOKEN"), null,
                 maxObject, maxTotal, "true".equals(env.get("CLUSTER_TEST_NODE_DOMAINS")));
-            multipart = new UnavailableMultipart();
+            multipart = (ClusterStore) store;
         } else if (mode.equals("disk")) {
             DiskStore disk = new DiskStore(Path.of(env.getOrDefault("DATA_DIR", "/data")), maxObject, maxTotal);
             store = disk;

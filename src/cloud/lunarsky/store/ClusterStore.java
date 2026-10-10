@@ -18,15 +18,18 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
-final class ClusterStore implements ObjectStorage {
+final class ClusterStore implements ObjectStorage, MultipartStorage {
     private record Segment(UUID id, int length, byte[] hash, List<UUID> replicas) {}
-    private record RepairTarget(UUID generation, int ordinal, long version, Segment segment) {}
+    private record RepairTarget(UUID id, int part, int ordinal, long version, Segment segment) {}
+    private record Upload(String contentType) {}
+    private record StoredPart(long length, String etag, List<Segment> segments) {}
     record RepairReport(int scanned, int restored, int underReplicated, int unrecoverable) {}
     private final String jdbcUrl, user, password, configuredBucket;
     private final NodeClient nodes;
@@ -116,7 +119,8 @@ final class ClusterStore implements ObjectStorage {
                 query.setString(1, bucket);
                 try (ResultSet result = query.executeQuery()) {
                     if (!result.next()) throw new SQLException("Bucket quota row is missing");
-                    if (result.getLong(1) - Math.max(0, previous) > maxTotal - length)
+                    if (maxTotal - (result.getLong(1) - Math.max(0, previous)) -
+                        stagedBytes(connection, bucket) < length)
                         throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
                 }
             }
@@ -168,7 +172,8 @@ final class ClusterStore implements ObjectStorage {
                 long previous = currentLength(connection, bucket, key);
                 if (createOnly && previous >= 0)
                     throw new StoreException(412, "PreconditionFailed", "Object already exists");
-                if (used - Math.max(0, previous) > maxTotal - length)
+                if (maxTotal - (used - Math.max(0, previous)) -
+                    stagedBytes(connection, bucket) < length)
                     throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
                 try (PreparedStatement insert = connection.prepareStatement(
                     "INSERT INTO cluster_segments (generation, ordinal, segment_id, length, sha256, replicas, replica_ids) VALUES (?, ?, ?, ?, ?, 'v2', ?)")) {
@@ -206,6 +211,276 @@ final class ClusterStore implements ObjectStorage {
                 throw error;
             }
         } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public String create(String bucket, String key, String contentType) throws IOException {
+        if (!configuredBucket.equals(bucket)) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+        if (contentType == null || contentType.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 255)
+            throw new StoreException(400, "InvalidArgument", "Invalid Content-Type");
+        UUID id = UUID.randomUUID();
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                lockUsage(connection, bucket);
+                try (PreparedStatement count = connection.prepareStatement("SELECT count(*) FROM cluster_uploads WHERE bucket=?")) {
+                    count.setString(1, bucket);
+                    try (ResultSet result = count.executeQuery()) {
+                        result.next();
+                        if (result.getLong(1) >= 32)
+                            throw new StoreException(503, "SlowDown", "Too many active uploads");
+                    }
+                }
+                try (PreparedStatement insert = connection.prepareStatement(
+                    "INSERT INTO cluster_uploads VALUES (?, ?, ?, ?, ?)")) {
+                    insert.setObject(1, id);
+                    insert.setString(2, bucket);
+                    insert.setString(3, key);
+                    insert.setString(4, contentType);
+                    insert.setLong(5, Instant.now().toEpochMilli());
+                    insert.executeUpdate();
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException error) {
+                connection.rollback();
+                if (error instanceof SQLException sql) throw databaseError(sql);
+                throw error;
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+        return id.toString();
+    }
+
+    @Override public String putPart(String id, String bucket, String key, int number, InputStream input,
+                                    long length, String expectedHash, String checksum) throws IOException {
+        if (number < 1 || number > 10000) throw new StoreException(400, "InvalidArgument", "Invalid part number");
+        validatePut(bucket, length, "application/octet-stream");
+        UUID uploadId = uploadId(id);
+        try (Connection connection = connect()) { upload(connection, uploadId, bucket, key, false); }
+        catch (SQLException error) { throw databaseError(error); }
+        Path staged = Files.createTempFile("objectstore-part-", ".pending");
+        MessageDigest md5 = digest("MD5");
+        List<Segment> segments;
+        try {
+            stageInput(staged, input, length, expectedHash, checksum, md5);
+            segments = uploadSegments(staged, length);
+        } finally { Files.deleteIfExists(staged); }
+        String etag = HexFormat.of().formatHex(md5.digest());
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                long used = lockUsage(connection, bucket);
+                upload(connection, uploadId, bucket, key, true);
+                long previous = partLength(connection, uploadId, number);
+                if (maxTotal - used - (stagedBytes(connection, bucket) - previous) < length)
+                    throw new StoreException(507, "InsufficientStorage", "Multipart staging limit reached");
+                try (PreparedStatement insert = connection.prepareStatement(
+                    "INSERT INTO cluster_upload_parts VALUES (?, ?, ?, ?, ?) ON CONFLICT (upload_id, part_number) DO UPDATE SET length=EXCLUDED.length, etag=EXCLUDED.etag, modified=EXCLUDED.modified")) {
+                    insert.setObject(1, uploadId);
+                    insert.setInt(2, number);
+                    insert.setLong(3, length);
+                    insert.setString(4, etag);
+                    insert.setLong(5, Instant.now().toEpochMilli());
+                    insert.executeUpdate();
+                }
+                try (PreparedStatement delete = connection.prepareStatement(
+                    "DELETE FROM cluster_upload_segments WHERE upload_id=? AND part_number=?")) {
+                    delete.setObject(1, uploadId);
+                    delete.setInt(2, number);
+                    delete.executeUpdate();
+                }
+                try (PreparedStatement insert = connection.prepareStatement(
+                    "INSERT INTO cluster_upload_segments VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+                    for (int ordinal = 0; ordinal < segments.size(); ordinal++) {
+                        Segment segment = segments.get(ordinal);
+                        insert.setObject(1, uploadId);
+                        insert.setInt(2, number);
+                        insert.setInt(3, ordinal);
+                        insert.setObject(4, segment.id());
+                        insert.setInt(5, segment.length());
+                        insert.setBytes(6, segment.hash());
+                        insert.setArray(7, connection.createArrayOf("uuid", segment.replicas().toArray()));
+                        insert.addBatch();
+                    }
+                    insert.executeBatch();
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException error) {
+                connection.rollback();
+                if (error instanceof SQLException sql) throw databaseError(sql);
+                throw error;
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+        return etag;
+    }
+
+    @Override public Metadata complete(String id, String bucket, String key, List<MultipartStorage.Part> parts) throws IOException {
+        if (parts.isEmpty() || parts.size() > 10000)
+            throw new StoreException(400, "InvalidPart", "No valid parts supplied");
+        UUID uploadId = uploadId(id);
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                long used = lockUsage(connection, bucket);
+                Upload upload = upload(connection, uploadId, bucket, key, true);
+                long staged = stagedBytes(connection, bucket);
+                long uploadBytes = uploadLength(connection, uploadId);
+                MessageDigest fullHash = digest("SHA-256");
+                MessageDigest etagHash = digest("MD5");
+                List<Segment> selected = new ArrayList<>();
+                long total = 0;
+                int last = 0;
+                for (MultipartStorage.Part requested : parts) {
+                    if (requested.number() <= last || requested.number() > 10000)
+                        throw new StoreException(400, "InvalidPartOrder", "Parts must be in ascending order");
+                    last = requested.number();
+                    StoredPart part = storedPart(connection, uploadId, requested.number());
+                    if (part == null || !part.etag().equals(requested.etag().replace("\"", "")))
+                        throw new StoreException(400, "InvalidPart", "Part ETag mismatch");
+                    if (part.length() > maxObject - total)
+                        throw new StoreException(413, "EntityTooLarge", "Object exceeds the configured size limit");
+                    total += part.length();
+                    MessageDigest partHash = digest("MD5");
+                    for (Segment segment : part.segments()) {
+                        byte[] bytes = readableSegment(segment);
+                        if (bytes == null) throw new StoreException(503, "SlowDown", "A part has no verified replica");
+                        fullHash.update(bytes);
+                        partHash.update(bytes);
+                        selected.add(segment);
+                    }
+                    byte[] md5 = partHash.digest();
+                    if (!part.etag().equals(HexFormat.of().formatHex(md5)))
+                        throw new StoreException(503, "SlowDown", "A part failed integrity verification");
+                    etagHash.update(md5);
+                }
+                long previous = currentLength(connection, bucket, key);
+                if (maxTotal - (used - Math.max(0, previous)) - (staged - uploadBytes) < total)
+                    throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
+                Metadata metadata = new Metadata(total, Instant.now().toEpochMilli(),
+                    HexFormat.of().formatHex(etagHash.digest()) + "-" + parts.size(), fullHash.digest(),
+                    bucket, key, upload.contentType());
+                UUID generation = UUID.randomUUID();
+                try (PreparedStatement insert = connection.prepareStatement(
+                    "INSERT INTO cluster_segments (generation, ordinal, segment_id, length, sha256, replicas, replica_ids) VALUES (?, ?, ?, ?, ?, 'v2', ?)")) {
+                    for (int ordinal = 0; ordinal < selected.size(); ordinal++) {
+                        Segment segment = selected.get(ordinal);
+                        insert.setObject(1, generation);
+                        insert.setInt(2, ordinal);
+                        insert.setObject(3, segment.id());
+                        insert.setInt(4, segment.length());
+                        insert.setBytes(5, segment.hash());
+                        insert.setArray(6, connection.createArrayOf("uuid", segment.replicas().toArray()));
+                        insert.addBatch();
+                    }
+                    insert.executeBatch();
+                }
+                try (PreparedStatement update = connection.prepareStatement(
+                    "INSERT INTO cluster_objects VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bucket, object_key) DO UPDATE SET generation=EXCLUDED.generation, length=EXCLUDED.length, modified=EXCLUDED.modified, etag=EXCLUDED.etag, sha256=EXCLUDED.sha256, content_type=EXCLUDED.content_type")) {
+                    bindObject(update, metadata, generation);
+                    update.executeUpdate();
+                }
+                try (PreparedStatement update = connection.prepareStatement("UPDATE cluster_usage SET used_bytes=? WHERE bucket=?")) {
+                    update.setLong(1, used - Math.max(0, previous) + total);
+                    update.setString(2, bucket);
+                    update.executeUpdate();
+                }
+                try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_tombstones WHERE bucket=? AND object_key=?")) {
+                    delete.setString(1, bucket);
+                    delete.setString(2, key);
+                    delete.executeUpdate();
+                }
+                try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_uploads WHERE upload_id=?")) {
+                    delete.setObject(1, uploadId);
+                    delete.executeUpdate();
+                }
+                connection.commit();
+                return metadata;
+            } catch (SQLException | IOException | RuntimeException error) {
+                connection.rollback();
+                if (error instanceof SQLException sql) throw databaseError(sql);
+                if (error instanceof IOException io) throw io;
+                throw error;
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public void abort(String id, String bucket, String key) throws IOException {
+        UUID uploadId = uploadId(id);
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                lockUsage(connection, bucket);
+                upload(connection, uploadId, bucket, key, true);
+                try (PreparedStatement delete = connection.prepareStatement("DELETE FROM cluster_uploads WHERE upload_id=?")) {
+                    delete.setObject(1, uploadId);
+                    delete.executeUpdate();
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException error) {
+                connection.rollback();
+                if (error instanceof SQLException sql) throw databaseError(sql);
+                throw error;
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public PartPage listParts(String id, String bucket, String key, int marker, int maxParts)
+            throws IOException {
+        UUID uploadId = uploadId(id);
+        try (Connection connection = connect()) {
+            upload(connection, uploadId, bucket, key, false);
+            List<PartInfo> parts = new ArrayList<>();
+            boolean truncated = false;
+            try (PreparedStatement query = connection.prepareStatement(
+                "SELECT part_number, length, etag, modified FROM cluster_upload_parts WHERE upload_id=? AND part_number>? ORDER BY part_number LIMIT ?")) {
+                query.setObject(1, uploadId);
+                query.setInt(2, marker);
+                query.setInt(3, maxParts + 1);
+                try (ResultSet result = query.executeQuery()) {
+                    while (result.next()) {
+                        if (parts.size() == maxParts) {
+                            truncated = true;
+                            break;
+                        }
+                        parts.add(new PartInfo(result.getInt(1), result.getLong(2), result.getString(3), result.getLong(4)));
+                    }
+                }
+            }
+            int next = parts.isEmpty() ? marker : parts.getLast().number();
+            return new PartPage(parts, next, truncated);
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public List<UploadInfo> listUploads(String bucket, String prefix) throws IOException {
+        if (!configuredBucket.equals(bucket)) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+        List<UploadInfo> uploads = new ArrayList<>();
+        try (Connection connection = connect(); PreparedStatement query = connection.prepareStatement(
+            "SELECT upload_id, object_key, created_at FROM cluster_uploads WHERE bucket=?")) {
+            query.setString(1, bucket);
+            try (ResultSet result = query.executeQuery()) {
+                while (result.next()) {
+                    String key = result.getString(2);
+                    if (key.startsWith(prefix))
+                        uploads.add(new UploadInfo(result.getObject(1).toString(), key, result.getLong(3)));
+                }
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+        uploads.sort(Comparator.comparing(UploadInfo::key).thenComparing(UploadInfo::id));
+        return uploads;
+    }
+
+    @Override public int activeUploads() {
+        try (Connection connection = connect(); PreparedStatement query = connection.prepareStatement(
+            "SELECT count(*) FROM cluster_uploads WHERE bucket=?")) {
+            query.setString(1, configuredBucket);
+            try (ResultSet result = query.executeQuery()) {
+                result.next();
+                return result.getInt(1);
+            }
+        } catch (SQLException error) { throw new IllegalStateException("Could not count multipart uploads", error); }
+    }
+
+    @Override public long stagedBytes() {
+        try (Connection connection = connect()) { return stagedBytes(connection, configuredBucket); }
+        catch (SQLException error) { throw new IllegalStateException("Could not count staged bytes", error); }
     }
 
     @Override public OpenObject open(String bucket, String key) throws IOException {
@@ -353,6 +628,106 @@ final class ClusterStore implements ObjectStorage {
             }
         }
     }
+
+    private static UUID uploadId(String id) {
+        try {
+            if (id == null || !id.matches("[0-9a-f-]{36}")) throw new IllegalArgumentException();
+            return UUID.fromString(id);
+        } catch (IllegalArgumentException error) {
+            throw new StoreException(404, "NoSuchUpload", "Upload not found");
+        }
+    }
+
+    private static Upload upload(Connection connection, UUID id, String bucket, String key, boolean lock)
+            throws SQLException {
+        String sql = "SELECT bucket, object_key, content_type, created_at FROM cluster_uploads WHERE upload_id=?" +
+            (lock ? " FOR UPDATE" : "");
+        try (PreparedStatement query = connection.prepareStatement(sql)) {
+            query.setObject(1, id);
+            try (ResultSet result = query.executeQuery()) {
+                if (!result.next() || !result.getString(1).equals(bucket) || !result.getString(2).equals(key))
+                    throw new StoreException(404, "NoSuchUpload", "Upload not found");
+                return new Upload(result.getString(3));
+            }
+        }
+    }
+
+    private static long stagedBytes(Connection connection, String bucket) throws SQLException {
+        try (PreparedStatement query = connection.prepareStatement(
+            "SELECT COALESCE(sum(p.length), 0) FROM cluster_upload_parts p JOIN cluster_uploads u USING (upload_id) WHERE u.bucket=?")) {
+            query.setString(1, bucket);
+            try (ResultSet result = query.executeQuery()) {
+                result.next();
+                return result.getLong(1);
+            }
+        }
+    }
+
+    private static long uploadLength(Connection connection, UUID id) throws SQLException {
+        try (PreparedStatement query = connection.prepareStatement(
+            "SELECT COALESCE(sum(length), 0) FROM cluster_upload_parts WHERE upload_id=?")) {
+            query.setObject(1, id);
+            try (ResultSet result = query.executeQuery()) {
+                result.next();
+                return result.getLong(1);
+            }
+        }
+    }
+
+    private static long partLength(Connection connection, UUID id, int number) throws SQLException {
+        try (PreparedStatement query = connection.prepareStatement(
+            "SELECT length FROM cluster_upload_parts WHERE upload_id=? AND part_number=?")) {
+            query.setObject(1, id);
+            query.setInt(2, number);
+            try (ResultSet result = query.executeQuery()) {
+                return result.next() ? result.getLong(1) : 0;
+            }
+        }
+    }
+
+    private static StoredPart storedPart(Connection connection, UUID id, int number) throws SQLException, IOException {
+        long length;
+        String etag;
+        try (PreparedStatement query = connection.prepareStatement(
+            "SELECT length, etag FROM cluster_upload_parts WHERE upload_id=? AND part_number=?")) {
+            query.setObject(1, id);
+            query.setInt(2, number);
+            try (ResultSet result = query.executeQuery()) {
+                if (!result.next()) return null;
+                length = result.getLong(1);
+                etag = result.getString(2);
+            }
+        }
+        List<Segment> segments = new ArrayList<>();
+        try (PreparedStatement query = connection.prepareStatement(
+            "SELECT ordinal, segment_id, length, sha256, replica_ids FROM cluster_upload_segments WHERE upload_id=? AND part_number=? ORDER BY ordinal")) {
+            query.setObject(1, id);
+            query.setInt(2, number);
+            try (ResultSet result = query.executeQuery()) {
+                long total = 0;
+                while (result.next()) {
+                    if (result.getInt(1) != segments.size()) throw new IOException("Incomplete multipart manifest");
+                    Segment segment = new Segment((UUID) result.getObject(2), result.getInt(3),
+                        result.getBytes(4), replicaIds(result, 5));
+                    total = Math.addExact(total, segment.length());
+                    segments.add(segment);
+                }
+                if (total != length) throw new IOException("Incomplete multipart manifest");
+            }
+        }
+        return new StoredPart(length, etag, segments);
+    }
+
+    private byte[] readableSegment(Segment segment) {
+        for (UUID id : segment.replicas()) {
+            int index = nodes.index(id);
+            if (index < 0) continue;
+            byte[] bytes = readableReplica(index, segment);
+            if (bytes != null) return bytes;
+        }
+        return null;
+    }
+
     private long currentLength(Connection connection, String bucket, String key) throws SQLException {
         try (PreparedStatement query = connection.prepareStatement("SELECT length FROM cluster_objects WHERE bucket=? AND object_key=?")) {
             query.setString(1, bucket);
@@ -419,14 +794,18 @@ final class ClusterStore implements ObjectStorage {
         try (Connection reader = connect()) {
             reader.setAutoCommit(false);
             try (PreparedStatement query = reader.prepareStatement(
-                "SELECT s.generation, s.ordinal, s.segment_id, s.length, s.sha256, s.replica_ids, s.placement_version FROM cluster_segments s JOIN cluster_objects o ON o.generation=s.generation ORDER BY s.generation, s.ordinal")) {
+                "SELECT s.generation, 0, s.ordinal, s.segment_id, s.length, s.sha256, s.replica_ids, s.placement_version " +
+                "FROM cluster_segments s JOIN cluster_objects o ON o.generation=s.generation " +
+                "UNION ALL SELECT s.upload_id, s.part_number, s.ordinal, s.segment_id, s.length, s.sha256, " +
+                "s.replica_ids, s.placement_version FROM cluster_upload_segments s " +
+                "ORDER BY 1, 2, 3")) {
                 query.setFetchSize(128);
                 try (ResultSet result = query.executeQuery()) {
                     while (result.next()) {
                         scanned++;
                         RepairTarget target = new RepairTarget((UUID) result.getObject(1), result.getInt(2),
-                            result.getLong(7), new Segment((UUID) result.getObject(3), result.getInt(4),
-                                result.getBytes(5), replicaIds(result, 6)));
+                            result.getInt(3), result.getLong(8), new Segment((UUID) result.getObject(4),
+                                result.getInt(5), result.getBytes(6), replicaIds(result, 7)));
                         Segment segment = target.segment();
                         byte[] copy = null;
                         Set<UUID> healthy = new HashSet<>();
@@ -458,12 +837,18 @@ final class ClusterStore implements ObjectStorage {
                         Set<UUID> listed = new java.util.LinkedHashSet<>(segment.replicas());
                         listed.addAll(healthy);
                         if (listed.size() != segment.replicas().size()) {
+                            String table = target.part() == 0 ? "cluster_segments" : "cluster_upload_segments";
+                            String identity = target.part() == 0 ? "generation=? AND ordinal=?" :
+                                "upload_id=? AND part_number=? AND ordinal=?";
                             try (Connection writer = connect(); PreparedStatement update = writer.prepareStatement(
-                                "UPDATE cluster_segments SET replica_ids=?, placement_version=placement_version+1 WHERE generation=? AND ordinal=? AND placement_version=?")) {
+                                "UPDATE " + table + " SET replica_ids=?, placement_version=placement_version+1 WHERE " +
+                                    identity + " AND placement_version=?")) {
                                 update.setArray(1, writer.createArrayOf("uuid", listed.toArray()));
-                                update.setObject(2, target.generation());
-                                update.setInt(3, target.ordinal());
-                                update.setLong(4, target.version());
+                                update.setObject(2, target.id());
+                                int next = 3;
+                                if (target.part() != 0) update.setInt(next++, target.part());
+                                update.setInt(next++, target.ordinal());
+                                update.setLong(next, target.version());
                                 update.executeUpdate();
                             }
                         }

@@ -21,7 +21,7 @@ final class SchemaMigrator {
                     result.next();
                     version = result.getInt(1);
                 }
-                if (version > 2) throw new IOException("Metadata schema is newer than this ObjectStore build");
+                if (version > 3) throw new IOException("Metadata schema is newer than this ObjectStore build");
                 if (version < 1) {
                     statement.execute("CREATE TABLE IF NOT EXISTS cluster_usage (bucket text PRIMARY KEY, used_bytes bigint NOT NULL CHECK (used_bytes >= 0))");
                     statement.execute("CREATE TABLE IF NOT EXISTS cluster_objects (bucket text NOT NULL, object_key text COLLATE \"C\" NOT NULL, generation uuid NOT NULL, length bigint NOT NULL, modified bigint NOT NULL, etag text NOT NULL, sha256 bytea NOT NULL, content_type text NOT NULL, PRIMARY KEY (bucket, object_key))");
@@ -36,6 +36,12 @@ final class SchemaMigrator {
                     statement.execute("CREATE TABLE IF NOT EXISTS cluster_nodes (node_id uuid PRIMARY KEY, host_id uuid NOT NULL, endpoint text NOT NULL UNIQUE, legacy_index integer UNIQUE, state text NOT NULL CHECK (state IN ('joining','active','draining','offline','retired')))");
                     statement.execute("CREATE TABLE IF NOT EXISTS cluster_format (singleton integer PRIMARY KEY CHECK (singleton=1), version integer NOT NULL)");
                     statement.execute("INSERT INTO cluster_schema_migrations VALUES (2)");
+                }
+                if (version < 3) {
+                    statement.execute("CREATE TABLE cluster_uploads (upload_id uuid PRIMARY KEY, bucket text NOT NULL, object_key text COLLATE \"C\" NOT NULL, content_type text NOT NULL, created_at bigint NOT NULL)");
+                    statement.execute("CREATE TABLE cluster_upload_parts (upload_id uuid NOT NULL REFERENCES cluster_uploads(upload_id) ON DELETE CASCADE, part_number integer NOT NULL CHECK (part_number BETWEEN 1 AND 10000), length bigint NOT NULL CHECK (length >= 0), etag text NOT NULL, modified bigint NOT NULL, PRIMARY KEY (upload_id, part_number))");
+                    statement.execute("CREATE TABLE cluster_upload_segments (upload_id uuid NOT NULL, part_number integer NOT NULL, ordinal integer NOT NULL, segment_id uuid NOT NULL, length integer NOT NULL, sha256 bytea NOT NULL, replica_ids uuid[] NOT NULL, placement_version bigint NOT NULL DEFAULT 0, PRIMARY KEY (upload_id, part_number, ordinal), FOREIGN KEY (upload_id, part_number) REFERENCES cluster_upload_parts(upload_id, part_number) ON DELETE CASCADE)");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (3)");
                 }
                 statement.execute("INSERT INTO cluster_format SELECT 1, CASE WHEN EXISTS (SELECT 1 FROM cluster_segments WHERE replica_ids IS NULL) THEN 1 ELSE 2 END WHERE NOT EXISTS (SELECT 1 FROM cluster_format)");
             }

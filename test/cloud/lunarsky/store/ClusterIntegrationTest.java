@@ -3,7 +3,10 @@ package cloud.lunarsky.store;
 import java.io.ByteArrayInputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.Arrays;
+import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 
 public final class ClusterIntegrationTest {
@@ -61,6 +64,60 @@ public final class ClusterIntegrationTest {
                         require(Arrays.equals(value, opened.stream().readAllBytes()), "Degraded write was not readable");
                     }
                     System.out.println("Cluster degraded test passed");
+                }
+                case "multipart-stage" -> {
+                    String key = "cluster-test/multipart";
+                    String id = store.create(bucket, key, "text/plain");
+                    byte[] first = "hello ".getBytes(StandardCharsets.UTF_8);
+                    byte[] second = "world".getBytes(StandardCharsets.UTF_8);
+                    putPart(store, id, bucket, key, 1, "old".getBytes(StandardCharsets.UTF_8));
+                    putPart(store, id, bucket, key, 1, first);
+                    putPart(store, id, bucket, key, 2, second);
+                    require(store.activeUploads() == 1, "Upload was not retained");
+                    require(store.stagedBytes() == first.length + second.length, "Replaced part was counted twice");
+                    require(store.listUploads(bucket, key).size() == 1, "Upload listing missed the staged upload");
+                    var firstPage = store.listParts(id, bucket, key, 0, 1);
+                    require(firstPage.truncated() && firstPage.parts().size() == 1 && firstPage.nextMarker() == 1,
+                        "Part listing did not paginate");
+                    require(store.listParts(id, bucket, key, 1, 1).parts().getFirst().number() == 2,
+                        "Part marker skipped the second part");
+                    try {
+                        store.open(bucket, key);
+                        throw new AssertionError("Incomplete upload became visible");
+                    } catch (StoreException error) { require(error.status == 404, "Wrong incomplete-upload status"); }
+                    System.out.println("Cluster multipart parts staged and listed");
+                }
+                case "multipart-complete" -> {
+                    String key = "cluster-test/multipart";
+                    var uploads = store.listUploads(bucket, key);
+                    require(uploads.size() == 1, "Upload did not survive gateway restart");
+                    String id = uploads.getFirst().id();
+                    var listed = store.listParts(id, bucket, key, 0, 1000).parts();
+                    require(listed.size() == 2, "Staged parts were lost");
+                    try {
+                        store.complete(id, bucket, key, List.of(new MultipartStorage.Part(1, "0".repeat(32))));
+                        throw new AssertionError("Wrong part ETag was accepted");
+                    } catch (StoreException error) { require(error.status == 400, "Wrong ETag rejection status"); }
+                    var completed = store.complete(id, bucket, key, List.of(
+                        new MultipartStorage.Part(1, listed.get(0).etag()),
+                        new MultipartStorage.Part(2, listed.get(1).etag())));
+                    byte[] expected = "hello world".getBytes(StandardCharsets.UTF_8);
+                    require(completed.length() == expected.length && completed.contentType().equals("text/plain"),
+                        "Completed object metadata is wrong");
+                    MessageDigest digest = MessageDigest.getInstance("MD5");
+                    digest.update(HexFormat.of().parseHex(listed.get(0).etag()));
+                    digest.update(HexFormat.of().parseHex(listed.get(1).etag()));
+                    require(completed.etag().equals(HexFormat.of().formatHex(digest.digest()) + "-2"),
+                        "Multipart ETag is wrong");
+                    try (var opened = store.open(bucket, key)) {
+                        require(Arrays.equals(opened.stream().readAllBytes(), expected), "Completed multipart body is wrong");
+                    }
+                    require(store.activeUploads() == 0 && store.stagedBytes() == 0, "Completed parts still count as staged");
+                    String aborted = store.create(bucket, "cluster-test/aborted", "text/plain");
+                    putPart(store, aborted, bucket, "cluster-test/aborted", 1, expected);
+                    store.abort(aborted, bucket, "cluster-test/aborted");
+                    require(store.activeUploads() == 0 && store.stagedBytes() == 0, "Aborted parts still count as staged");
+                    System.out.println("Cluster multipart completion survived restart and node loss");
                 }
                 case "quorum-lost" -> {
                     require(!store.ready(), "One available node must not be ready");
@@ -150,6 +207,11 @@ public final class ClusterIntegrationTest {
     private static void put(ClusterStore store, String bucket, String key, byte[] data, boolean createOnly) throws Exception {
         store.put(bucket, key, new ByteArrayInputStream(data), data.length, SigV4.hex(SigV4.hash(data)),
             null, createOnly, "application/octet-stream");
+    }
+    private static void putPart(ClusterStore store, String id, String bucket, String key, int number, byte[] data)
+            throws Exception {
+        store.putPart(id, bucket, key, number, new ByteArrayInputStream(data), data.length,
+            SigV4.hex(SigV4.hash(data)), null);
     }
     private static void require(boolean condition, String message) {
         if (!condition) throw new AssertionError(message);
