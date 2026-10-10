@@ -1,0 +1,58 @@
+x-client-tls: &client-tls
+  CLUSTER_NODES: https://node-a:9100,https://node-b:9100,https://node-c:9100
+  CLUSTER_TLS_TRUSTSTORE: /run/objectstore-tls/trust.p12
+  CLUSTER_TLS_PASSWORD_FILE: /run/objectstore-tls/trust.pass
+
+x-tls-volume: &tls-volume
+  - ${CLUSTER_TLS_DIR:?Set CLUSTER_TLS_DIR to a private certificate directory}:/run/objectstore-tls:ro
+
+x-node-health: &node-health
+  test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "9100"]
+  interval: 10s
+  timeout: 3s
+  retries: 3
+
+services:
+  gateway:
+    environment: *client-tls
+    volumes: *tls-volume
+
+  repair:
+    environment: *client-tls
+    volumes: *tls-volume
+
+  gc:
+    environment: *client-tls
+    volumes: *tls-volume
+
+  maintenance:
+    environment: *client-tls
+    volumes: *tls-volume
+
+  node-a:
+    environment:
+      NODE_TLS_KEYSTORE: /run/objectstore-tls/node-a.p12
+      NODE_TLS_PASSWORD_FILE: /run/objectstore-tls/node-a.pass
+    volumes: *tls-volume
+    healthcheck: *node-health
+
+  node-b:
+    environment:
+      NODE_TLS_KEYSTORE: /run/objectstore-tls/node-b.p12
+      NODE_TLS_PASSWORD_FILE: /run/objectstore-tls/node-b.pass
+    volumes: *tls-volume
+    healthcheck: *node-health
+
+  node-c:
+    environment:
+      NODE_TLS_KEYSTORE: /run/objectstore-tls/node-c.p12
+      NODE_TLS_PASSWORD_FILE: /run/objectstore-tls/node-c.pass
+    volumes: *tls-volume
+    healthcheck: *node-health
+
+  node-d:
+    environment:
+      NODE_TLS_KEYSTORE: /run/objectstore-tls/node-d.p12
+      NODE_TLS_PASSWORD_FILE: /run/objectstore-tls/node-d.pass
+    volumes: *tls-volume
+    healthcheck: *node-health

@@ -21,6 +21,7 @@ Source: [GitHub](https://github.com/LunarSkyOSS/ObjectStore) · [Gitea mirror](h
 - [Capability discovery](#capability-discovery)
 - [Java client](#java-client)
 - [Local cluster prototype](#local-cluster-prototype)
+- [Node transport TLS](#node-transport-tls)
 - [Migrating a local cluster](#migrating-a-local-cluster)
 - [Adding a cluster node](#adding-a-cluster-node)
 - [Cluster maintenance and recovery](#cluster-maintenance-and-recovery)
@@ -36,6 +37,7 @@ ObjectStore creates the configured default bucket at startup. Additional buckets
 - ✅ Configurable per-object and total logical size limits
 - ✅ CLI status, version, and full payload verification
 - ✅ Local cluster prototype with stable node IDs and host-aware placement code
+- ✅ Optional HTTPS between cluster processes and storage nodes
 - ✅ Opt-in automatic repair, rebalance, and guarded garbage collection in the local cluster
 - ✅ Metadata backup and tested restore to a separate local PostgreSQL instance
 - ✅ Manual [two-machine durability and metadata-restore drill](tests/two-host/README.md)
@@ -127,6 +129,23 @@ docker compose --env-file /path/to/cluster.env -f compose.cluster.yaml run --rm 
 
 The cluster S3 endpoint binds to `127.0.0.1:9001`; storage nodes and PostgreSQL have no published ports. The separate repair container holds the repair credential and restores missing or corrupt replicas.
 
+## Node transport TLS
+
+The default local Compose cluster uses HTTP inside its private Docker network. For an HTTPS test, give each node a PKCS#12 keystore containing its private key and a certificate whose DNS subject alternative name matches its `CLUSTER_NODES` hostname. Give the gateway, repair, garbage collection, and maintenance processes a PKCS#12 truststore containing the issuing CA or each node certificate. Mount the files read-only and keep the keystores and password files outside Git.
+
+Set `NODE_TLS_KEYSTORE` and `NODE_TLS_PASSWORD_FILE` on each node. Set `CLUSTER_TLS_TRUSTSTORE` and `CLUSTER_TLS_PASSWORD_FILE` on every process that contacts nodes, and change each node URL to `https://`. With a truststore configured, HTTP node URLs are rejected. The client verifies the certificate chain and hostname; a failed handshake does not fall back to HTTP. Both settings in each pair are required. Restart affected processes after rotating certificates or truststores.
+
+The optional [Compose TLS overlay](compose.cluster.tls.yaml) expects `node-a.p12` through `node-d.p12`, matching `.pass` files, and `trust.p12` with `trust.pass` in `CLUSTER_TLS_DIR`. Set that variable to a private certificate directory and include both Compose files:
+
+```sh
+CLUSTER_TLS_DIR=/private/objectstore-certs docker compose --env-file /path/to/cluster.env \
+  -f compose.cluster.yaml -f compose.cluster.tls.yaml up -d --build
+```
+
+The files must be readable by container UID 10001 without making private keys or passwords world-readable. Add HTTPS URLs for additional nodes when expanding the cluster.
+
+This secures node traffic only. The local cluster still lacks automatic PostgreSQL failover, database TLS configuration, encryption at rest, and production multi-server validation. Its HTTP S3 gateway remains bound to localhost; use a separate trusted proxy for external TLS. Do not treat the TLS overlay as a production deployment.
+
 Multipart parts are stored on cluster nodes and indexed in PostgreSQL. Incomplete uploads count toward the logical capacity limit; abort them to release that capacity. Repair includes staged parts. The gateway upgrades the metadata schema when it starts, so back up the database before upgrading an existing cluster.
 
 Node UUIDs persist on their volumes, and replica manifests use those UUIDs so reordering configured URLs cannot move an existing replica. Each node also has an operator-assigned physical host UUID. New writes require acknowledgements from two different host UUIDs. The optional `CLUSTER_TEST_NODE_DOMAINS=true` override counts containers instead, solely for local process tests; all containers in this Compose file share one physical host.
@@ -169,7 +188,7 @@ ObjectStore uses the socket peer as the client IP and ignores forwarded-IP heade
 
 Enable these limits only on a deliberately public endpoint. They also apply to direct localhost storage calls to that same endpoint; leave them disabled for the local-only setup or run a separate local-only instance if local storage calls must be exempt. A direct loopback `/health` probe without a forwarded-IP header remains exempt. The byte limit is aggregate ingress plus egress for each IP, and several users behind one NAT share it. If a proxy buffers complete uploads before forwarding them, the upload byte limit controls proxy-to-ObjectStore traffic, not the client's initial upload speed; disable request buffering when end-to-end upload pacing is required. It is a fairness control, not a defense against connection floods before the Java handler runs. Put an internet-facing proxy or firewall in front of the gateway for TLS, connection limits, request timeouts, and buffering controls. Do not expose storage nodes or PostgreSQL publicly.
 
-The local cluster has no automatic metadata failover, private-network TLS, scoped credentials, or physical host verification. Garbage collection can remove data required by an older metadata backup, so its retention guard is essential. Host UUIDs are operator labels, not proof that machines have separate power, disks, or network paths. Keep `CLUSTER_LOCAL_DEV=true` limited to local tests.
+The default local cluster still uses plaintext node and PostgreSQL connections. The optional TLS overlay secures node traffic, but PostgreSQL TLS, automatic metadata failover, scoped credentials, and physical host verification remain absent. Garbage collection can remove data required by an older metadata backup, so its retention guard is essential. Host UUIDs are operator labels, not proof that machines have separate power, disks, or network paths. Keep `CLUSTER_LOCAL_DEV=true` limited to local tests.
 
 The standalone cluster node binds to localhost by default. Set `NODE_BIND` only for a private test network; the Compose file binds inside its private Docker network. PostgreSQL JDBC 42.7.14 is bundled in the image with its license inside the JAR.
 

@@ -1,7 +1,6 @@
 package cloud.lunarsky.store;
 
 import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -325,7 +324,8 @@ public final class ClusterNode implements AutoCloseable {
             env.get("CLUSTER_REPAIR_TOKEN"),
             UUID.fromString(env.get("CLUSTER_HOST_ID")));
         int port = Integer.parseInt(env.getOrDefault("NODE_PORT", "9100"));
-        var server = HttpServer.create(new InetSocketAddress(env.getOrDefault("NODE_BIND", "127.0.0.1"), port), 64);
+        var server = ClusterTls.nodeServer(
+            new InetSocketAddress(env.getOrDefault("NODE_BIND", "127.0.0.1"), port), env);
         var executor = Executors.newVirtualThreadPerTaskExecutor();
         server.setExecutor(executor);
         server.createContext("/", node::handle);
@@ -336,6 +336,7 @@ public final class ClusterNode implements AutoCloseable {
             catch (IOException error) { System.err.println("Node close failed: " + error); }
         }));
         server.start();
-        System.out.println("ObjectStore cluster node listening on :" + port);
+        System.out.println("ObjectStore cluster node listening on :" + port +
+            (server instanceof com.sun.net.httpserver.HttpsServer ? " (TLS)" : " (HTTP)"));
     }
 }

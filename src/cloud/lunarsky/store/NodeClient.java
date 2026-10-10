@@ -21,18 +21,21 @@ final class NodeClient {
     record Node(UUID id, UUID hostId, URI url) {}
     record StoredSegment(UUID id, long modified) {}
 
-    private static final HttpClient IDENTITY_HTTP = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(2)).build();
+    private static HttpClient identityHttp;
     private final List<Node> nodes;
     private final String token;
     private final String repairToken;
-    private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+    private final HttpClient http;
     private final ConcurrentHashMap<UUID, Long> unreadableUntil = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Long> healthyUntil = new ConcurrentHashMap<>();
     private static final long READ_RETRY_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final long HEALTH_FRESH_NANOS = TimeUnit.SECONDS.toNanos(3);
 
-    NodeClient(List<Node> nodes, String token, String repairToken) {
+    NodeClient(List<Node> nodes, String token, String repairToken) throws IOException {
+        this(nodes, token, repairToken, ClusterTls.client(System.getenv(), Duration.ofSeconds(3)));
+    }
+
+    NodeClient(List<Node> nodes, String token, String repairToken, HttpClient http) {
         if (nodes.isEmpty() || nodes.stream().map(Node::id).distinct().count() != nodes.size() ||
             nodes.stream().map(Node::url).distinct().count() != nodes.size())
             throw new IllegalArgumentException("Cluster node IDs and URLs must be unique");
@@ -45,6 +48,7 @@ final class NodeClient {
         this.nodes = List.copyOf(nodes);
         this.token = token;
         this.repairToken = repairToken;
+        this.http = java.util.Objects.requireNonNull(http);
     }
 
     int count() { return nodes.size(); }
@@ -63,12 +67,16 @@ final class NodeClient {
     }
 
     static NodeIdentity probe(URI url, String token) throws IOException {
+        return probe(url, token, identityHttp());
+    }
+
+    static NodeIdentity probe(URI url, String token, HttpClient http) throws IOException {
         validateUrl(url);
         if (token == null || token.length() < 32) throw new IllegalArgumentException("Invalid cluster token");
         HttpRequest request = HttpRequest.newBuilder(url.resolve("/identity"))
             .timeout(Duration.ofSeconds(2)).header("X-Cluster-Token", token).GET().build();
         try {
-            HttpResponse<InputStream> response = IDENTITY_HTTP.send(request, HttpResponse.BodyHandlers.ofInputStream());
+            HttpResponse<InputStream> response = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
             try (InputStream body = response.body()) {
                 if (response.statusCode() != 200) throw new IOException("Node identity request failed: " + response.statusCode());
                 byte[] bytes = body.readNBytes(128);
@@ -90,19 +98,38 @@ final class NodeClient {
         catch (IOException offline) { return null; }
     }
 
+    private static NodeIdentity probeIfAvailable(URI url, String token, HttpClient http) {
+        try { return probe(url, token, http); }
+        catch (IOException offline) { return null; }
+    }
+
+    private static synchronized HttpClient identityHttp() throws IOException {
+        if (identityHttp == null)
+            identityHttp = ClusterTls.client(System.getenv(), Duration.ofSeconds(2));
+        return identityHttp;
+    }
+
     static void validateUrl(URI url) {
-        if (url == null || !"http".equals(url.getScheme()) || url.getHost() == null ||
+        String trustStore = System.getenv("CLUSTER_TLS_TRUSTSTORE");
+        validateUrl(url, trustStore != null && !trustStore.isBlank());
+    }
+
+    static void validateUrl(URI url, boolean requireHttps) {
+        if (url == null || !("http".equals(url.getScheme()) || "https".equals(url.getScheme())) ||
+            url.getHost() == null ||
             url.getPort() < 1 || url.getRawUserInfo() != null ||
             (url.getRawPath() != null && !url.getRawPath().isEmpty()) ||
             url.getRawQuery() != null || url.getRawFragment() != null)
             throw new IllegalArgumentException("Invalid private storage node URL");
+        if (requireHttps && !"https".equals(url.getScheme()))
+            throw new IllegalArgumentException("Cluster TLS truststore requires HTTPS node URLs");
     }
 
     boolean availableHostsAtLeast(int required, boolean testNodeDomains) {
         Set<UUID> healthy = new HashSet<>();
         for (int i = 0; i < nodes.size(); i++) {
             Node node = nodes.get(i);
-            NodeIdentity actual = probeIfAvailable(node.url(), token);
+            NodeIdentity actual = probeIfAvailable(node.url(), token, http);
             if (actual == null || !actual.nodeId().equals(node.id()) || !actual.hostId().equals(node.hostId())) {
                 markUnreadable(node);
                 continue;
@@ -159,7 +186,7 @@ final class NodeClient {
         Node node = nodes.get(index);
         if (unreadable(node)) throw new IOException("Storage node is temporarily unreachable");
         if (!recentlyHealthy(node)) {
-            NodeIdentity actual = probeIfAvailable(node.url(), token);
+            NodeIdentity actual = probeIfAvailable(node.url(), token, http);
             if (actual == null || !actual.nodeId().equals(node.id()) || !actual.hostId().equals(node.hostId())) {
                 markUnreadable(node);
                 throw new IOException("Storage node is temporarily unreachable");

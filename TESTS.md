@@ -21,10 +21,11 @@ The script compiles the source and test programs into `out/classes`, then runs:
 | `HttpTest` | Signed capability discovery, presigned URLs, streaming uploads and trailers, object and bucket operations, ACL grants with a second access key and public reads, copies, checksum persistence and rejection, ranges, listing, metadata, tags, multipart uploads, and versioning in single-node mode. |
 | `ClientLimitsTest` | Disabled defaults, trusted-proxy address validation, ignored untrusted headers, per-IP request refusal, and paced response bytes. |
 | `ClusterNodeTest` | Node identity and locking, authenticated segment transfers, checksum rejection, repair authorization, inventory and guarded deletion, and restart cleanup. |
+| `ClusterTlsTest` | HTTPS node identity and segment roundtrip with a trusted certificate, plus rejection of untrusted and wrong-host certificates. |
 | `CliTest` | Version, status, verification, and a nonzero result for corrupt data. |
 | `ClientTest` and `MultipartClientTest` | Java client request signing, capability discovery, error handling, and multipart operations. |
 
-The script exits nonzero on failure. The test programs use temporary local directories and loopback HTTP ports; they do not use an existing ObjectStore volume.
+The script exits nonzero on failure. The test programs use temporary local directories and loopback HTTP or HTTPS ports; they do not use an existing ObjectStore volume. `ClusterTlsTest` uses the JDK's `keytool` to create disposable test certificates.
 
 ## Disposable Docker cluster tests
 
