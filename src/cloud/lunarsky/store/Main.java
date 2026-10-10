@@ -114,7 +114,8 @@ public final class Main {
         String method = exchange.getRequestMethod();
         boolean multipartRequest = multipartRequest(method, query);
         if (!multipartRequest && !query.isEmpty() && !(query.size() == 1 &&
-            ("PutObject".equals(query.get("x-id")) || "GetObject".equals(query.get("x-id")) ||
+            ("PutObject".equals(query.get("x-id")) || "CopyObject".equals(query.get("x-id")) ||
+             "GetObject".equals(query.get("x-id")) ||
              "HeadObject".equals(query.get("x-id")) || "DeleteObject".equals(query.get("x-id")))))
             unsupported("Query operation");
         validateObjectHeaders(exchange.getRequestHeaders());
@@ -122,9 +123,19 @@ public final class Main {
             handleMultipart(exchange, method, query, key, hash);
             return;
         }
-        if (!method.equals("PUT")) requireEmptyBody(exchange, hash);
+        boolean copy = exchange.getRequestHeaders().containsKey("x-amz-copy-source");
+        if (!method.equals("PUT") && (copy || exchange.getRequestHeaders().containsKey("content-md5") ||
+            exchange.getRequestHeaders().containsKey("x-amz-metadata-directive") ||
+            exchange.getRequestHeaders().containsKey("x-amz-sdk-checksum-algorithm") ||
+            exchange.getRequestHeaders().keySet().stream().anyMatch(name ->
+                name.toLowerCase(Locale.ROOT).startsWith("x-amz-checksum-"))))
+            unsupported("Object upload header");
+        if (!method.equals("PUT") || copy) requireEmptyBody(exchange, hash);
         switch (method) {
-            case "PUT" -> putObject(exchange, key, hash);
+            case "PUT" -> {
+                if (copy) copyObject(exchange, key);
+                else putObject(exchange, key, hash);
+            }
             case "GET", "HEAD" -> readObject(exchange, key);
             case "DELETE" -> deleteObject(exchange, key);
             default -> unsupported("HTTP method");
@@ -135,17 +146,14 @@ public final class Main {
         for (String name : headers.keySet()) {
             String lower = name.toLowerCase(java.util.Locale.ROOT);
             if (lower.startsWith("x-amz-") && !java.util.Set.of("x-amz-date", "x-amz-content-sha256",
-                "x-amz-checksum-sha256", "x-amz-sdk-checksum-algorithm", "x-amz-user-agent").contains(lower))
+                "x-amz-sdk-checksum-algorithm", "x-amz-user-agent", "x-amz-copy-source",
+                "x-amz-metadata-directive").contains(lower) && !lower.startsWith("x-amz-checksum-"))
                 unsupported("Amazon header");
             if (lower.startsWith("x-amz-meta-") || lower.startsWith("x-amz-server-side-") ||
-                lower.startsWith("x-amz-copy-") || lower.startsWith("x-amz-acl") ||
+                lower.startsWith("x-amz-acl") ||
                 lower.startsWith("x-amz-grant") || lower.startsWith("x-amz-tagging") ||
-                lower.equals("content-md5")) unsupported("Object metadata, encryption, ACL, copy, tagging or MD5 header");
-            if (lower.startsWith("x-amz-checksum-") && !lower.equals("x-amz-checksum-sha256"))
-                unsupported("Checksum algorithm");
+                lower.startsWith("x-amz-copy-source-")) unsupported("Object metadata, encryption, ACL or tagging header");
         }
-        String algorithm = SigV4.single(headers, "x-amz-sdk-checksum-algorithm");
-        if (algorithm != null && !algorithm.equals("SHA256")) unsupported("Checksum algorithm");
     }
 
     private void putObject(HttpExchange exchange, String key, String hash) throws IOException {
@@ -156,12 +164,49 @@ public final class Main {
         try { bytes = length == null ? -1 : Long.parseLong(length); }
         catch (NumberFormatException e) { throw new StoreException(400, "InvalidArgument", "Invalid Content-Length"); }
         if (headers.containsKey("content-encoding")) unsupported("Encoded payload");
+        if (headers.containsKey("x-amz-metadata-directive")) unsupported("Copy metadata directive");
+        UploadChecksums checksums = UploadChecksums.from(headers);
         String type = contentType(headers);
-        ObjectStorage.Metadata data = store.put(bucket, key, exchange.getRequestBody(), bytes, hash,
-            SigV4.single(headers, "x-amz-checksum-sha256"), condition != null, type);
+        ObjectStorage.Metadata data = store.put(bucket, key, checksums.verifying(exchange.getRequestBody()),
+            bytes, hash, checksums.sha256(), condition != null, type);
         exchange.getResponseHeaders().set("ETag", "\"" + data.etag() + "\"");
         exchange.getResponseHeaders().set("x-amz-checksum-sha256", Base64.getEncoder().encodeToString(data.sha256()));
+        checksums.response(exchange.getResponseHeaders());
         exchange.sendResponseHeaders(200, -1);
+    }
+
+    private void copyObject(HttpExchange exchange, String key) throws IOException {
+        var headers = exchange.getRequestHeaders();
+        if (headers.containsKey("content-encoding") || headers.containsKey("content-md5") ||
+            headers.containsKey("if-none-match") || headers.containsKey("x-amz-sdk-checksum-algorithm") ||
+            headers.keySet().stream().anyMatch(name -> name.toLowerCase(Locale.ROOT).startsWith("x-amz-checksum-")))
+            unsupported("Copy request header");
+        String source = SigV4.single(headers, "x-amz-copy-source");
+        if (source == null) throw new StoreException(400, "InvalidArgument", "Missing copy source");
+        if (source.startsWith("/")) source = source.substring(1);
+        int separator = source.indexOf('/');
+        if (separator <= 0 || separator == source.length() - 1 || source.indexOf('?') >= 0)
+            throw new StoreException(400, "InvalidArgument", "Invalid copy source");
+        String sourceBucket = SigV4.decode(source.substring(0, separator));
+        String sourceKey = SigV4.decode(source.substring(separator + 1));
+        if (!sourceBucket.equals(bucket)) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+        if (sourceKey.isEmpty() || sourceKey.getBytes(StandardCharsets.UTF_8).length > 1024 ||
+            sourceKey.indexOf('\0') >= 0)
+            throw new StoreException(400, "InvalidArgument", "Invalid copy source key");
+        String directive = SigV4.single(headers, "x-amz-metadata-directive");
+        if (directive != null && !directive.equals("COPY") && !directive.equals("REPLACE"))
+            throw new StoreException(400, "InvalidArgument", "Invalid metadata directive");
+        if (!"REPLACE".equals(directive) && headers.containsKey("content-type"))
+            unsupported("Content-Type requires REPLACE metadata directive");
+        try (var object = store.open(bucket, sourceKey)) {
+            var sourceMetadata = object.metadata();
+            String type = "REPLACE".equals(directive) ? contentType(headers) : sourceMetadata.contentType();
+            var copied = store.put(bucket, key, object.stream(), sourceMetadata.length(),
+                SigV4.hex(sourceMetadata.sha256()), null, false, type);
+            sendXml(exchange, 200, "<CopyObjectResult><LastModified>" +
+                Instant.ofEpochMilli(copied.modified()) + "</LastModified><ETag>&quot;" +
+                copied.etag() + "&quot;</ETag></CopyObjectResult>");
+        }
     }
 
     private void deleteObject(HttpExchange exchange, String key) throws IOException {
@@ -212,6 +257,12 @@ public final class Main {
         var headers = exchange.getRequestHeaders();
         if (headers.containsKey("content-encoding") || headers.containsKey("if-none-match"))
             unsupported("Multipart request header");
+        if (headers.containsKey("x-amz-copy-source") || headers.containsKey("x-amz-metadata-directive"))
+            unsupported("Multipart copy request");
+        if (!method.equals("PUT") && (headers.containsKey("content-md5") ||
+            headers.containsKey("x-amz-sdk-checksum-algorithm") ||
+            headers.keySet().stream().anyMatch(name -> name.toLowerCase(Locale.ROOT).startsWith("x-amz-checksum-"))))
+            unsupported("Multipart checksum header");
         if (query.containsKey("uploads")) {
             requireEmptyBody(exchange, hash);
             String id = multipart.create(bucket, key, contentType(headers));
@@ -227,9 +278,11 @@ public final class Main {
                 try { number = Integer.parseInt(query.get("partNumber")); }
                 catch (NumberFormatException e) { throw new StoreException(400, "InvalidArgument", "Invalid part number"); }
                 long length = contentLength(headers);
-                String etag = multipart.putPart(id, bucket, key, number, exchange.getRequestBody(), length,
-                    hash, SigV4.single(headers, "x-amz-checksum-sha256"));
+                UploadChecksums checksums = UploadChecksums.from(headers);
+                String etag = multipart.putPart(id, bucket, key, number,
+                    checksums.verifying(exchange.getRequestBody()), length, hash, checksums.sha256());
                 exchange.getResponseHeaders().set("ETag", "\"" + etag + "\"");
+                checksums.response(exchange.getResponseHeaders());
                 exchange.sendResponseHeaders(200, -1);
             }
             case "POST" -> {

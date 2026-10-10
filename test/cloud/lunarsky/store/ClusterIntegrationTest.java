@@ -8,6 +8,9 @@ import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.UUID;
 
 public final class ClusterIntegrationTest {
     private static final String KEY = "cluster-test/survivor";
@@ -199,6 +202,42 @@ public final class ClusterIntegrationTest {
                         }
                     }
                     System.out.println("Joined node accepted new placements while previous objects stayed readable");
+                }
+                case "verify-expanded" -> {
+                    for (int i = 0; i < 32; i++) {
+                        try (var opened = store.open(bucket, "cluster-test/expanded-" + i)) {
+                            require(("expanded object " + i).equals(new String(opened.stream().readAllBytes(),
+                                StandardCharsets.UTF_8)), "Expanded object was lost during maintenance");
+                        }
+                    }
+                    System.out.println("Expanded objects survived repair and cleanup");
+                }
+                case "balanced" -> {
+                    try (var connection = java.sql.DriverManager.getConnection(env.get("POSTGRES_JDBC_URL"),
+                            env.get("POSTGRES_USER"), env.get("POSTGRES_PASSWORD"))) {
+                        NodeClient nodes = NodeRegistry.load(connection,
+                            Arrays.stream(urls).map(URI::create).toList(), env.get("CLUSTER_TOKEN"), null);
+                        int checked = 0;
+                        try (var query = connection.createStatement();
+                             var result = query.executeQuery("SELECT s.segment_id, s.replica_ids FROM cluster_segments s " +
+                                 "JOIN cluster_objects o ON o.generation=s.generation")) {
+                            while (result.next()) {
+                                UUID segment = (UUID) result.getObject(1);
+                                Set<UUID> preferred = new HashSet<>();
+                                Set<UUID> hosts = new HashSet<>();
+                                for (int index : PlacementPolicy.candidates(segment, nodes, true)) {
+                                    if (hosts.add(nodes.faultDomain(index, true))) preferred.add(nodes.node(index).id());
+                                    if (preferred.size() == 3) break;
+                                }
+                                Set<UUID> actual = new HashSet<>();
+                                for (Object id : (Object[]) result.getArray(2).getArray()) actual.add((UUID) id);
+                                require(actual.equals(preferred), "Segment did not move to preferred hosts");
+                                checked++;
+                            }
+                        }
+                        require(checked > 0, "No live segments were checked for placement");
+                    }
+                    System.out.println("Existing segments balanced across preferred hosts");
                 }
                 default -> throw new IllegalArgumentException("Unknown test phase");
             }

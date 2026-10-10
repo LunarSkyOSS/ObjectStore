@@ -3,6 +3,10 @@ if [ "${1:-}" = "cluster-repair" ]; then
   shift
   exec java -XX:MaxRAMPercentage=70 --add-modules java.net.http -cp /app:/app/postgresql.jar cloud.lunarsky.store.ClusterRepair "$@"
 fi
+if [ "${1:-}" = "cluster-gc" ]; then
+  shift
+  exec java -XX:MaxRAMPercentage=70 --add-modules java.net.http -cp /app:/app/postgresql.jar cloud.lunarsky.store.ClusterGc "$@"
+fi
 if [ "${1:-}" = "cluster-migrate" ]; then
   shift
   exec java -XX:MaxRAMPercentage=70 --add-modules java.net.http -cp /app:/app/postgresql.jar cloud.lunarsky.store.ClusterMigrate "$@"

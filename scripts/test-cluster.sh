@@ -3,8 +3,13 @@ set -eu
 cd "$(dirname "$0")/.."
 env_file=${1:?Usage: sh scripts/test-cluster.sh /path/to/local-cluster.env}
 host_port=${CLUSTER_HOST_PORT:-9001}
+backup_dir=
 compose() { docker compose --env-file "$env_file" -f compose.cluster.yaml "$@"; }
-restore() { compose start metadata node-a node-b >/dev/null 2>&1 || true; }
+restore() {
+  compose stop maintenance >/dev/null 2>&1 || true
+  compose start metadata node-a node-b node-c >/dev/null 2>&1 || true
+  if [ -n "$backup_dir" ]; then rm -rf "$backup_dir"; fi
+}
 trap restore EXIT
 compose up -d --build
 run_phase() {
@@ -69,4 +74,58 @@ compose up -d --no-deps gateway
 wait_ready
 run_phase recovered
 run_phase joined
+compose run --rm -T repair
+run_phase balanced
+export CLUSTER_MAINTENANCE_INTERVAL_SECONDS=1
+compose --profile automatic up -d maintenance
+node_a_id=$(compose exec -T metadata psql -U objectstore -d objectstore -At -c \
+  "SELECT node_id FROM cluster_nodes WHERE endpoint='http://node-a:9100'")
+segment_id=$(compose exec -T metadata psql -U objectstore -d objectstore -At -c \
+  "SELECT s.segment_id FROM cluster_segments s JOIN cluster_objects o ON o.generation=s.generation WHERE '$node_a_id'::uuid = ANY(s.replica_ids) LIMIT 1")
+expected=$(compose exec -T metadata psql -U objectstore -d objectstore -At -c \
+  "SELECT encode(s.sha256,'hex') FROM cluster_segments s WHERE s.segment_id='$segment_id' LIMIT 1")
+shard=$(printf '%s' "$segment_id" | cut -c1-2)
+compose exec -T node-a sh -c 'printf corrupted > "/data/segments/$1/$2"' _ "$shard" "$segment_id"
+attempt=0
+while :; do
+  actual=$(compose exec -T node-a sha256sum "/data/segments/$shard/$segment_id" | cut -d' ' -f1)
+  [ "$actual" = "$expected" ] && break
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 90 ] || { echo 'Automatic repair did not restore the replica' >&2; exit 1; }
+  sleep 1
+done
+compose stop maintenance
+export CLUSTER_GC_TEST_MODE=true CLUSTER_GC_MIN_AGE_SECONDS=0
+compose stop node-c
+if gc_refusal=$(compose run --rm -T gc --apply 2>&1); then
+  echo 'Cleanup proceeded while replicas needed repair' >&2
+  exit 1
+fi
+printf '%s\n' "$gc_refusal" | grep -q 'Refusing cleanup while live segments need repair'
+compose start node-c
+before=$(compose exec -T metadata psql -U objectstore -d objectstore -At -c \
+  'SELECT count(*) FROM cluster_gc_candidates')
+compose run --rm -T gc
+after=$(compose exec -T metadata psql -U objectstore -d objectstore -At -c \
+  'SELECT count(*) FROM cluster_gc_candidates')
+[ "$before" = "$after" ]
+first_gc=$(compose run --rm -T gc --apply)
+printf '%s\n' "$first_gc" | grep -q '^orphan_candidates=[1-9]'
+printf '%s\n' "$first_gc" | grep -q '^segments_deleted=0$'
+second_gc=$(compose run --rm -T gc --apply)
+printf '%s\n' "$second_gc" | grep -q '^segments_deleted=[1-9]'
+run_phase recovered
+run_phase verify-expanded
+backup_dir=$(mktemp -d)
+sh scripts/backup-cluster-metadata.sh "$env_file" "$backup_dir/metadata.dump"
+compose --profile recovery up -d --wait metadata-recovery
+compose exec -T metadata-recovery pg_restore -U objectstore -d objectstore --no-owner --no-acl \
+  < "$backup_dir/metadata.dump"
+compose stop metadata
+compose run --rm -T --no-deps \
+  -e 'POSTGRES_JDBC_URL=jdbc:postgresql://metadata-recovery:5432/objectstore?connectTimeout=3&socketTimeout=10' \
+  --entrypoint java gateway --add-modules jdk.httpserver,java.net.http \
+  -cp /app:/app/postgresql.jar cloud.lunarsky.store.ClusterIntegrationTest recovered
+compose start metadata
+wait_ready
 echo 'Cluster failure tests passed'

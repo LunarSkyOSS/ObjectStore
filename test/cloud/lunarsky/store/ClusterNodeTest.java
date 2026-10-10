@@ -75,6 +75,28 @@ public final class ClusterNodeTest {
                 client.repair(0, id, value, SigV4.hash(value));
                 require(java.util.Arrays.equals(value, client.get(0, id, value.length, SigV4.hash(value))),
                     "Repair did not restore the original bytes");
+                UUID orphan = UUID.randomUUID();
+                client.put(0, orphan, value, SigV4.hash(value));
+                var inventory = client.inventory(0, orphan.toString().substring(0, 2), null);
+                var listed = inventory.stream().filter(entry -> entry.id().equals(orphan)).findFirst().orElseThrow();
+                var forgedInventory = HttpRequest.newBuilder(uri.resolve("/segments?shard=" +
+                    orphan.toString().substring(0, 2))).header("X-Cluster-Token", token)
+                    .header("X-Cluster-Expected-Node", nodeId.toString()).GET().build();
+                require(HttpClient.newHttpClient().send(forgedInventory, HttpResponse.BodyHandlers.discarding())
+                    .statusCode() == 403, "Gateway token was allowed to list node segments");
+                var forgedDelete = HttpRequest.newBuilder(uri.resolve("/segments/" + orphan))
+                    .header("X-Cluster-Token", token).header("X-Cluster-Expected-Node", nodeId.toString())
+                    .header("X-Cluster-Expected-Mtime", Long.toString(listed.modified()))
+                    .header("X-Cluster-Gc-Min-Age-Millis", "0").DELETE().build();
+                require(HttpClient.newHttpClient().send(forgedDelete, HttpResponse.BodyHandlers.discarding())
+                    .statusCode() == 403, "Gateway token was allowed to delete a segment");
+                require(!client.deleteOrphan(0, new NodeClient.StoredSegment(orphan, listed.modified() - 1), 0),
+                    "Stale inventory entry deleted a segment");
+                require(client.deleteOrphan(0, listed, 0), "Confirmed orphan segment was not deleted");
+                try {
+                    client.get(0, orphan, value.length, SigV4.hash(value));
+                    throw new AssertionError("Deleted orphan was still readable");
+                } catch (IOException expected) { }
             } finally { server.stop(0); }
         }
         Path pending = root.resolve("pending").resolve("unfinished.part");

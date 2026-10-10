@@ -9,6 +9,7 @@ import java.net.http.HttpResponse;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
@@ -16,6 +17,7 @@ import java.util.UUID;
 
 final class NodeClient {
     record Node(UUID id, UUID hostId, URI url) {}
+    record StoredSegment(UUID id, long modified) {}
 
     private static final HttpClient IDENTITY_HTTP = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(2)).build();
@@ -42,6 +44,7 @@ final class NodeClient {
     int count() { return nodes.size(); }
     List<Node> nodes() { return nodes; }
     Node node(int index) { return nodes.get(index); }
+    boolean repairTokenUnavailable() { return repairToken == null || repairToken.length() < 32; }
     int index(UUID id) {
         for (int i = 0; i < nodes.size(); i++) {
             if (nodes.get(i).id().equals(id)) return i;
@@ -141,6 +144,59 @@ final class NodeClient {
                 throw new IOException("Node " + node.id() + " has no verified copy of segment " + id);
             return bytes;
         }
+    }
+
+    List<StoredSegment> inventory(int index, String shard, UUID after) throws IOException {
+        if (repairToken == null || repairToken.length() < 32)
+            throw new IOException("Repair authority is not available to this process");
+        Node node = nodes.get(index);
+        String path = "/segments?shard=" + shard + (after == null ? "" : "&after=" + after);
+        HttpRequest request = HttpRequest.newBuilder(node.url().resolve(path))
+            .timeout(Duration.ofSeconds(30)).header("X-Cluster-Token", token)
+            .header("X-Cluster-Expected-Node", node.id().toString())
+            .header("X-Cluster-Repair-Token", repairToken).GET().build();
+        HttpResponse<InputStream> response = send(request, HttpResponse.BodyHandlers.ofInputStream());
+        try (InputStream body = response.body()) {
+            if (response.statusCode() != 200) throw new IOException("Node inventory failed: " + response.statusCode());
+            byte[] bytes = body.readNBytes(70001);
+            if (bytes.length > 70000) throw new IOException("Node inventory response is too large");
+            List<StoredSegment> result = new ArrayList<>();
+            String last = after == null ? "" : after.toString();
+            for (String line : new String(bytes, java.nio.charset.StandardCharsets.US_ASCII).split("\n")) {
+                if (line.isEmpty()) continue;
+                String[] fields = line.split(" ", -1);
+                if (fields.length != 2) throw new IOException("Invalid node inventory response");
+                try {
+                    UUID id = UUID.fromString(fields[0]);
+                    if (!id.toString().equals(fields[0]) || !fields[0].startsWith(shard) ||
+                        fields[0].compareTo(last) <= 0)
+                        throw new IOException("Invalid node inventory cursor");
+                    result.add(new StoredSegment(id, Long.parseLong(fields[1])));
+                    last = fields[0];
+                } catch (IllegalArgumentException error) {
+                    throw new IOException("Invalid node inventory response", error);
+                }
+            }
+            if (result.size() > 1000) throw new IOException("Node inventory page is too large");
+            return result;
+        }
+    }
+
+    boolean deleteOrphan(int index, StoredSegment segment, long minimumAgeMillis) throws IOException {
+        if (repairToken == null || repairToken.length() < 32)
+            throw new IOException("Repair authority is not available to this process");
+        Node node = nodes.get(index);
+        HttpRequest request = HttpRequest.newBuilder(node.url().resolve("/segments/" + segment.id()))
+            .timeout(Duration.ofSeconds(30)).header("X-Cluster-Token", token)
+            .header("X-Cluster-Expected-Node", node.id().toString())
+            .header("X-Cluster-Repair-Token", repairToken)
+            .header("X-Cluster-Expected-Mtime", Long.toString(segment.modified()))
+            .header("X-Cluster-Gc-Min-Age-Millis", Long.toString(minimumAgeMillis))
+            .DELETE().build();
+        HttpResponse<Void> response = send(request, HttpResponse.BodyHandlers.discarding());
+        if (response.statusCode() == 204) return true;
+        if (response.statusCode() == 404 || response.statusCode() == 409) return false;
+        throw new IOException("Node refused orphan deletion: " + response.statusCode());
     }
 
     private <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) throws IOException {

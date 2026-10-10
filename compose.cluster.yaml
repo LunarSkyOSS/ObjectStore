@@ -59,7 +59,25 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  repair:
+  metadata-recovery:
+    image: postgres:17-alpine
+    profiles: [recovery]
+    environment:
+      POSTGRES_DB: objectstore
+      POSTGRES_USER: objectstore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - cluster-metadata-recovery:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U objectstore -d objectstore"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+
+  repair: &repair
     image: lunarsky-objectstore:cluster-local
     profiles: [maintenance]
     entrypoint: ["/usr/local/bin/objectstore", "cluster-repair"]
@@ -74,6 +92,50 @@ services:
       POSTGRES_JDBC_URL: jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10
       POSTGRES_USER: objectstore
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      CLUSTER_GC_MIN_AGE_SECONDS: ${CLUSTER_GC_MIN_AGE_SECONDS:-1209600}
+      CLUSTER_BACKUP_RETENTION_SECONDS: ${CLUSTER_BACKUP_RETENTION_SECONDS:-0}
+      CLUSTER_GC_TEST_MODE: ${CLUSTER_GC_TEST_MODE:-false}
+    mem_limit: 384m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  gc:
+    <<: *repair
+    entrypoint: ["/usr/local/bin/objectstore", "cluster-gc"]
+
+  maintenance:
+    image: lunarsky-objectstore:cluster-local
+    profiles: [automatic]
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/objectstore", "cluster-repair", "--loop"]
+    environment:
+      STORE_MODE: cluster
+      CLUSTER_LOCAL_DEV: "true"
+      CLUSTER_TEST_NODE_DOMAINS: "true"
+      CLUSTER_NODES: ${CLUSTER_NODES:-http://node-a:9100,http://node-b:9100,http://node-c:9100}
+      CLUSTER_TOKEN: ${CLUSTER_TOKEN:?Set CLUSTER_TOKEN}
+      CLUSTER_REPAIR_TOKEN: ${CLUSTER_REPAIR_TOKEN:?Set CLUSTER_REPAIR_TOKEN}
+      CLUSTER_MAINTENANCE_INTERVAL_SECONDS: ${CLUSTER_MAINTENANCE_INTERVAL_SECONDS:-60}
+      CLUSTER_GC_ENABLED: ${CLUSTER_GC_ENABLED:-false}
+      CLUSTER_GC_INTERVAL_SECONDS: ${CLUSTER_GC_INTERVAL_SECONDS:-86400}
+      CLUSTER_GC_MIN_AGE_SECONDS: ${CLUSTER_GC_MIN_AGE_SECONDS:-1209600}
+      CLUSTER_BACKUP_RETENTION_SECONDS: ${CLUSTER_BACKUP_RETENTION_SECONDS:-0}
+      CLUSTER_GC_TEST_MODE: ${CLUSTER_GC_TEST_MODE:-false}
+      S3_BUCKET: ${S3_BUCKET:-objects}
+      POSTGRES_JDBC_URL: jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10
+      POSTGRES_USER: objectstore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    depends_on:
+      metadata:
+        condition: service_healthy
+      node-a:
+        condition: service_healthy
+      node-b:
+        condition: service_healthy
+      node-c:
+        condition: service_healthy
     mem_limit: 384m
     security_opt:
       - no-new-privileges:true
@@ -121,6 +183,7 @@ services:
 
 volumes:
   cluster-metadata:
+  cluster-metadata-recovery:
   cluster-node-a:
   cluster-node-b:
   cluster-node-c:

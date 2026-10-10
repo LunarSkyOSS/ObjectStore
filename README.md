@@ -20,6 +20,7 @@ Source: [GitHub](https://github.com/LunarSkyOSS/ObjectStore) · [Gitea mirror](h
 - [Local cluster prototype](#local-cluster-prototype)
 - [Migrating a local cluster](#migrating-a-local-cluster)
 - [Adding a cluster node](#adding-a-cluster-node)
+- [Cluster maintenance and recovery](#cluster-maintenance-and-recovery)
 - [Limits and safety](#limits-and-safety)
 - [Disclaimer](#disclaimer)
 - [AI contributions](#ai-contributions)
@@ -32,7 +33,8 @@ ObjectStore serves one configured bucket.
 - ✅ Configurable per-object and total logical size limits
 - ✅ CLI status, version, and full payload verification
 - ✅ Local cluster prototype with stable node IDs and host-aware placement code
-- ⬜ Automatic repair, rebalance, and garbage collection
+- ✅ Opt-in automatic repair, rebalance, and guarded garbage collection in the local cluster
+- ✅ Metadata backup and tested restore to a separate local PostgreSQL instance
 - ⬜ Production multi-server deployment and metadata failover
 
 New objects retain their content type and key. Objects written by the earlier single-node format remain readable, but cannot appear in listings until overwritten because their original keys were not stored.
@@ -43,14 +45,16 @@ New objects retain their content type and key. Objects written by the earlier si
 - ✅ `PutObject`, `GetObject`, `HeadObject`, and `DeleteObject` in both modes
 - ✅ Single-range GET and `ListObjectsV2` in both modes
 - ✅ SHA-256 payload verification and `x-amz-checksum-sha256` in both modes
+- ✅ `Content-MD5` and CRC32, CRC32C, SHA-1, SHA-256, SHA-512, and MD5 checksum headers on `PutObject` and `UploadPart`
 - ✅ `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, and `AbortMultipartUpload` in both modes
 - ✅ `ListParts` and `ListMultipartUploads` in both modes
 - ⬜ Presigned URLs and streaming Signature V4 uploads
-- ⬜ `CopyObject`
-- ⬜ `Content-MD5` and checksum algorithms other than SHA-256
+- ✅ `CopyObject` within the configured bucket, with `COPY` and `REPLACE` content-type behavior
+- ⬜ CRC64NVME and XXHash checksums, checksum trailers, and persisted non-SHA-256 checksum metadata
 - ⬜ Bucket creation and listing, object versioning, ACLs, tags, and user metadata
 
 This is an S3 API subset, not full AWS S3 compatibility. Unsupported S3 operations and Amazon-specific headers are rejected.
+Checksum values are validated before an object or part is published. Non-SHA-256 checksums are returned on upload but are not stored for later reads. Copies use the existing object size limit and do not support cross-bucket or versioned sources.
 
 ## Single-node setup
 
@@ -110,11 +114,23 @@ The old format did not record the original URL mapping, so the inventory check i
 
 ## Adding a cluster node
 
-`objectstore cluster-join http://new-node:9100 expected-host-uuid` registers an additional local node. Add its URL to `CLUSTER_NODES` and restart the gateway to use it for new writes. Existing segments stay where their manifests say; this is capacity expansion for new writes, not a rebalance. `scripts/test-cluster.sh` exercises a fourth container joining and receiving new segments.
+`objectstore cluster-join http://new-node:9100 expected-host-uuid` registers an additional local node. Add its URL to `CLUSTER_NODES` and restart the gateway. A repair pass then copies existing segments to their preferred nodes and removes obsolete replicas from the manifest only after verifying the replacements. `scripts/test-cluster.sh` exercises a fourth container joining, receiving new segments, and rebalancing existing ones.
+
+## Cluster maintenance and recovery
+
+From the Compose directory, use `docker compose --env-file /path/to/cluster.env -f compose.cluster.yaml` as the command prefix:
+
+```sh
+docker compose --env-file /path/to/cluster.env -f compose.cluster.yaml --profile automatic up -d maintenance
+docker compose --env-file /path/to/cluster.env -f compose.cluster.yaml run --rm gc
+sh scripts/backup-cluster-metadata.sh /path/to/cluster.env /path/to/metadata.dump
+```
+
+The maintenance service is opt-in. It repairs missing or corrupt replicas and rebalances them every 60 seconds by default. Set `CLUSTER_MAINTENANCE_INTERVAL_SECONDS` to change the interval. The `gc` command is a dry run; use `gc --apply` only after checking its candidate count and keeping independent backups. Cleanup records each orphan on one pass and waits at least `CLUSTER_GC_MIN_AGE_SECONDS` before deleting it on a later pass. The default age is 14 days. To permit deletion, set `CLUSTER_BACKUP_RETENTION_SECONDS` to your actual backup retention in seconds; it must be at least one day and shorter than the cleanup age. Scheduled cleanup also requires `CLUSTER_GC_ENABLED=true` on the maintenance service. The backup command writes a verified PostgreSQL archive with private file permissions. Restore it to a separate database and point a gateway at that database only after validating the restore. A backup restore is manual recovery, not automatic failover.
 
 ## Limits and safety
 
-The cluster retains old and failed-write segments. It has no garbage collection, metadata standby, automated rebalance, private-network TLS, scoped credentials, or physical host verification yet. Host UUIDs are operator labels, not proof that machines have separate power, disks, or network paths. Keep `CLUSTER_LOCAL_DEV=true` limited to local tests.
+The local cluster has no automatic metadata failover, private-network TLS, scoped credentials, or physical host verification. Garbage collection can remove data required by an older metadata backup, so its retention guard is essential. Host UUIDs are operator labels, not proof that machines have separate power, disks, or network paths. Keep `CLUSTER_LOCAL_DEV=true` limited to local tests.
 
 The standalone cluster node binds to localhost by default. Set `NODE_BIND` only for a private test network; the Compose file binds inside its private Docker network. PostgreSQL JDBC 42.7.14 is bundled in the image with its license inside the JAR.
 

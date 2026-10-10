@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import datetime
+import base64
 import hashlib
 import hmac
 import http.client
 import pathlib
+import re
 import sys
 import urllib.parse
-import xml.etree.ElementTree as ET
+import zlib
 
 
 values = dict(line.strip().split("=", 1) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
@@ -83,15 +85,44 @@ assert status == 204, status
 status, _, _ = request("GET", key)
 assert status == 404, status
 
+copy_source = f"/{bucket}/cluster-test/copy-source.txt"
+copy_target = f"/{bucket}/cluster-test/copied.txt"
+body = b"cluster copy and checksum test"
+crc32 = base64.b64encode(zlib.crc32(body).to_bytes(4, "big")).decode()
+md5 = base64.b64encode(hashlib.md5(body).digest()).decode()
+status, _, headers = request("PUT", copy_source, body,
+                             {"content-type": "text/plain", "content-md5": md5,
+                              "x-amz-checksum-crc32": crc32,
+                              "x-amz-sdk-checksum-algorithm": "CRC32"})
+assert status == 200 and headers["x-amz-checksum-crc32"] == crc32, status
+status, content, _ = request("PUT", copy_source, body,
+                             {"content-md5": base64.b64encode(bytes(16)).decode()})
+assert status == 400 and b"BadDigest" in content, (status, content)
+status, content, _ = request("GET", copy_source)
+assert status == 200 and content == body, (status, content)
+status, content, _ = request("PUT", copy_target, extra={"x-amz-copy-source": copy_source})
+assert status == 200 and b"<CopyObjectResult>" in content, (status, content)
+status, content, headers = request("GET", copy_target)
+assert status == 200 and content == body and headers["content-type"] == "text/plain", (status, content)
+status, _, _ = request("DELETE", copy_source)
+assert status == 204, status
+status, _, _ = request("DELETE", copy_target)
+assert status == 204, status
+
 multipart_key = f"/{bucket}/cluster-test/http-multipart.txt"
 status, content, _ = request("POST", multipart_key + "?uploads")
 assert status == 200, (status, content)
-upload_id = ET.fromstring(content).findtext("UploadId")
-assert upload_id, content
+match = re.search(rb"<UploadId>([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})</UploadId>",
+                  content[:8192])
+assert match, content
+upload_id = match.group(1).decode("ascii")
 part_etags = []
 for number, part in enumerate((b"hello ", b"world"), start=1):
-    status, _, headers = request("PUT", multipart_key + f"?partNumber={number}&uploadId={upload_id}", part)
+    checksum = base64.b64encode(hashlib.sha1(part).digest()).decode()
+    status, _, headers = request("PUT", multipart_key + f"?partNumber={number}&uploadId={upload_id}",
+                                 part, {"x-amz-checksum-sha1": checksum})
     assert status == 200, status
+    assert headers["x-amz-checksum-sha1"] == checksum, headers
     part_etags.append(headers["etag"])
 status, content, _ = request("GET", multipart_key + f"?uploadId={upload_id}&max-parts=1")
 assert status == 200 and b"<IsTruncated>true</IsTruncated>" in content, (status, content)
@@ -107,4 +138,4 @@ status, content, _ = request("GET", multipart_key)
 assert status == 200 and content == b"hello world", (status, content)
 status, content, _ = request("GET", f"/{bucket}?uploads&prefix=cluster-test%2Fhttp-multipart")
 assert status == 200 and upload_id.encode() not in content, (status, content)
-print("Cluster HTTP tests passed: signed object and multipart operations")
+print("Cluster HTTP tests passed: signed objects, copies, checksums, and multipart operations")

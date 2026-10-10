@@ -15,7 +15,9 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Executors;
@@ -84,11 +86,18 @@ public final class ClusterNode implements AutoCloseable {
                 return;
             }
             if (!expectedNodeAndRepairAuthorized(exchange)) return;
+            if (path.equals("/segments") && exchange.getRequestMethod().equals("GET")) {
+                if (maintenanceAuthorized(exchange)) inventory(exchange);
+                return;
+            }
             String id = segmentId(exchange, path);
             if (id == null) return;
             switch (exchange.getRequestMethod()) {
                 case "PUT" -> put(exchange, segmentPath(id, true));
                 case "GET" -> get(exchange, segmentPath(id, false));
+                case "DELETE" -> {
+                    if (maintenanceAuthorized(exchange)) delete(exchange, segmentPath(id, false));
+                }
                 default -> respond(exchange, 405, "Method not allowed");
             }
         } catch (IllegalArgumentException error) {
@@ -128,6 +137,77 @@ public final class ClusterNode implements AutoCloseable {
             }
         }
         return true;
+    }
+
+    private boolean maintenanceAuthorized(HttpExchange exchange) throws IOException {
+        String supplied = exchange.getRequestHeaders().getFirst("X-Cluster-Repair-Token");
+        byte[] value = supplied == null ? new byte[0] : supplied.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        if (MessageDigest.isEqual(repairToken, value)) return true;
+        respond(exchange, 403, "Repair authority required");
+        return false;
+    }
+
+    private void inventory(HttpExchange exchange) throws IOException {
+        String query = exchange.getRequestURI().getRawQuery();
+        if (query == null || !query.matches("shard=[0-9a-f]{2}(&after=[0-9a-f-]{36})?")) {
+            respond(exchange, 400, "Invalid inventory request");
+            return;
+        }
+        String shard = query.substring(6, 8);
+        String after = query.length() > 8 ? query.substring(15) : "";
+        if (!after.isEmpty() && (!after.startsWith(shard) || !UUID.fromString(after).toString().equals(after))) {
+            respond(exchange, 400, "Invalid inventory cursor");
+            return;
+        }
+        Path directory = segments.resolve(shard);
+        if (!Files.isDirectory(directory)) {
+            respond(exchange, 200, "");
+            return;
+        }
+        List<Path> files;
+        try (var entries = Files.list(directory)) {
+            files = entries.filter(Files::isRegularFile).sorted(Comparator.comparing(path ->
+                path.getFileName().toString())).toList();
+        }
+        StringBuilder body = new StringBuilder();
+        int count = 0;
+        for (Path file : files) {
+            String id = file.getFileName().toString();
+            if (id.compareTo(after) <= 0 || !id.matches("[0-9a-f-]{36}")) continue;
+            if (!UUID.fromString(id).toString().equals(id)) continue;
+            body.append(id).append(' ').append(Files.getLastModifiedTime(file).toMillis()).append('\n');
+            if (++count == 1000) break;
+        }
+        respond(exchange, 200, body.toString());
+    }
+
+    private synchronized void delete(HttpExchange exchange, Path target) throws IOException {
+        String expected = exchange.getRequestHeaders().getFirst("X-Cluster-Expected-Mtime");
+        String age = exchange.getRequestHeaders().getFirst("X-Cluster-Gc-Min-Age-Millis");
+        long expectedTime, minimumAge;
+        try {
+            expectedTime = Long.parseLong(expected);
+            minimumAge = Long.parseLong(age);
+        } catch (NumberFormatException error) {
+            respond(exchange, 400, "Invalid deletion guard");
+            return;
+        }
+        if (minimumAge < 0 || minimumAge > System.currentTimeMillis()) {
+            respond(exchange, 400, "Invalid deletion age");
+            return;
+        }
+        if (!Files.isRegularFile(target)) {
+            exchange.sendResponseHeaders(404, -1);
+            return;
+        }
+        long modified = Files.getLastModifiedTime(target).toMillis();
+        if (modified != expectedTime || modified > System.currentTimeMillis() - minimumAge) {
+            exchange.sendResponseHeaders(409, -1);
+            return;
+        }
+        Files.delete(target);
+        DiskStore.syncDirectory(target.getParent());
+        exchange.sendResponseHeaders(204, -1);
     }
 
     private static String segmentId(HttpExchange exchange, String path) throws IOException {

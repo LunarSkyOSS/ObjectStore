@@ -21,6 +21,7 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -30,7 +31,8 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     private record RepairTarget(UUID id, int part, int ordinal, long version, Segment segment) {}
     private record Upload(String contentType) {}
     private record StoredPart(long length, String etag, List<Segment> segments) {}
-    record RepairReport(int scanned, int restored, int underReplicated, int unrecoverable) {}
+    record RepairReport(int scanned, int restored, int rebalanced, int underReplicated, int unrecoverable) {}
+    record GcReport(int scanned, int eligible, int deleted, int unavailableNodes) {}
     private final String jdbcUrl, user, password, configuredBucket;
     private final NodeClient nodes;
     private final long maxObject, maxTotal;
@@ -57,22 +59,29 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
 
     private Connection connect() throws SQLException { return DriverManager.getConnection(jdbcUrl, user, password); }
 
+    private static void lockGc(Connection connection, boolean shared) throws SQLException {
+        try (var statement = connection.createStatement()) {
+            statement.execute("SELECT pg_advisory_lock" + (shared ? "_shared" : "") + "(6834071092783)");
+        }
+    }
+
     @Override public Metadata put(String bucket, String key, InputStream input, long length, String expectedHash,
                                   String checksum, boolean createOnly, String contentType) throws IOException {
         validatePut(bucket, length, contentType);
         MessageDigest md5 = digest("MD5");
         Path staged = Files.createTempFile("objectstore-cluster-", ".pending");
-        List<Segment> segments;
-        byte[] fullHash;
         try {
-            fullHash = stageInput(staged, input, length, expectedHash, checksum, md5);
+            byte[] fullHash = stageInput(staged, input, length, expectedHash, checksum, md5);
             checkCapacity(bucket, key, length, createOnly);
-            segments = uploadSegments(staged, length);
+            try (Connection connection = connect()) {
+                lockGc(connection, true);
+                List<Segment> segments = uploadSegments(staged, length);
+                Metadata metadata = new Metadata(length, Instant.now().toEpochMilli(),
+                    HexFormat.of().formatHex(md5.digest()), fullHash, bucket, key, contentType);
+                persistObject(connection, metadata, segments, createOnly);
+                return metadata;
+            } catch (SQLException error) { throw databaseError(error); }
         } finally { Files.deleteIfExists(staged); }
-        Metadata metadata = new Metadata(length, Instant.now().toEpochMilli(),
-            HexFormat.of().formatHex(md5.digest()), fullHash, bucket, key, contentType);
-        persistObject(metadata, segments, createOnly);
-        return metadata;
     }
 
     private void validatePut(String bucket, long length, String contentType) {
@@ -161,11 +170,12 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         return segments;
     }
 
-    private void persistObject(Metadata metadata, List<Segment> segments, boolean createOnly) throws IOException {
+    private void persistObject(Connection connection, Metadata metadata, List<Segment> segments,
+                               boolean createOnly) throws IOException {
         String bucket = metadata.bucket(), key = metadata.key();
         long length = metadata.length();
         UUID generation = UUID.randomUUID();
-        try (Connection connection = connect()) {
+        try {
             connection.setAutoCommit(false);
             try {
                 long used = lockUsage(connection, bucket);
@@ -258,58 +268,58 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         catch (SQLException error) { throw databaseError(error); }
         Path staged = Files.createTempFile("objectstore-part-", ".pending");
         MessageDigest md5 = digest("MD5");
-        List<Segment> segments;
         try {
             stageInput(staged, input, length, expectedHash, checksum, md5);
-            segments = uploadSegments(staged, length);
-        } finally { Files.deleteIfExists(staged); }
-        String etag = HexFormat.of().formatHex(md5.digest());
-        try (Connection connection = connect()) {
-            connection.setAutoCommit(false);
-            try {
-                long used = lockUsage(connection, bucket);
-                upload(connection, uploadId, bucket, key, true);
-                long previous = partLength(connection, uploadId, number);
-                if (maxTotal - used - (stagedBytes(connection, bucket) - previous) < length)
-                    throw new StoreException(507, "InsufficientStorage", "Multipart staging limit reached");
-                try (PreparedStatement insert = connection.prepareStatement(
-                    "INSERT INTO cluster_upload_parts VALUES (?, ?, ?, ?, ?) ON CONFLICT (upload_id, part_number) DO UPDATE SET length=EXCLUDED.length, etag=EXCLUDED.etag, modified=EXCLUDED.modified")) {
-                    insert.setObject(1, uploadId);
-                    insert.setInt(2, number);
-                    insert.setLong(3, length);
-                    insert.setString(4, etag);
-                    insert.setLong(5, Instant.now().toEpochMilli());
-                    insert.executeUpdate();
-                }
-                try (PreparedStatement delete = connection.prepareStatement(
-                    "DELETE FROM cluster_upload_segments WHERE upload_id=? AND part_number=?")) {
-                    delete.setObject(1, uploadId);
-                    delete.setInt(2, number);
-                    delete.executeUpdate();
-                }
-                try (PreparedStatement insert = connection.prepareStatement(
-                    "INSERT INTO cluster_upload_segments VALUES (?, ?, ?, ?, ?, ?, ?)")) {
-                    for (int ordinal = 0; ordinal < segments.size(); ordinal++) {
-                        Segment segment = segments.get(ordinal);
+            try (Connection connection = connect()) {
+                lockGc(connection, true);
+                List<Segment> segments = uploadSegments(staged, length);
+                String etag = HexFormat.of().formatHex(md5.digest());
+                connection.setAutoCommit(false);
+                try {
+                    long used = lockUsage(connection, bucket);
+                    upload(connection, uploadId, bucket, key, true);
+                    long previous = partLength(connection, uploadId, number);
+                    if (maxTotal - used - (stagedBytes(connection, bucket) - previous) < length)
+                        throw new StoreException(507, "InsufficientStorage", "Multipart staging limit reached");
+                    try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO cluster_upload_parts VALUES (?, ?, ?, ?, ?) ON CONFLICT (upload_id, part_number) DO UPDATE SET length=EXCLUDED.length, etag=EXCLUDED.etag, modified=EXCLUDED.modified")) {
                         insert.setObject(1, uploadId);
                         insert.setInt(2, number);
-                        insert.setInt(3, ordinal);
-                        insert.setObject(4, segment.id());
-                        insert.setInt(5, segment.length());
-                        insert.setBytes(6, segment.hash());
-                        insert.setArray(7, connection.createArrayOf("uuid", segment.replicas().toArray()));
-                        insert.addBatch();
+                        insert.setLong(3, length);
+                        insert.setString(4, etag);
+                        insert.setLong(5, Instant.now().toEpochMilli());
+                        insert.executeUpdate();
                     }
-                    insert.executeBatch();
+                    try (PreparedStatement delete = connection.prepareStatement(
+                        "DELETE FROM cluster_upload_segments WHERE upload_id=? AND part_number=?")) {
+                        delete.setObject(1, uploadId);
+                        delete.setInt(2, number);
+                        delete.executeUpdate();
+                    }
+                    try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO cluster_upload_segments VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+                        for (int ordinal = 0; ordinal < segments.size(); ordinal++) {
+                            Segment segment = segments.get(ordinal);
+                            insert.setObject(1, uploadId);
+                            insert.setInt(2, number);
+                            insert.setInt(3, ordinal);
+                            insert.setObject(4, segment.id());
+                            insert.setInt(5, segment.length());
+                            insert.setBytes(6, segment.hash());
+                            insert.setArray(7, connection.createArrayOf("uuid", segment.replicas().toArray()));
+                            insert.addBatch();
+                        }
+                        insert.executeBatch();
+                    }
+                    connection.commit();
+                } catch (SQLException | RuntimeException error) {
+                    connection.rollback();
+                    if (error instanceof SQLException sql) throw databaseError(sql);
+                    throw error;
                 }
-                connection.commit();
-            } catch (SQLException | RuntimeException error) {
-                connection.rollback();
-                if (error instanceof SQLException sql) throw databaseError(sql);
-                throw error;
-            }
-        } catch (SQLException error) { throw databaseError(error); }
-        return etag;
+                return etag;
+            } catch (SQLException error) { throw databaseError(error); }
+        } finally { Files.deleteIfExists(staged); }
     }
 
     @Override public Metadata complete(String id, String bucket, String key, List<MultipartStorage.Part> parts) throws IOException {
@@ -487,6 +497,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         try (Connection connection = connect()) {
             connection.setAutoCommit(false);
             connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            lockGc(connection, true);
             try {
                 Metadata metadata;
                 UUID generation;
@@ -790,9 +801,12 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         } catch (SQLException error) { return false; }
     }
     RepairReport repairOnce() throws IOException {
-        int scanned = 0, restored = 0, underReplicated = 0, unrecoverable = 0;
+        int scanned = 0, restored = 0, rebalanced = 0, underReplicated = 0, unrecoverable = 0;
         try (Connection reader = connect()) {
             reader.setAutoCommit(false);
+            try (var lock = reader.createStatement()) {
+                lock.execute("SELECT pg_advisory_xact_lock(6834071092782)");
+            }
             try (PreparedStatement query = reader.prepareStatement(
                 "SELECT s.generation, 0, s.ordinal, s.segment_id, s.length, s.sha256, s.replica_ids, s.placement_version " +
                 "FROM cluster_segments s JOIN cluster_objects o ON o.generation=s.generation " +
@@ -808,7 +822,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                                 result.getInt(5), result.getBytes(6), replicaIds(result, 7)));
                         Segment segment = target.segment();
                         byte[] copy = null;
-                        Set<UUID> healthy = new HashSet<>();
+                        Set<UUID> healthy = new LinkedHashSet<>();
                         Set<UUID> healthyHosts = new HashSet<>();
                         for (UUID id : segment.replicas()) {
                             int node = nodes.index(id);
@@ -823,20 +837,45 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                             unrecoverable++;
                             continue;
                         }
+                        List<UUID> preferred = new ArrayList<>();
+                        Set<UUID> preferredHosts = new HashSet<>();
                         for (int node : PlacementPolicy.candidates(segment.id(), nodes, testNodeDomains)) {
                             UUID host = nodes.faultDomain(node, testNodeDomains);
-                            if (healthyHosts.contains(host)) continue;
+                            if (!preferredHosts.add(host)) continue;
+                            preferred.add(nodes.node(node).id());
+                            if (preferred.size() == 3) break;
+                        }
+                        for (UUID id : preferred) {
+                            int node = nodes.index(id);
+                            UUID host = nodes.faultDomain(node, testNodeDomains);
+                            if (healthy.contains(id)) continue;
                             if (repairReplica(node, segment, copy)) {
-                                healthy.add(nodes.node(node).id());
+                                healthy.add(id);
                                 healthyHosts.add(host);
                                 restored++;
                             }
-                            if (healthyHosts.size() == 3) break;
                         }
                         if (healthyHosts.size() < 3) underReplicated++;
-                        Set<UUID> listed = new java.util.LinkedHashSet<>(segment.replicas());
-                        listed.addAll(healthy);
-                        if (listed.size() != segment.replicas().size()) {
+                        List<UUID> listed = new ArrayList<>();
+                        Set<UUID> listedHosts = new HashSet<>();
+                        for (UUID id : preferred) {
+                            if (healthy.contains(id)) {
+                                listed.add(id);
+                                listedHosts.add(nodes.faultDomain(nodes.index(id), testNodeDomains));
+                            }
+                        }
+                        for (UUID id : segment.replicas()) {
+                            if (listed.size() == 3) break;
+                            int node = nodes.index(id);
+                            if (healthy.contains(id) && node >= 0 &&
+                                listedHosts.add(nodes.faultDomain(node, testNodeDomains))) listed.add(id);
+                        }
+                        if (listed.size() < 3) {
+                            for (UUID id : segment.replicas()) {
+                                if (!listed.contains(id)) listed.add(id);
+                            }
+                        }
+                        if (!listed.equals(segment.replicas())) {
                             String table = target.part() == 0 ? "cluster_segments" : "cluster_upload_segments";
                             String identity = target.part() == 0 ? "generation=? AND ordinal=?" :
                                 "upload_id=? AND part_number=? AND ordinal=?";
@@ -849,7 +888,8 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                                 if (target.part() != 0) update.setInt(next++, target.part());
                                 update.setInt(next++, target.ordinal());
                                 update.setLong(next, target.version());
-                                update.executeUpdate();
+                                if (update.executeUpdate() == 1 && preferred.stream().anyMatch(id ->
+                                    !segment.replicas().contains(id) && listed.contains(id))) rebalanced++;
                             }
                         }
                     }
@@ -857,7 +897,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
             }
             reader.commit();
         } catch (SQLException error) { throw databaseError(error); }
-        return new RepairReport(scanned, restored, underReplicated, unrecoverable);
+        return new RepairReport(scanned, restored, rebalanced, underReplicated, unrecoverable);
     }
 
     private byte[] readableReplica(int node, Segment segment) {
@@ -870,6 +910,114 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
             nodes.repair(node, segment.id(), copy, segment.hash());
             return true;
         } catch (IOException unavailable) { return false; }
+    }
+
+    GcReport collectGarbage(long minimumAgeMillis, boolean apply) throws IOException {
+        if (minimumAgeMillis < 0 || (minimumAgeMillis == 0 && !testNodeDomains))
+            throw new IllegalArgumentException("Invalid garbage collection age");
+        if (nodes.count() < 2 || nodes.repairTokenUnavailable())
+            throw new IllegalStateException("Garbage collection requires repair authority");
+        int scanned = 0, eligible = 0, deleted = 0, unavailable = 0;
+        try (Connection connection = connect()) {
+            try (var lock = connection.createStatement()) {
+                lock.execute("SELECT pg_advisory_lock(6834071092782)");
+            }
+            lockGc(connection, false);
+            try (PreparedStatement referenced = connection.prepareStatement(
+                "SELECT EXISTS (SELECT 1 FROM cluster_segments s JOIN cluster_objects o " +
+                "ON o.generation=s.generation WHERE s.segment_id=? AND ?=ANY(s.replica_ids) " +
+                "UNION ALL SELECT 1 FROM cluster_upload_segments s " +
+                "WHERE s.segment_id=? AND ?=ANY(s.replica_ids))");
+                 PreparedStatement candidate = connection.prepareStatement(
+                     "SELECT observed_mtime, first_seen FROM cluster_gc_candidates WHERE node_id=? AND segment_id=?");
+                 PreparedStatement mark = connection.prepareStatement(
+                     "INSERT INTO cluster_gc_candidates VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING");
+                 PreparedStatement reset = connection.prepareStatement(
+                     "UPDATE cluster_gc_candidates SET observed_mtime=?, first_seen=? WHERE node_id=? AND segment_id=?");
+                 PreparedStatement clear = connection.prepareStatement(
+                     "DELETE FROM cluster_gc_candidates WHERE node_id=? AND segment_id=?")) {
+                for (int node = 0; node < nodes.count(); node++) {
+                    boolean reachable = true;
+                    for (int shard = 0; shard < 256 && reachable; shard++) {
+                        String prefix = "%02x".formatted(shard);
+                        UUID after = null;
+                        while (true) {
+                            List<NodeClient.StoredSegment> page;
+                            try { page = nodes.inventory(node, prefix, after); }
+                            catch (IOException error) {
+                                System.err.println("Cluster inventory failed for node " + nodes.node(node).id() +
+                                    ": " + error.getMessage());
+                                unavailable++;
+                                reachable = false;
+                                break;
+                            }
+                            for (NodeClient.StoredSegment segment : page) {
+                                scanned++;
+                                UUID nodeId = nodes.node(node).id();
+                                referenced.setObject(1, segment.id());
+                                referenced.setObject(2, nodeId);
+                                referenced.setObject(3, segment.id());
+                                referenced.setObject(4, nodeId);
+                                try (ResultSet result = referenced.executeQuery()) {
+                                    result.next();
+                                    if (result.getBoolean(1)) {
+                                        if (apply) clearCandidate(clear, nodeId, segment.id());
+                                        continue;
+                                    }
+                                }
+                                eligible++;
+                                if (apply) {
+                                    candidate.setObject(1, nodeId);
+                                    candidate.setObject(2, segment.id());
+                                    long now = System.currentTimeMillis();
+                                    boolean firstObservation = false;
+                                    long firstSeen = now;
+                                    try (ResultSet result = candidate.executeQuery()) {
+                                        if (!result.next()) firstObservation = true;
+                                        else if (result.getLong(1) != segment.modified()) firstObservation = true;
+                                        else firstSeen = result.getLong(2);
+                                    }
+                                    if (firstObservation) {
+                                        reset.setLong(1, segment.modified());
+                                        reset.setLong(2, now);
+                                        reset.setObject(3, nodeId);
+                                        reset.setObject(4, segment.id());
+                                        if (reset.executeUpdate() == 0) {
+                                            mark.setObject(1, nodeId);
+                                            mark.setObject(2, segment.id());
+                                            mark.setLong(3, segment.modified());
+                                            mark.setLong(4, now);
+                                            mark.executeUpdate();
+                                        }
+                                        continue;
+                                    }
+                                    if (now - firstSeen < minimumAgeMillis) continue;
+                                    try {
+                                        if (nodes.deleteOrphan(node, segment, minimumAgeMillis)) deleted++;
+                                        clearCandidate(clear, nodeId, segment.id());
+                                    } catch (IOException error) {
+                                        System.err.println("Cluster deletion failed for segment " + segment.id() +
+                                            ": " + error.getMessage());
+                                        unavailable++;
+                                        reachable = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!reachable || page.size() < 1000) break;
+                            after = page.getLast().id();
+                        }
+                    }
+                }
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+        return new GcReport(scanned, eligible, deleted, unavailable);
+    }
+
+    private static void clearCandidate(PreparedStatement clear, UUID node, UUID segment) throws SQLException {
+        clear.setObject(1, node);
+        clear.setObject(2, segment);
+        clear.executeUpdate();
     }
 
     @Override public void close() {}

@@ -13,10 +13,14 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.Executors;
+import java.util.zip.CRC32;
+import java.util.zip.CRC32C;
+import java.util.zip.Checksum;
 
 public final class HttpTest {
     private static final String ACCESS = "TESTACCESSKEY123";
@@ -129,6 +133,106 @@ public final class HttpTest {
             throw new AssertionError("Empty list page failed: " + emptyPage.body());
     }
 
+    private static void testCopy(HttpClient client, String base) throws Exception {
+        String source = "folder/copy source.txt";
+        String target = "folder/copied.txt";
+        byte[] body = "copy source".getBytes(StandardCharsets.UTF_8);
+        status(200, client.send(signedUri(URI.create(base + "/objects/" + SigV4.encode(source, true)),
+            "PUT", body, Map.of("content-type", "text/plain")), HttpResponse.BodyHandlers.ofByteArray()));
+        String header = "/objects/" + SigV4.encode(source, true);
+        var result = client.send(signedUri(URI.create(base + "/objects/" + target), "PUT",
+            new byte[0], Map.of("x-amz-copy-source", header)), HttpResponse.BodyHandlers.ofString());
+        if (result.statusCode() != 200 || !result.body().contains("<CopyObjectResult>") ||
+            !result.body().contains("<ETag>&quot;"))
+            throw new AssertionError("CopyObject failed: " + result.body());
+        var copied = client.send(signed(base, "GET", target, new byte[0]), HttpResponse.BodyHandlers.ofByteArray());
+        status(200, copied);
+        if (!java.util.Arrays.equals(body, copied.body()) ||
+            !"text/plain".equals(copied.headers().firstValue("content-type").orElse("")))
+            throw new AssertionError("Copied body or content type mismatch");
+        status(200, client.send(signedUri(URI.create(base + "/objects/" + target), "PUT",
+            new byte[0], Map.of("x-amz-copy-source", header, "x-amz-metadata-directive", "REPLACE",
+                "content-type", "text/markdown")), HttpResponse.BodyHandlers.ofByteArray()));
+        var replaced = client.send(signed(base, "GET", target, new byte[0]), HttpResponse.BodyHandlers.ofByteArray());
+        status(200, replaced);
+        if (!java.util.Arrays.equals(body, replaced.body()) ||
+            !"text/markdown".equals(replaced.headers().firstValue("content-type").orElse("")))
+            throw new AssertionError("REPLACE metadata directive failed");
+        status(200, client.send(signedUri(URI.create(base + "/objects/" + target), "PUT",
+            new byte[0], Map.of("x-amz-copy-source", "/objects/" + target)),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(404, client.send(signedUri(URI.create(base + "/objects/" + target), "PUT",
+            new byte[0], Map.of("x-amz-copy-source", "/objects/missing")),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(404, client.send(signedUri(URI.create(base + "/objects/" + target), "PUT",
+            new byte[0], Map.of("x-amz-copy-source", "/other/source")),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(400, client.send(signedUri(URI.create(base + "/objects/" + target), "PUT",
+            new byte[0], Map.of("x-amz-copy-source", "/objects/source?versionId=1")),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(501, client.send(signedUri(URI.create(base + "/objects/" + target), "PUT",
+            new byte[0], Map.of("x-amz-copy-source", header, "x-amz-metadata-directive", "REPLACE",
+                "content-md5", "AAAAAAAAAAAAAAAAAAAAAA==")), HttpResponse.BodyHandlers.ofByteArray()));
+        status(204, client.send(signed(base, "DELETE", source, new byte[0]),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(204, client.send(signed(base, "DELETE", target, new byte[0]),
+            HttpResponse.BodyHandlers.ofByteArray()));
+    }
+
+    private static String encodedChecksum(String algorithm, byte[] body) throws Exception {
+        if (algorithm.startsWith("CRC")) {
+            Checksum checksum = algorithm.equals("CRC32") ? new CRC32() : new CRC32C();
+            checksum.update(body, 0, body.length);
+            long value = checksum.getValue();
+            return Base64.getEncoder().encodeToString(new byte[]{(byte) (value >>> 24),
+                (byte) (value >>> 16), (byte) (value >>> 8), (byte) value});
+        }
+        String name = algorithm.equals("SHA1") ? "SHA-1" :
+            algorithm.equals("SHA256") ? "SHA-256" :
+            algorithm.equals("SHA512") ? "SHA-512" : "MD5";
+        return Base64.getEncoder().encodeToString(java.security.MessageDigest.getInstance(name).digest(body));
+    }
+
+    private static void testChecksums(HttpClient client, String base) throws Exception {
+        URI uri = URI.create(base + "/objects/checksum-target");
+        byte[] body = "checksum payload".getBytes(StandardCharsets.UTF_8);
+        String md5 = encodedChecksum("MD5", body);
+        for (String algorithm : new String[]{"CRC32", "CRC32C", "SHA1", "SHA256", "SHA512", "MD5"}) {
+            String header = "x-amz-checksum-" + algorithm.toLowerCase(java.util.Locale.ROOT);
+            String checksum = encodedChecksum(algorithm, body);
+            var stored = client.send(signedUri(uri, "PUT", body,
+                Map.of("content-md5", md5, header, checksum, "x-amz-sdk-checksum-algorithm", algorithm)),
+                HttpResponse.BodyHandlers.ofByteArray());
+            status(200, stored);
+            if (!checksum.equals(stored.headers().firstValue(header).orElse("")))
+                throw new AssertionError("Missing checksum response: " + algorithm);
+            var bad = client.send(signedUri(uri, "PUT", body,
+                Map.of(header, Base64.getEncoder().encodeToString(new byte[algorithm.startsWith("CRC") ? 4 :
+                    algorithm.equals("SHA1") ? 20 : algorithm.equals("SHA256") ? 32 :
+                    algorithm.equals("SHA512") ? 64 : 16]))), HttpResponse.BodyHandlers.ofString());
+            if (bad.statusCode() != 400 || !bad.body().contains("BadDigest"))
+                throw new AssertionError("Mismatched " + algorithm + " accepted: " + bad.body());
+            var unchanged = client.send(signedUri(uri, "GET", new byte[0], Map.of()),
+                HttpResponse.BodyHandlers.ofByteArray());
+            status(200, unchanged);
+            if (!java.util.Arrays.equals(body, unchanged.body()))
+                throw new AssertionError("Bad checksum replaced stored object");
+        }
+        var badMd5 = client.send(signedUri(uri, "PUT", body,
+            Map.of("content-md5", "AAAAAAAAAAAAAAAAAAAAAA==")), HttpResponse.BodyHandlers.ofString());
+        if (badMd5.statusCode() != 400 || !badMd5.body().contains("BadDigest"))
+            throw new AssertionError("Mismatched Content-MD5 accepted");
+        status(400, client.send(signedUri(uri, "PUT", body,
+            Map.of("content-md5", "invalid")), HttpResponse.BodyHandlers.ofByteArray()));
+        status(400, client.send(signedUri(uri, "PUT", body,
+            Map.of("x-amz-checksum-crc32", encodedChecksum("CRC32", body),
+                "x-amz-sdk-checksum-algorithm", "CRC32C")), HttpResponse.BodyHandlers.ofByteArray()));
+        status(501, client.send(signedUri(uri, "PUT", body,
+            Map.of("x-amz-checksum-crc64nvme", "AAAAAAAAAAA=")), HttpResponse.BodyHandlers.ofByteArray()));
+        status(204, client.send(signedUri(uri, "DELETE", new byte[0], Map.of()),
+            HttpResponse.BodyHandlers.ofByteArray()));
+    }
+
     private static void testMultipart(HttpClient client, String base) throws Exception {
         String movie = "folder/video.mp4";
         URI initiate = URI.create(base + "/objects/" + movie + "?uploads=");
@@ -144,6 +248,11 @@ public final class HttpTest {
             "?partNumber=2&uploadId=" + upload), "PUT", second, Map.of()), HttpResponse.BodyHandlers.ofByteArray());
         status(200, partOne);
         status(200, partTwo);
+        var rejectedPart = client.send(signedUri(URI.create(base + "/objects/" + movie +
+            "?partNumber=1&uploadId=" + upload), "PUT", first,
+            Map.of("content-md5", "AAAAAAAAAAAAAAAAAAAAAA==")), HttpResponse.BodyHandlers.ofString());
+        if (rejectedPart.statusCode() != 400 || !rejectedPart.body().contains("BadDigest"))
+            throw new AssertionError("Mismatched part Content-MD5 accepted");
         var parts = client.send(signedUri(URI.create(base + "/objects/" + movie +
             "?uploadId=" + upload + "&max-parts=1"), "GET", new byte[0], Map.of()),
             HttpResponse.BodyHandlers.ofString());
@@ -202,9 +311,11 @@ public final class HttpTest {
             HttpClient client = HttpClient.newHttpClient();
             testObjects(client, base);
             testListing(client, base);
+            testCopy(client, base);
+            testChecksums(client, base);
             testMultipart(client, base);
             testDelete(client, base);
-            System.out.println("HTTP tests passed: health, authentication, PUT, GET, HEAD, DELETE, MIME, ranges, listing, multipart");
+            System.out.println("HTTP tests passed: objects, copy, checksums, listing, multipart");
         } finally {
             server.stop(0);
             executor.close();
