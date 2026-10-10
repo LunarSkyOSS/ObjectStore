@@ -1,0 +1,30 @@
+services:
+  metadata:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: objectstore_test
+      POSTGRES_USER: objectstore_test
+      POSTGRES_PASSWORD: local-metadata-test-only
+    tmpfs:
+      - /var/lib/postgresql/data:size=268435456
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U objectstore_test -d objectstore_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    mem_limit: 256m
+
+  check:
+    build:
+      context: ../..
+    image: lunarsky-objectstore:metadata-test
+    entrypoint: ["java", "--add-modules", "jdk.httpserver,java.net.http", "-cp", "/app:/app/postgresql.jar:/app/hash4j.jar", "cloud.lunarsky.store.ClusterMetadataTest"]
+    environment:
+      POSTGRES_JDBC_URL: jdbc:postgresql://127.0.0.2:5432,metadata:5432/objectstore_test?connectTimeout=1&socketTimeout=10&targetServerType=primary&hostRecheckSeconds=0
+      POSTGRES_ADMIN_JDBC_URL: jdbc:postgresql://metadata:5432/postgres?connectTimeout=3&socketTimeout=10
+      POSTGRES_USER: objectstore_test
+      POSTGRES_PASSWORD: local-metadata-test-only
+    depends_on:
+      metadata:
+        condition: service_healthy
+    mem_limit: 384m

@@ -8,6 +8,8 @@ compose() { docker compose --env-file "$env_file" -f compose.cluster.yaml "$@"; 
 restore() {
   compose stop maintenance >/dev/null 2>&1 || true
   compose start metadata node-a node-b node-c >/dev/null 2>&1 || true
+  compose exec -T metadata psql -U objectstore -d postgres -c \
+    'ALTER DATABASE objectstore RESET default_transaction_read_only' >/dev/null 2>&1 || true
   if [ -n "$backup_dir" ]; then rm -rf "$backup_dir"; fi
 }
 trap restore EXIT
@@ -59,6 +61,13 @@ expected=$(compose exec -T metadata psql -U objectstore -d objectstore -At -c \
   "SELECT encode(s.sha256,'hex') FROM cluster_segments s JOIN cluster_objects o ON o.generation=s.generation WHERE o.object_key='cluster-test/survivor' LIMIT 1")
 actual=$(compose exec -T node-a sha256sum "/data/segments/$shard/$segment_id" | cut -d' ' -f1)
 [ "$expected" = "$actual" ]
+compose exec -T metadata psql -U objectstore -d postgres -c \
+  'ALTER DATABASE objectstore SET default_transaction_read_only=on' >/dev/null
+status=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$host_port/ready")
+[ "$status" = 503 ]
+compose exec -T metadata psql -U objectstore -d postgres -c \
+  'ALTER DATABASE objectstore RESET default_transaction_read_only' >/dev/null
+wait_ready
 compose stop metadata
 status=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$host_port/ready")
 [ "$status" = 503 ]
@@ -124,7 +133,7 @@ compose exec -T metadata-recovery pg_restore -U objectstore -d objectstore --no-
   < "$backup_dir/metadata.dump"
 compose stop metadata
 compose run --rm -T --no-deps \
-  -e 'POSTGRES_JDBC_URL=jdbc:postgresql://metadata-recovery:5432/objectstore?connectTimeout=3&socketTimeout=10' \
+  -e 'POSTGRES_JDBC_URL=jdbc:postgresql://metadata:5432,metadata-recovery:5432/objectstore?connectTimeout=3&socketTimeout=10&targetServerType=primary&hostRecheckSeconds=0' \
   --entrypoint java gateway --add-modules jdk.httpserver,java.net.http \
   -cp /app:/app/postgresql.jar:/app/hash4j.jar cloud.lunarsky.store.ClusterIntegrationTest recovered
 compose start metadata

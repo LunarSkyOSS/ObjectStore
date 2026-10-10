@@ -1347,8 +1347,9 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     @Override public boolean ready() {
         if (!nodes.availableHostsAtLeast(2, testNodeDomains)) return false;
         try (Connection connection = connect(); var statement = connection.createStatement();
-             ResultSet result = statement.executeQuery("SELECT 1")) {
-            return result.next() && result.getInt(1) == 1;
+             ResultSet result = statement.executeQuery(
+                 "SELECT NOT pg_is_in_recovery() AND current_setting('transaction_read_only') = 'off'")) {
+            return result.next() && result.getBoolean(1);
         } catch (SQLException error) { return false; }
     }
     RepairReport repairOnce() throws IOException {

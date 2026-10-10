@@ -23,7 +23,7 @@ services:
       PUBLIC_TRUSTED_PROXY_IPS: ${PUBLIC_TRUSTED_PROXY_IPS:-}
       CLUSTER_TOKEN: ${CLUSTER_TOKEN:?Set CLUSTER_TOKEN}
       CLUSTER_NODES: ${CLUSTER_NODES:-http://node-a:9100,http://node-b:9100,http://node-c:9100}
-      POSTGRES_JDBC_URL: jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10
+      POSTGRES_JDBC_URL: ${POSTGRES_JDBC_URL:-jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10&targetServerType=primary}
       POSTGRES_USER: objectstore
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
     ports:
@@ -96,7 +96,7 @@ services:
       CLUSTER_TOKEN: ${CLUSTER_TOKEN:?Set CLUSTER_TOKEN}
       CLUSTER_REPAIR_TOKEN: ${CLUSTER_REPAIR_TOKEN:?Set CLUSTER_REPAIR_TOKEN}
       S3_BUCKET: ${S3_BUCKET:-objects}
-      POSTGRES_JDBC_URL: jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10
+      POSTGRES_JDBC_URL: ${POSTGRES_JDBC_URL:-jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10&targetServerType=primary}
       POSTGRES_USER: objectstore
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
       CLUSTER_GC_MIN_AGE_SECONDS: ${CLUSTER_GC_MIN_AGE_SECONDS:-1209600}
@@ -131,7 +131,7 @@ services:
       CLUSTER_BACKUP_RETENTION_SECONDS: ${CLUSTER_BACKUP_RETENTION_SECONDS:-0}
       CLUSTER_GC_TEST_MODE: ${CLUSTER_GC_TEST_MODE:-false}
       S3_BUCKET: ${S3_BUCKET:-objects}
-      POSTGRES_JDBC_URL: jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10
+      POSTGRES_JDBC_URL: ${POSTGRES_JDBC_URL:-jdbc:postgresql://metadata:5432/objectstore?connectTimeout=3&socketTimeout=10&targetServerType=primary}
       POSTGRES_USER: objectstore
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
     depends_on:

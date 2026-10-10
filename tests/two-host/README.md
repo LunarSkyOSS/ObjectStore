@@ -1,6 +1,6 @@
 # Two-machine durability drill
 
-Run this disposable test on two machines. Machine A runs the gateway, PostgreSQL, and one storage node; machine B runs a second storage node. Keep the node connection on a private network: the node protocol uses bearer tokens over HTTP.
+Run this disposable test on two machines. Machine A runs the gateway, PostgreSQL, and one storage node; machine B runs a second storage node. Keep the node connection on a private network: this drill uses bearer tokens over HTTP and does not enable the optional node TLS setup.
 
 Both machines need Docker. Machine A also needs Docker Compose and Python 3. The example uses loopback port 9003 on machine A and private-network port 9103 on machine B; change them if needed. Use separate test volumes, and do not point this drill at an existing ObjectStore cluster.
 
