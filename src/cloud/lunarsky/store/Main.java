@@ -24,6 +24,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 
 public final class Main {
+
+
+    //Todo: Main is too complex. Chop Chop.
+
+    
     private static final String CAPABILITIES_PATH = "/_objectstore/capabilities";
     private final ObjectStorage store;
     private final SigV4 authentication;
@@ -52,6 +57,8 @@ public final class Main {
         store.ensureBucket(bucket);
     }
 
+    //Todo: These methods dont need to be in Main.java.
+    
     void handle(HttpExchange exchange) throws IOException {
         boolean admitted = false;
         ClientLimits.Client client = null;
