@@ -52,6 +52,23 @@ final class ClusterStore implements ObjectStorage {
 
     @Override public Metadata put(String bucket, String key, InputStream input, long length, String expectedHash,
                                   String checksum, boolean createOnly, String contentType) throws IOException {
+        validatePut(bucket, length, contentType);
+        MessageDigest md5 = digest("MD5");
+        Path staged = Files.createTempFile("objectstore-cluster-", ".pending");
+        List<Segment> segments;
+        byte[] fullHash;
+        try {
+            fullHash = stageInput(staged, input, length, expectedHash, checksum, md5);
+            checkCapacity(bucket, key, length, createOnly);
+            segments = uploadSegments(staged, length);
+        } finally { Files.deleteIfExists(staged); }
+        Metadata metadata = new Metadata(length, Instant.now().toEpochMilli(),
+            HexFormat.of().formatHex(md5.digest()), fullHash, bucket, key, contentType);
+        persistObject(metadata, segments, createOnly);
+        return metadata;
+    }
+
+    private void validatePut(String bucket, long length, String contentType) {
         if (!configuredBucket.equals(bucket)) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
         if (length < 0) throw new StoreException(411, "MissingContentLength", "Content-Length is required");
         if (length > maxObject) throw new StoreException(413, "EntityTooLarge", "Object exceeds the configured size limit");
@@ -59,74 +76,85 @@ final class ClusterStore implements ObjectStorage {
             throw new StoreException(503, "SlowDown", "Fewer than two storage hosts are available");
         if (contentType.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 255)
             throw new StoreException(400, "InvalidArgument", "Content-Type is too long");
-        MessageDigest sha = digest("SHA-256"), md5 = digest("MD5");
+    }
+
+    private byte[] stageInput(Path staged, InputStream input, long length, String expectedHash,
+                              String checksum, MessageDigest md5) throws IOException {
+        MessageDigest sha = digest("SHA-256");
+        try (OutputStream output = Files.newOutputStream(staged)) {
+            byte[] buffer = new byte[65536];
+            long remaining = length;
+            while (remaining > 0) {
+                int count = input.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                if (count < 0) throw new StoreException(400, "IncompleteBody", "Payload length does not match Content-Length");
+                if (count == 0) continue;
+                sha.update(buffer, 0, count); md5.update(buffer, 0, count);
+                output.write(buffer, 0, count);
+                remaining -= count;
+            }
+        }
+        if (input.read() != -1) throw new StoreException(413, "EntityTooLarge", "Payload exceeds declared size");
+        byte[] fullHash = sha.digest();
+        if (!HexFormat.of().formatHex(fullHash).equals(expectedHash))
+            throw new StoreException(400, "XAmzContentSHA256Mismatch", "Payload hash mismatch");
+        if (checksum != null && !Base64.getEncoder().encodeToString(fullHash).equals(checksum))
+            throw new StoreException(400, "BadDigest", "SHA-256 checksum mismatch");
+        return fullHash;
+    }
+
+    private void checkCapacity(String bucket, String key, long length, boolean createOnly) throws IOException {
+        try (Connection connection = connect()) {
+            long previous = currentLength(connection, bucket, key);
+            if (createOnly && previous >= 0)
+                throw new StoreException(412, "PreconditionFailed", "Object already exists");
+            try (PreparedStatement query = connection.prepareStatement("SELECT used_bytes FROM cluster_usage WHERE bucket=?")) {
+                query.setString(1, bucket);
+                try (ResultSet result = query.executeQuery()) {
+                    if (!result.next()) throw new SQLException("Bucket quota row is missing");
+                    if (result.getLong(1) - Math.max(0, previous) > maxTotal - length)
+                        throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
+                }
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    private List<Segment> uploadSegments(Path staged, long length) throws IOException {
         List<Segment> segments = new ArrayList<>();
-        byte[] fullHash;
-        Path staged = Files.createTempFile("objectstore-cluster-", ".pending");
-        try {
-            try (OutputStream output = Files.newOutputStream(staged)) {
-                byte[] buffer = new byte[65536];
-                long remaining = length;
-                while (remaining > 0) {
-                    int count = input.read(buffer, 0, (int) Math.min(buffer.length, remaining));
-                    if (count < 0) throw new StoreException(400, "IncompleteBody", "Payload length does not match Content-Length");
-                    if (count == 0) continue;
-                    sha.update(buffer, 0, count); md5.update(buffer, 0, count);
-                    output.write(buffer, 0, count);
-                    remaining -= count;
-                }
-            }
-            if (input.read() != -1) throw new StoreException(413, "EntityTooLarge", "Payload exceeds declared size");
-            fullHash = sha.digest();
-            if (!HexFormat.of().formatHex(fullHash).equals(expectedHash))
-                throw new StoreException(400, "XAmzContentSHA256Mismatch", "Payload hash mismatch");
-            if (checksum != null && !Base64.getEncoder().encodeToString(fullHash).equals(checksum))
-                throw new StoreException(400, "BadDigest", "SHA-256 checksum mismatch");
-            try (Connection connection = connect()) {
-                long previous = currentLength(connection, bucket, key);
-                if (createOnly && previous >= 0)
-                    throw new StoreException(412, "PreconditionFailed", "Object already exists");
-                try (PreparedStatement query = connection.prepareStatement("SELECT used_bytes FROM cluster_usage WHERE bucket=?")) {
-                    query.setString(1, bucket);
-                    try (ResultSet result = query.executeQuery()) {
-                        if (!result.next()) throw new SQLException("Bucket quota row is missing");
-                        if (result.getLong(1) - Math.max(0, previous) > maxTotal - length)
-                            throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
+        try (InputStream stagedInput = Files.newInputStream(staged)) {
+            long remaining = length;
+            while (remaining > 0) {
+                int wanted = (int) Math.min(ClusterNode.MAX_SEGMENT, remaining);
+                byte[] bytes = stagedInput.readNBytes(wanted);
+                if (bytes.length != wanted) throw new IOException("Staged object was truncated");
+                byte[] segmentHash = SigV4.hash(bytes);
+                UUID id = UUID.randomUUID();
+                List<UUID> replicas = new ArrayList<>();
+                Set<UUID> acceptedHosts = new HashSet<>();
+                for (int index : PlacementPolicy.candidates(id, nodes, testNodeDomains)) {
+                    UUID host = nodes.faultDomain(index, testNodeDomains);
+                    if (acceptedHosts.contains(host)) continue;
+                    try {
+                        nodes.put(index, id, bytes, segmentHash);
+                        replicas.add(nodes.node(index).id());
+                        acceptedHosts.add(host);
+                        if (acceptedHosts.size() == 3) break;
+                    } catch (IOException error) {
+                        System.err.println("Cluster node " + nodes.node(index).id() +
+                            " did not accept segment " + id + ": " + error.getMessage());
                     }
                 }
-            } catch (SQLException error) { throw databaseError(error); }
-            try (InputStream stagedInput = Files.newInputStream(staged)) {
-                long remaining = length;
-                while (remaining > 0) {
-                    int wanted = (int) Math.min(ClusterNode.MAX_SEGMENT, remaining);
-                    byte[] bytes = stagedInput.readNBytes(wanted);
-                    if (bytes.length != wanted) throw new IOException("Staged object was truncated");
-                    byte[] segmentHash = SigV4.hash(bytes);
-                    UUID id = UUID.randomUUID();
-                    List<UUID> replicas = new ArrayList<>();
-                    Set<UUID> acceptedHosts = new HashSet<>();
-                    for (int index : PlacementPolicy.candidates(id, nodes, testNodeDomains)) {
-                        UUID host = nodes.faultDomain(index, testNodeDomains);
-                        if (acceptedHosts.contains(host)) continue;
-                        try {
-                            nodes.put(index, id, bytes, segmentHash);
-                            replicas.add(nodes.node(index).id());
-                            acceptedHosts.add(host);
-                            if (acceptedHosts.size() == 3) break;
-                        } catch (IOException error) {
-                            System.err.println("Cluster node " + nodes.node(index).id() +
-                                " did not accept segment " + id + ": " + error.getMessage());
-                        }
-                    }
-                    if (acceptedHosts.size() < 2)
-                        throw new StoreException(503, "SlowDown", "Fewer than two storage hosts accepted the segment");
-                    segments.add(new Segment(id, wanted, segmentHash, List.copyOf(replicas)));
-                    remaining -= wanted;
-                }
+                if (acceptedHosts.size() < 2)
+                    throw new StoreException(503, "SlowDown", "Fewer than two storage hosts accepted the segment");
+                segments.add(new Segment(id, wanted, segmentHash, List.copyOf(replicas)));
+                remaining -= wanted;
             }
-        } finally { Files.deleteIfExists(staged); }
-        Metadata metadata = new Metadata(length, Instant.now().toEpochMilli(),
-            HexFormat.of().formatHex(md5.digest()), fullHash, bucket, key, contentType);
+        }
+        return segments;
+    }
+
+    private void persistObject(Metadata metadata, List<Segment> segments, boolean createOnly) throws IOException {
+        String bucket = metadata.bucket(), key = metadata.key();
+        long length = metadata.length();
         UUID generation = UUID.randomUUID();
         try (Connection connection = connect()) {
             connection.setAutoCommit(false);
@@ -159,7 +187,6 @@ final class ClusterStore implements ObjectStorage {
                     delete.setString(1, bucket); delete.setString(2, key); delete.executeUpdate();
                 }
                 connection.commit();
-                return metadata;
             } catch (SQLException | RuntimeException error) {
                 connection.rollback();
                 if (error instanceof SQLException sql) throw databaseError(sql);
@@ -241,43 +268,52 @@ final class ClusterStore implements ObjectStorage {
     }
 
     @Override public ListPage list(String bucket, String prefix, String delimiter, int maxKeys, String after) throws IOException {
-        List<ListedObject> entries = new ArrayList<>();
-        List<String> prefixes = new ArrayList<>();
-        if (maxKeys == 0) return new ListPage(entries, prefixes, null, false);
-        String lastKey = null, activePrefix = null;
-        boolean truncated = false;
+        if (maxKeys == 0) return new ListPage(new ArrayList<>(), new ArrayList<>(), null, false);
         try (Connection connection = connect()) {
             connection.setAutoCommit(false);
+            ListPage page;
             try (PreparedStatement query = connection.prepareStatement(
                 "SELECT object_key, length, modified, etag, sha256, content_type FROM cluster_objects WHERE bucket=? AND object_key>=? ORDER BY object_key")) {
                 query.setString(1, bucket);
                 query.setString(2, after != null && after.compareTo(prefix) > 0 ? after : prefix);
                 query.setFetchSize(128);
                 try (ResultSet result = query.executeQuery()) {
-                    while (result.next()) {
-                        String key = result.getString(1);
-                        if (!key.startsWith(prefix)) break;
-                        if (after != null && key.compareTo(after) <= 0) continue;
-                        String group = null;
-                        if (!delimiter.isEmpty()) {
-                            int at = key.indexOf(delimiter, prefix.length());
-                            if (at >= 0) group = key.substring(0, at + delimiter.length());
-                        }
-                        if (group != null && group.equals(activePrefix)) { lastKey = key; continue; }
-                        if (entries.size() + prefixes.size() >= maxKeys) { truncated = true; break; }
-                        if (group != null) { prefixes.add(group); activePrefix = group; }
-                        else {
-                            entries.add(new ListedObject(key, new Metadata(result.getLong(2), result.getLong(3),
-                                result.getString(4), result.getBytes(5), bucket, key, result.getString(6))));
-                            activePrefix = null;
-                        }
-                        lastKey = key;
-                    }
+                    page = readListPage(result, bucket, prefix, delimiter, maxKeys, after);
                 }
             }
             connection.commit();
+            return page;
         } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    private static ListPage readListPage(ResultSet result, String bucket, String prefix, String delimiter,
+                                         int maxKeys, String after) throws SQLException {
+        List<ListedObject> entries = new ArrayList<>();
+        List<String> prefixes = new ArrayList<>();
+        String lastKey = null, activePrefix = null;
+        boolean truncated = false;
+        while (result.next()) {
+            String key = result.getString(1);
+            if (!key.startsWith(prefix)) break;
+            if (after != null && key.compareTo(after) <= 0) continue;
+            String group = commonPrefix(key, prefix, delimiter);
+            if (group != null && group.equals(activePrefix)) { lastKey = key; continue; }
+            if (entries.size() + prefixes.size() >= maxKeys) { truncated = true; break; }
+            if (group != null) { prefixes.add(group); activePrefix = group; }
+            else {
+                entries.add(new ListedObject(key, new Metadata(result.getLong(2), result.getLong(3),
+                    result.getString(4), result.getBytes(5), bucket, key, result.getString(6))));
+                activePrefix = null;
+            }
+            lastKey = key;
+        }
         return new ListPage(entries, prefixes, truncated ? lastKey : null, truncated);
+    }
+
+    private static String commonPrefix(String key, String prefix, String delimiter) {
+        if (delimiter.isEmpty()) return null;
+        int at = key.indexOf(delimiter, prefix.length());
+        return at < 0 ? null : key.substring(0, at + delimiter.length());
     }
 
     private long lockUsage(Connection connection, String bucket) throws SQLException {

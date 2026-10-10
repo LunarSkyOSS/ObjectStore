@@ -66,6 +66,114 @@ public final class HttpTest {
         }
     }
 
+    private static void testObjects(HttpClient client, String base) throws Exception {
+        status(200, client.send(HttpRequest.newBuilder(URI.create(base + "/health")).GET().build(),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        String key = "folder/moon-☾.txt";
+        byte[] body = "independent storage test".getBytes(StandardCharsets.UTF_8);
+        status(403, client.send(HttpRequest.newBuilder(URI.create(base + "/objects/" + key))
+            .GET().build(), HttpResponse.BodyHandlers.ofByteArray()));
+        status(200, client.send(signed(base, "PUT", key, body),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        String other = "folder/stars.txt";
+        status(200, client.send(signedUri(URI.create(base + "/objects/" + other), "PUT",
+            "stars".getBytes(StandardCharsets.UTF_8), Map.of("content-type", "text/plain")),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        var get = client.send(signed(base, "GET", key, new byte[0]),
+            HttpResponse.BodyHandlers.ofByteArray());
+        status(200, get);
+        if (!java.util.Arrays.equals(body, get.body())) throw new AssertionError("GET body mismatch");
+        if (!"application/octet-stream".equals(get.headers().firstValue("content-type").orElse("")))
+            throw new AssertionError("Unexpected content type");
+        var typed = client.send(signed(base, "GET", other, new byte[0]), HttpResponse.BodyHandlers.ofByteArray());
+        status(200, typed);
+        if (!"text/plain".equals(typed.headers().firstValue("content-type").orElse("")))
+            throw new AssertionError("Stored content type missing");
+        var partial = client.send(signedUri(URI.create(base + "/objects/" + other), "GET",
+            new byte[0], Map.of("range", "bytes=1-3")), HttpResponse.BodyHandlers.ofByteArray());
+        status(206, partial);
+        if (!"tar".equals(new String(partial.body(), StandardCharsets.UTF_8)) ||
+            !"bytes 1-3/5".equals(partial.headers().firstValue("content-range").orElse("")))
+            throw new AssertionError("Range response mismatch");
+        status(416, client.send(signedUri(URI.create(base + "/objects/" + other), "GET",
+            new byte[0], Map.of("range", "bytes=20-30")), HttpResponse.BodyHandlers.ofByteArray()));
+    }
+
+    private static void testListing(HttpClient client, String base) throws Exception {
+        var listed = client.send(signedUri(URI.create(base + "/objects?list-type=2&prefix=folder%2F"),
+            "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
+        if (listed.statusCode() != 200 || !listed.body().contains("<Key>folder/stars.txt</Key>") ||
+            !listed.body().contains("<Key>folder/moon-☾.txt</Key>"))
+            throw new AssertionError("ListObjectsV2 failed: " + listed.body());
+        var page = client.send(signedUri(URI.create(base + "/objects?list-type=2&max-keys=1"),
+            "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
+        if (page.statusCode() != 200 || !page.body().contains("<IsTruncated>true</IsTruncated>"))
+            throw new AssertionError("List pagination failed: " + page.body());
+        String token = page.body().split("<NextContinuationToken>")[1].split("</NextContinuationToken>")[0];
+        var next = client.send(signedUri(URI.create(base + "/objects?list-type=2&continuation-token=" + token),
+            "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
+        if (next.statusCode() != 200 || !next.body().contains("<Key>folder/stars.txt</Key>"))
+            throw new AssertionError("List continuation failed: " + next.body());
+        var grouped = client.send(signedUri(URI.create(base + "/objects?list-type=2&delimiter=%2F"),
+            "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
+        if (grouped.statusCode() != 200 || !grouped.body().contains("<CommonPrefixes><Prefix>folder/</Prefix></CommonPrefixes>") ||
+            grouped.body().contains("<Contents>"))
+            throw new AssertionError("Delimiter listing failed: " + grouped.body());
+        var encoded = client.send(signedUri(URI.create(base + "/objects?list-type=2&encoding-type=url"),
+            "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
+        if (encoded.statusCode() != 200 || !encoded.body().contains("folder%2Fmoon-%E2%98%BE.txt"))
+            throw new AssertionError("Encoded listing failed: " + encoded.body());
+        var emptyPage = client.send(signedUri(URI.create(base + "/objects?list-type=2&max-keys=0"),
+            "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
+        if (emptyPage.statusCode() != 200 || !emptyPage.body().contains("<KeyCount>0</KeyCount>"))
+            throw new AssertionError("Empty list page failed: " + emptyPage.body());
+    }
+
+    private static void testMultipart(HttpClient client, String base) throws Exception {
+        String movie = "folder/video.mp4";
+        URI initiate = URI.create(base + "/objects/" + movie + "?uploads=");
+        var created = client.send(signedUri(initiate, "POST", new byte[0],
+            Map.of("content-type", "video/mp4")), HttpResponse.BodyHandlers.ofString());
+        if (created.statusCode() != 200) throw new AssertionError("Multipart initiation failed: " + created.body());
+        String upload = created.body().split("<UploadId>")[1].split("</UploadId>")[0];
+        byte[] first = "hello ".getBytes(StandardCharsets.UTF_8);
+        byte[] second = "world".getBytes(StandardCharsets.UTF_8);
+        var partOne = client.send(signedUri(URI.create(base + "/objects/" + movie +
+            "?partNumber=1&uploadId=" + upload), "PUT", first, Map.of()), HttpResponse.BodyHandlers.ofByteArray());
+        var partTwo = client.send(signedUri(URI.create(base + "/objects/" + movie +
+            "?partNumber=2&uploadId=" + upload), "PUT", second, Map.of()), HttpResponse.BodyHandlers.ofByteArray());
+        status(200, partOne); status(200, partTwo);
+        String completion = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" +
+            partOne.headers().firstValue("etag").orElseThrow() +
+            "</ETag></Part><Part><PartNumber>2</PartNumber><ETag>" +
+            partTwo.headers().firstValue("etag").orElseThrow() +
+            "</ETag></Part></CompleteMultipartUpload>";
+        status(200, client.send(signedUri(URI.create(base + "/objects/" + movie + "?uploadId=" + upload),
+            "POST", completion.getBytes(StandardCharsets.UTF_8), Map.of()), HttpResponse.BodyHandlers.ofByteArray()));
+        var assembled = client.send(signed(base, "GET", movie, new byte[0]), HttpResponse.BodyHandlers.ofByteArray());
+        status(200, assembled);
+        if (!"hello world".equals(new String(assembled.body(), StandardCharsets.UTF_8)) ||
+            !"video/mp4".equals(assembled.headers().firstValue("content-type").orElse("")))
+            throw new AssertionError("Completed multipart object mismatch");
+        var abandoned = client.send(signedUri(URI.create(base + "/objects/abandoned?uploads="),
+            "POST", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
+        String abandonedId = abandoned.body().split("<UploadId>")[1].split("</UploadId>")[0];
+        status(204, client.send(signedUri(URI.create(base + "/objects/abandoned?uploadId=" + abandonedId),
+            "DELETE", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofByteArray()));
+    }
+
+    private static void testDelete(HttpClient client, String base) throws Exception {
+        String key = "folder/moon-☾.txt";
+        var head = client.send(signed(base, "HEAD", key, new byte[0]),
+            HttpResponse.BodyHandlers.ofByteArray());
+        status(200, head);
+        if (head.body().length != 0) throw new AssertionError("HEAD returned a body");
+        status(204, client.send(signed(base, "DELETE", key, new byte[0]),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(404, client.send(signed(base, "GET", key, new byte[0]),
+            HttpResponse.BodyHandlers.ofByteArray()));
+    }
+
     public static void main(String[] args) throws Exception {
         Path root = Files.createTempDirectory("store-http-test-");
         var executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -79,101 +187,10 @@ public final class HttpTest {
             server.start();
             String base = "http://127.0.0.1:" + server.getAddress().getPort();
             HttpClient client = HttpClient.newHttpClient();
-            status(200, client.send(HttpRequest.newBuilder(URI.create(base + "/health")).GET().build(),
-                HttpResponse.BodyHandlers.ofByteArray()));
-            String key = "folder/moon-☾.txt";
-            byte[] body = "independent storage test".getBytes(StandardCharsets.UTF_8);
-            status(403, client.send(HttpRequest.newBuilder(URI.create(base + "/objects/" + key))
-                .GET().build(), HttpResponse.BodyHandlers.ofByteArray()));
-            status(200, client.send(signed(base, "PUT", key, body),
-                HttpResponse.BodyHandlers.ofByteArray()));
-            String other = "folder/stars.txt";
-            status(200, client.send(signedUri(URI.create(base + "/objects/" + other), "PUT",
-                "stars".getBytes(StandardCharsets.UTF_8), Map.of("content-type", "text/plain")),
-                HttpResponse.BodyHandlers.ofByteArray()));
-            var get = client.send(signed(base, "GET", key, new byte[0]),
-                HttpResponse.BodyHandlers.ofByteArray());
-            status(200, get);
-            if (!java.util.Arrays.equals(body, get.body())) throw new AssertionError("GET body mismatch");
-            if (!"application/octet-stream".equals(get.headers().firstValue("content-type").orElse("")))
-                throw new AssertionError("Unexpected content type");
-            var typed = client.send(signed(base, "GET", other, new byte[0]), HttpResponse.BodyHandlers.ofByteArray());
-            status(200, typed);
-            if (!"text/plain".equals(typed.headers().firstValue("content-type").orElse("")))
-                throw new AssertionError("Stored content type missing");
-            var partial = client.send(signedUri(URI.create(base + "/objects/" + other), "GET",
-                new byte[0], Map.of("range", "bytes=1-3")), HttpResponse.BodyHandlers.ofByteArray());
-            status(206, partial);
-            if (!"tar".equals(new String(partial.body(), StandardCharsets.UTF_8)) ||
-                !"bytes 1-3/5".equals(partial.headers().firstValue("content-range").orElse("")))
-                throw new AssertionError("Range response mismatch");
-            status(416, client.send(signedUri(URI.create(base + "/objects/" + other), "GET",
-                new byte[0], Map.of("range", "bytes=20-30")), HttpResponse.BodyHandlers.ofByteArray()));
-            var listed = client.send(signedUri(URI.create(base + "/objects?list-type=2&prefix=folder%2F"),
-                "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
-            if (listed.statusCode() != 200 || !listed.body().contains("<Key>folder/stars.txt</Key>") ||
-                !listed.body().contains("<Key>folder/moon-☾.txt</Key>"))
-                throw new AssertionError("ListObjectsV2 failed: " + listed.body());
-            var page = client.send(signedUri(URI.create(base + "/objects?list-type=2&max-keys=1"),
-                "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
-            if (page.statusCode() != 200 || !page.body().contains("<IsTruncated>true</IsTruncated>"))
-                throw new AssertionError("List pagination failed: " + page.body());
-            String token = page.body().split("<NextContinuationToken>")[1].split("</NextContinuationToken>")[0];
-            var next = client.send(signedUri(URI.create(base + "/objects?list-type=2&continuation-token=" + token),
-                "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
-            if (next.statusCode() != 200 || !next.body().contains("<Key>folder/stars.txt</Key>"))
-                throw new AssertionError("List continuation failed: " + next.body());
-            var grouped = client.send(signedUri(URI.create(base + "/objects?list-type=2&delimiter=%2F"),
-                "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
-            if (grouped.statusCode() != 200 || !grouped.body().contains("<CommonPrefixes><Prefix>folder/</Prefix></CommonPrefixes>") ||
-                grouped.body().contains("<Contents>"))
-                throw new AssertionError("Delimiter listing failed: " + grouped.body());
-            var encoded = client.send(signedUri(URI.create(base + "/objects?list-type=2&encoding-type=url"),
-                "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
-            if (encoded.statusCode() != 200 || !encoded.body().contains("folder%2Fmoon-%E2%98%BE.txt"))
-                throw new AssertionError("Encoded listing failed: " + encoded.body());
-            var emptyPage = client.send(signedUri(URI.create(base + "/objects?list-type=2&max-keys=0"),
-                "GET", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
-            if (emptyPage.statusCode() != 200 || !emptyPage.body().contains("<KeyCount>0</KeyCount>"))
-                throw new AssertionError("Empty list page failed: " + emptyPage.body());
-            String movie = "folder/video.mp4";
-            URI initiate = URI.create(base + "/objects/" + movie + "?uploads=");
-            var created = client.send(signedUri(initiate, "POST", new byte[0],
-                Map.of("content-type", "video/mp4")), HttpResponse.BodyHandlers.ofString());
-            if (created.statusCode() != 200) throw new AssertionError("Multipart initiation failed: " + created.body());
-            String upload = created.body().split("<UploadId>")[1].split("</UploadId>")[0];
-            byte[] first = "hello ".getBytes(StandardCharsets.UTF_8);
-            byte[] second = "world".getBytes(StandardCharsets.UTF_8);
-            var partOne = client.send(signedUri(URI.create(base + "/objects/" + movie +
-                "?partNumber=1&uploadId=" + upload), "PUT", first, Map.of()), HttpResponse.BodyHandlers.ofByteArray());
-            var partTwo = client.send(signedUri(URI.create(base + "/objects/" + movie +
-                "?partNumber=2&uploadId=" + upload), "PUT", second, Map.of()), HttpResponse.BodyHandlers.ofByteArray());
-            status(200, partOne); status(200, partTwo);
-            String completion = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" +
-                partOne.headers().firstValue("etag").orElseThrow() +
-                "</ETag></Part><Part><PartNumber>2</PartNumber><ETag>" +
-                partTwo.headers().firstValue("etag").orElseThrow() +
-                "</ETag></Part></CompleteMultipartUpload>";
-            status(200, client.send(signedUri(URI.create(base + "/objects/" + movie + "?uploadId=" + upload),
-                "POST", completion.getBytes(StandardCharsets.UTF_8), Map.of()), HttpResponse.BodyHandlers.ofByteArray()));
-            var assembled = client.send(signed(base, "GET", movie, new byte[0]), HttpResponse.BodyHandlers.ofByteArray());
-            status(200, assembled);
-            if (!"hello world".equals(new String(assembled.body(), StandardCharsets.UTF_8)) ||
-                !"video/mp4".equals(assembled.headers().firstValue("content-type").orElse("")))
-                throw new AssertionError("Completed multipart object mismatch");
-            var abandoned = client.send(signedUri(URI.create(base + "/objects/abandoned?uploads="),
-                "POST", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofString());
-            String abandonedId = abandoned.body().split("<UploadId>")[1].split("</UploadId>")[0];
-            status(204, client.send(signedUri(URI.create(base + "/objects/abandoned?uploadId=" + abandonedId),
-                "DELETE", new byte[0], Map.of()), HttpResponse.BodyHandlers.ofByteArray()));
-            var head = client.send(signed(base, "HEAD", key, new byte[0]),
-                HttpResponse.BodyHandlers.ofByteArray());
-            status(200, head);
-            if (head.body().length != 0) throw new AssertionError("HEAD returned a body");
-            status(204, client.send(signed(base, "DELETE", key, new byte[0]),
-                HttpResponse.BodyHandlers.ofByteArray()));
-            status(404, client.send(signed(base, "GET", key, new byte[0]),
-                HttpResponse.BodyHandlers.ofByteArray()));
+            testObjects(client, base);
+            testListing(client, base);
+            testMultipart(client, base);
+            testDelete(client, base);
             System.out.println("HTTP tests passed: health, authentication, PUT, GET, HEAD, DELETE, MIME, ranges, listing, multipart");
         } finally {
             server.stop(0);

@@ -78,40 +78,14 @@ public final class ClusterNode implements AutoCloseable {
                 respond(exchange, 200, "ok");
                 return;
             }
-            byte[] supplied = exchange.getRequestHeaders().getFirst("X-Cluster-Token") == null
-                ? new byte[0] : exchange.getRequestHeaders().getFirst("X-Cluster-Token")
-                    .getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            if (!MessageDigest.isEqual(token, supplied)) {
-                respond(exchange, 403, "Forbidden");
-                return;
-            }
+            if (!authorized(exchange)) return;
             if (path.equals("/identity") && exchange.getRequestMethod().equals("GET")) {
                 respond(exchange, 200, identity.nodeId() + " " + identity.hostId());
                 return;
             }
-            if (!identity.nodeId().toString().equals(exchange.getRequestHeaders().getFirst("X-Cluster-Expected-Node"))) {
-                respond(exchange, 409, "Wrong storage node");
-                return;
-            }
-            if (exchange.getRequestMethod().equals("PUT") &&
-                "true".equals(exchange.getRequestHeaders().getFirst("X-Cluster-Repair"))) {
-                String suppliedRepair = exchange.getRequestHeaders().getFirst("X-Cluster-Repair-Token");
-                byte[] suppliedBytes = suppliedRepair == null ? new byte[0]
-                    : suppliedRepair.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                if (!MessageDigest.isEqual(repairToken, suppliedBytes)) {
-                    respond(exchange, 403, "Repair authority required");
-                    return;
-                }
-            }
-            if (!path.matches("/segments/[0-9a-f-]{36}")) {
-                respond(exchange, 404, "Not found");
-                return;
-            }
-            String id = path.substring("/segments/".length());
-            if (!UUID.fromString(id).toString().equals(id)) {
-                respond(exchange, 400, "Invalid segment ID");
-                return;
-            }
+            if (!expectedNodeAndRepairAuthorized(exchange)) return;
+            String id = segmentId(exchange, path);
+            if (id == null) return;
             switch (exchange.getRequestMethod()) {
                 case "PUT" -> put(exchange, segmentPath(id, true));
                 case "GET" -> get(exchange, segmentPath(id, false));
@@ -125,6 +99,48 @@ public final class ClusterNode implements AutoCloseable {
         } finally {
             exchange.close();
         }
+    }
+
+    private boolean authorized(HttpExchange exchange) throws IOException {
+        byte[] supplied = exchange.getRequestHeaders().getFirst("X-Cluster-Token") == null
+            ? new byte[0] : exchange.getRequestHeaders().getFirst("X-Cluster-Token")
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        if (!MessageDigest.isEqual(token, supplied)) {
+            respond(exchange, 403, "Forbidden");
+            return false;
+        }
+        return true;
+    }
+
+    private boolean expectedNodeAndRepairAuthorized(HttpExchange exchange) throws IOException {
+        if (!identity.nodeId().toString().equals(exchange.getRequestHeaders().getFirst("X-Cluster-Expected-Node"))) {
+            respond(exchange, 409, "Wrong storage node");
+            return false;
+        }
+        if (exchange.getRequestMethod().equals("PUT") &&
+            "true".equals(exchange.getRequestHeaders().getFirst("X-Cluster-Repair"))) {
+            String suppliedRepair = exchange.getRequestHeaders().getFirst("X-Cluster-Repair-Token");
+            byte[] suppliedBytes = suppliedRepair == null ? new byte[0]
+                : suppliedRepair.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            if (!MessageDigest.isEqual(repairToken, suppliedBytes)) {
+                respond(exchange, 403, "Repair authority required");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String segmentId(HttpExchange exchange, String path) throws IOException {
+        if (!path.matches("/segments/[0-9a-f-]{36}")) {
+            respond(exchange, 404, "Not found");
+            return null;
+        }
+        String id = path.substring("/segments/".length());
+        if (!UUID.fromString(id).toString().equals(id)) {
+            respond(exchange, 400, "Invalid segment ID");
+            return null;
+        }
+        return id;
     }
 
     private synchronized Path segmentPath(String id, boolean createShard) throws IOException {

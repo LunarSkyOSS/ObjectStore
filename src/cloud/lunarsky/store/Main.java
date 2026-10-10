@@ -45,93 +45,114 @@ public final class Main {
         exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
         try {
             if (!admitted) throw new StoreException(503, "SlowDown", "Too many concurrent requests");
-            if (exchange.getRequestURI().getRawPath().equals("/health") && exchange.getRequestMethod().equals("GET")) {
-                byte[] body = "{\"status\":\"ok\",\"service\":\"lunarsky-objectstore\"}".getBytes(StandardCharsets.UTF_8);
-                exchange.getResponseHeaders().set("Content-Type", "application/json");
-                exchange.sendResponseHeaders(200, body.length);
-                exchange.getResponseBody().write(body);
-                return;
-            }
-            if (exchange.getRequestURI().getRawPath().equals("/ready") && exchange.getRequestMethod().equals("GET")) {
-                boolean ready = store.ready();
-                byte[] body = (ready ? "ready" : "unavailable").getBytes(StandardCharsets.UTF_8);
-                exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
-                exchange.sendResponseHeaders(ready ? 200 : 503, body.length);
-                exchange.getResponseBody().write(body);
-                return;
-            }
+            if (handleStatus(exchange)) return;
             String hash = authentication.verify(exchange.getRequestMethod(), exchange.getRequestURI(), exchange.getRequestHeaders());
             String path = SigV4.decode(exchange.getRequestURI().getRawPath());
             Map<String, String> query = query(exchange.getRequestURI().getRawQuery());
             if (path.equals("/" + bucket) || path.equals("/" + bucket + "/")) {
-                if (!exchange.getRequestMethod().equals("GET") || !"2".equals(query.get("list-type")) ||
-                    !query.keySet().stream().allMatch(java.util.Set.of("list-type", "prefix", "delimiter", "max-keys",
-                        "continuation-token", "start-after", "encoding-type", "x-id")::contains) ||
-                    (query.containsKey("x-id") && !"ListObjectsV2".equals(query.get("x-id"))))
-                    unsupported("Bucket operation");
-                requireEmptyBody(exchange, hash);
-                listObjects(exchange, query);
-                return;
-            }
-            String prefix = "/" + bucket + "/";
-            if (!path.startsWith(prefix)) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
-            String key = path.substring(prefix.length());
-            if (key.isEmpty() || key.getBytes(StandardCharsets.UTF_8).length > 1024 || key.indexOf('\0') >= 0)
-                throw new StoreException(400, "InvalidArgument", "Invalid object key");
-            String method = exchange.getRequestMethod();
-            boolean multipartRequest = multipartRequest(method, query);
-            if (!multipartRequest && !query.isEmpty() && !(query.size() == 1 &&
-                ("PutObject".equals(query.get("x-id")) || "GetObject".equals(query.get("x-id")) ||
-                 "HeadObject".equals(query.get("x-id")) || "DeleteObject".equals(query.get("x-id")))))
-                unsupported("Query operation");
-            var headers = exchange.getRequestHeaders();
-            for (String name : headers.keySet()) {
-                String lower = name.toLowerCase(java.util.Locale.ROOT);
-                if (lower.startsWith("x-amz-") && !java.util.Set.of("x-amz-date", "x-amz-content-sha256",
-                    "x-amz-checksum-sha256", "x-amz-sdk-checksum-algorithm", "x-amz-user-agent").contains(lower))
-                    unsupported("Amazon header");
-                if (lower.startsWith("x-amz-meta-") || lower.startsWith("x-amz-server-side-") ||
-                    lower.startsWith("x-amz-copy-") || lower.startsWith("x-amz-acl") ||
-                    lower.startsWith("x-amz-grant") || lower.startsWith("x-amz-tagging") ||
-                    lower.equals("content-md5")) unsupported("Object metadata, encryption, ACL, copy, tagging or MD5 header");
-                if (lower.startsWith("x-amz-checksum-") && !lower.equals("x-amz-checksum-sha256"))
-                    unsupported("Checksum algorithm");
-            }
-            String algorithm = SigV4.single(headers, "x-amz-sdk-checksum-algorithm");
-            if (algorithm != null && !algorithm.equals("SHA256")) unsupported("Checksum algorithm");
-            if (multipartRequest) {
-                handleMultipart(exchange, method, query, key, hash);
-                return;
-            }
-            if (!method.equals("PUT")) requireEmptyBody(exchange, hash);
-            switch (method) {
-                case "PUT" -> {
-                    String length = SigV4.single(headers, "content-length"), condition = SigV4.single(headers, "if-none-match");
-                    if (condition != null && !condition.equals("*")) unsupported("Write condition");
-                    long bytes;
-                    try { bytes = length == null ? -1 : Long.parseLong(length); }
-                    catch (NumberFormatException e) { throw new StoreException(400, "InvalidArgument", "Invalid Content-Length"); }
-                    if (headers.containsKey("content-encoding")) unsupported("Encoded payload");
-                    String contentType = contentType(headers);
-                    ObjectStorage.Metadata data = store.put(bucket, key, exchange.getRequestBody(), bytes, hash,
-                        SigV4.single(headers, "x-amz-checksum-sha256"), condition != null, contentType);
-                    exchange.getResponseHeaders().set("ETag", "\"" + data.etag() + "\"");
-                    exchange.getResponseHeaders().set("x-amz-checksum-sha256", Base64.getEncoder().encodeToString(data.sha256()));
-                    exchange.sendResponseHeaders(200, -1);
-                }
-                case "GET", "HEAD" -> readObject(exchange, key);
-                case "DELETE" -> {
-                    if (headers.containsKey("if-none-match")) unsupported("Conditional delete");
-                    store.delete(bucket, key);
-                    exchange.sendResponseHeaders(204, -1);
-                }
-                default -> unsupported("HTTP method");
+                handleBucket(exchange, query, hash);
+            } else {
+                handleObject(exchange, path, query, hash);
             }
         } catch (StoreException error) { sendError(exchange, error.status, error.code, error.getMessage(), requestId); }
         catch (Exception error) {
             System.err.println("ObjectStore request failed: " + requestId + " " + error.getClass().getSimpleName());
             sendError(exchange, 500, "InternalError", "Storage operation failed", requestId);
         } finally { if (admitted) slots.release(); exchange.close(); }
+    }
+
+    private boolean handleStatus(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("GET")) return false;
+        String path = exchange.getRequestURI().getRawPath();
+        if (path.equals("/health")) {
+            byte[] body = "{\"status\":\"ok\",\"service\":\"lunarsky-objectstore\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            return true;
+        }
+        if (!path.equals("/ready")) return false;
+        boolean ready = store.ready();
+        byte[] body = (ready ? "ready" : "unavailable").getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+        exchange.sendResponseHeaders(ready ? 200 : 503, body.length);
+        exchange.getResponseBody().write(body);
+        return true;
+    }
+
+    private void handleBucket(HttpExchange exchange, Map<String, String> query, String hash) throws IOException {
+        if (!exchange.getRequestMethod().equals("GET") || !"2".equals(query.get("list-type")) ||
+            !query.keySet().stream().allMatch(java.util.Set.of("list-type", "prefix", "delimiter", "max-keys",
+                "continuation-token", "start-after", "encoding-type", "x-id")::contains) ||
+            (query.containsKey("x-id") && !"ListObjectsV2".equals(query.get("x-id"))))
+            unsupported("Bucket operation");
+        requireEmptyBody(exchange, hash);
+        listObjects(exchange, query);
+    }
+
+    private void handleObject(HttpExchange exchange, String path, Map<String, String> query, String hash) throws IOException {
+        String prefix = "/" + bucket + "/";
+        if (!path.startsWith(prefix)) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+        String key = path.substring(prefix.length());
+        if (key.isEmpty() || key.getBytes(StandardCharsets.UTF_8).length > 1024 || key.indexOf('\0') >= 0)
+            throw new StoreException(400, "InvalidArgument", "Invalid object key");
+        String method = exchange.getRequestMethod();
+        boolean multipartRequest = multipartRequest(method, query);
+        if (!multipartRequest && !query.isEmpty() && !(query.size() == 1 &&
+            ("PutObject".equals(query.get("x-id")) || "GetObject".equals(query.get("x-id")) ||
+             "HeadObject".equals(query.get("x-id")) || "DeleteObject".equals(query.get("x-id")))))
+            unsupported("Query operation");
+        validateObjectHeaders(exchange.getRequestHeaders());
+        if (multipartRequest) {
+            handleMultipart(exchange, method, query, key, hash);
+            return;
+        }
+        if (!method.equals("PUT")) requireEmptyBody(exchange, hash);
+        switch (method) {
+            case "PUT" -> putObject(exchange, key, hash);
+            case "GET", "HEAD" -> readObject(exchange, key);
+            case "DELETE" -> deleteObject(exchange, key);
+            default -> unsupported("HTTP method");
+        }
+    }
+
+    private static void validateObjectHeaders(com.sun.net.httpserver.Headers headers) {
+        for (String name : headers.keySet()) {
+            String lower = name.toLowerCase(java.util.Locale.ROOT);
+            if (lower.startsWith("x-amz-") && !java.util.Set.of("x-amz-date", "x-amz-content-sha256",
+                "x-amz-checksum-sha256", "x-amz-sdk-checksum-algorithm", "x-amz-user-agent").contains(lower))
+                unsupported("Amazon header");
+            if (lower.startsWith("x-amz-meta-") || lower.startsWith("x-amz-server-side-") ||
+                lower.startsWith("x-amz-copy-") || lower.startsWith("x-amz-acl") ||
+                lower.startsWith("x-amz-grant") || lower.startsWith("x-amz-tagging") ||
+                lower.equals("content-md5")) unsupported("Object metadata, encryption, ACL, copy, tagging or MD5 header");
+            if (lower.startsWith("x-amz-checksum-") && !lower.equals("x-amz-checksum-sha256"))
+                unsupported("Checksum algorithm");
+        }
+        String algorithm = SigV4.single(headers, "x-amz-sdk-checksum-algorithm");
+        if (algorithm != null && !algorithm.equals("SHA256")) unsupported("Checksum algorithm");
+    }
+
+    private void putObject(HttpExchange exchange, String key, String hash) throws IOException {
+        var headers = exchange.getRequestHeaders();
+        String length = SigV4.single(headers, "content-length"), condition = SigV4.single(headers, "if-none-match");
+        if (condition != null && !condition.equals("*")) unsupported("Write condition");
+        long bytes;
+        try { bytes = length == null ? -1 : Long.parseLong(length); }
+        catch (NumberFormatException e) { throw new StoreException(400, "InvalidArgument", "Invalid Content-Length"); }
+        if (headers.containsKey("content-encoding")) unsupported("Encoded payload");
+        String type = contentType(headers);
+        ObjectStorage.Metadata data = store.put(bucket, key, exchange.getRequestBody(), bytes, hash,
+            SigV4.single(headers, "x-amz-checksum-sha256"), condition != null, type);
+        exchange.getResponseHeaders().set("ETag", "\"" + data.etag() + "\"");
+        exchange.getResponseHeaders().set("x-amz-checksum-sha256", Base64.getEncoder().encodeToString(data.sha256()));
+        exchange.sendResponseHeaders(200, -1);
+    }
+
+    private void deleteObject(HttpExchange exchange, String key) throws IOException {
+        if (exchange.getRequestHeaders().containsKey("if-none-match")) unsupported("Conditional delete");
+        store.delete(bucket, key);
+        exchange.sendResponseHeaders(204, -1);
     }
 
     private static String contentType(com.sun.net.httpserver.Headers headers) {
@@ -337,6 +358,24 @@ public final class Main {
     }
 
     private void listObjects(HttpExchange exchange, Map<String, String> query) throws IOException {
+        ListRequest request = listRequest(query);
+        var page = store.list(bucket, request.prefix(), request.delimiter(), request.maxKeys(), request.after());
+        StringBuilder xml = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+        appendListHeader(xml, query, request, page);
+        appendListEntries(xml, page, request.encoding());
+        if (page.truncated()) xml.append("<NextContinuationToken>")
+            .append(Base64.getUrlEncoder().withoutPadding().encodeToString(page.nextKey().getBytes(StandardCharsets.UTF_8)))
+            .append("</NextContinuationToken>");
+        xml.append("</ListBucketResult>");
+        byte[] body = xml.toString().getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/xml");
+        exchange.sendResponseHeaders(200, body.length);
+        exchange.getResponseBody().write(body);
+    }
+
+    private record ListRequest(String prefix, String delimiter, String encoding, int maxKeys, String after) { }
+
+    private static ListRequest listRequest(Map<String, String> query) {
         String prefix = query.getOrDefault("prefix", ""), delimiter = query.getOrDefault("delimiter", "");
         String encoding = query.get("encoding-type");
         if (encoding != null && !encoding.equals("url")) unsupported("Encoding type");
@@ -356,8 +395,11 @@ public final class Main {
                 throw new StoreException(400, "InvalidArgument", "Invalid continuation token");
             }
         }
-        var page = store.list(bucket, prefix, delimiter, maxKeys, after);
-        StringBuilder xml = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+        return new ListRequest(prefix, delimiter, encoding, maxKeys, after);
+    }
+
+    private void appendListHeader(StringBuilder xml, Map<String, String> query, ListRequest request, ObjectStorage.ListPage page) {
+        String prefix = request.prefix(), delimiter = request.delimiter(), encoding = request.encoding();
         xml.append("<Name>").append(xml(bucket)).append("</Name><Prefix>").append(xml(listKey(prefix, encoding))).append("</Prefix>");
         if (!delimiter.isEmpty()) xml.append("<Delimiter>").append(xml(listKey(delimiter, encoding))).append("</Delimiter>");
         if (encoding != null) xml.append("<EncodingType>url</EncodingType>");
@@ -365,8 +407,11 @@ public final class Main {
             .append(xml(query.get("continuation-token"))).append("</ContinuationToken>");
         if (query.containsKey("start-after")) xml.append("<StartAfter>")
             .append(xml(listKey(query.get("start-after"), encoding))).append("</StartAfter>");
-        xml.append("<KeyCount>").append(page.keyCount()).append("</KeyCount><MaxKeys>").append(maxKeys)
+        xml.append("<KeyCount>").append(page.keyCount()).append("</KeyCount><MaxKeys>").append(request.maxKeys())
             .append("</MaxKeys><IsTruncated>").append(page.truncated()).append("</IsTruncated>");
+    }
+
+    private static void appendListEntries(StringBuilder xml, ObjectStorage.ListPage page, String encoding) {
         int objectAt = 0, prefixAt = 0;
         while (objectAt < page.objects().size() || prefixAt < page.prefixes().size()) {
             if (objectAt < page.objects().size() &&
@@ -384,14 +429,6 @@ public final class Main {
                     .append("</Prefix></CommonPrefixes>");
             }
         }
-        if (page.truncated()) xml.append("<NextContinuationToken>")
-            .append(Base64.getUrlEncoder().withoutPadding().encodeToString(page.nextKey().getBytes(StandardCharsets.UTF_8)))
-            .append("</NextContinuationToken>");
-        xml.append("</ListBucketResult>");
-        byte[] body = xml.toString().getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().set("Content-Type", "application/xml");
-        exchange.sendResponseHeaders(200, body.length);
-        exchange.getResponseBody().write(body);
     }
 
     private static String listKey(String key, String encoding) {

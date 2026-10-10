@@ -28,28 +28,61 @@ final class SigV4 {
     }
 
     String verify(String method, URI uri, Headers headers) {
+        Map<String, String> fields = authorizationFields(headers);
+        String[] credential = credentialScope(fields.get("Credential"));
+        String date = signingDate(headers, credential[1]);
+        String payload = payloadHash(headers);
+        String signedHeaders = fields.get("SignedHeaders");
+        String canonicalHeaders = canonicalHeaders(headers, signedHeaders);
+        String canonical = method + "\n" + encode(decode(uri.getRawPath()), true) + "\n"
+            + canonicalQuery(uri.getRawQuery()) + "\n" + canonicalHeaders + "\n" + signedHeaders + "\n" + payload;
+        String scope = String.join("/", Arrays.copyOfRange(credential, 1, 5));
+        String toSign = "AWS4-HMAC-SHA256\n" + date + "\n" + scope + "\n" + hex(hash(canonical.getBytes(StandardCharsets.UTF_8)));
+        byte[] signingKey = signingKey(secretKey, credential[1], region);
+        String signature = fields.get("Signature");
+        if (!HEX.matcher(signature).matches() || !MessageDigest.isEqual(hmac(signingKey, toSign), HexFormat.of().parseHex(signature))) denied("Signature mismatch");
+        return payload;
+    }
+
+    private static Map<String, String> authorizationFields(Headers headers) {
         String authorization = single(headers, "authorization");
         if (authorization == null || !authorization.startsWith("AWS4-HMAC-SHA256 ")) denied("Signed requests are required");
-        Map<String,String> fields = new TreeMap<>();
+        Map<String, String> fields = new TreeMap<>();
         for (String part : authorization.substring(17).split(",")) {
             String[] pair = part.trim().split("=", 2);
             if (pair.length != 2 || fields.put(pair[0], pair[1]) != null) denied("Invalid authorization header");
         }
         if (!fields.keySet().equals(java.util.Set.of("Credential", "SignedHeaders", "Signature"))) denied("Invalid authorization fields");
-        String[] credential = fields.get("Credential").split("/", -1);
+        return fields;
+    }
+
+    private String[] credentialScope(String value) {
+        String[] credential = value.split("/", -1);
         if (credential.length != 5 || !credential[0].equals(accessKey) || !credential[2].equals(region)
             || !credential[3].equals("s3") || !credential[4].equals("aws4_request")) denied("Invalid credential scope");
-        String date = single(headers, "x-amz-date"), payload = single(headers, "x-amz-content-sha256");
-        if (date == null || !credential[1].matches("[0-9]{8}") || !date.matches("[0-9]{8}T[0-9]{6}Z") || !date.startsWith(credential[1])) denied("Invalid signing date");
+        return credential;
+    }
+
+    private String signingDate(Headers headers, String credentialDate) {
+        String date = single(headers, "x-amz-date");
+        if (date == null || !credentialDate.matches("[0-9]{8}") || !date.matches("[0-9]{8}T[0-9]{6}Z") || !date.startsWith(credentialDate)) denied("Invalid signing date");
         try {
             Instant signed = Instant.from(DATE.parse(date));
             if (Duration.between(signed, clock.instant()).abs().compareTo(Duration.ofMinutes(5)) > 0)
                 throw new StoreException(403, "RequestTimeTooSkewed", "Request timestamp is outside the permitted window");
         } catch (java.time.DateTimeException e) { denied("Invalid signing date"); }
+        return date;
+    }
+
+    private static String payloadHash(Headers headers) {
+        String payload = single(headers, "x-amz-content-sha256");
         if (payload == null || !HEX.matcher(payload).matches())
             throw new StoreException(400, "NotImplemented", "A hexadecimal SHA-256 payload hash is required; unsigned and chunk-signed payloads are unsupported");
         if (headers.containsKey("x-amz-security-token")) denied("Temporary credentials are unsupported");
-        String signedHeaders = fields.get("SignedHeaders");
+        return payload;
+    }
+
+    private static String canonicalHeaders(Headers headers, String signedHeaders) {
         String[] names = signedHeaders.split(";", -1);
         if (names.length > 32 || !signedHeaders.equals(String.join(";", Arrays.stream(names).distinct().sorted().toList()))) denied("Signed headers must be unique and sorted");
         var namesSet = java.util.Set.copyOf(Arrays.asList(names));
@@ -66,14 +99,7 @@ final class SigV4 {
             if (value == null) denied("Missing signed header");
             canonicalHeaders.append(name).append(':').append(value.trim().replaceAll("[\\t ]+", " ")).append('\n');
         }
-        String canonical = method + "\n" + encode(decode(uri.getRawPath()), true) + "\n"
-            + canonicalQuery(uri.getRawQuery()) + "\n" + canonicalHeaders + "\n" + signedHeaders + "\n" + payload;
-        String scope = String.join("/", Arrays.copyOfRange(credential, 1, 5));
-        String toSign = "AWS4-HMAC-SHA256\n" + date + "\n" + scope + "\n" + hex(hash(canonical.getBytes(StandardCharsets.UTF_8)));
-        byte[] signingKey = signingKey(secretKey, credential[1], region);
-        String signature = fields.get("Signature");
-        if (!HEX.matcher(signature).matches() || !MessageDigest.isEqual(hmac(signingKey, toSign), HexFormat.of().parseHex(signature))) denied("Signature mismatch");
-        return payload;
+        return canonicalHeaders.toString();
     }
 
     static String single(Headers headers, String name) {

@@ -117,65 +117,80 @@ final class DiskStore implements ObjectStorage {
         byte[] bucketBytes = bucket.getBytes(StandardCharsets.UTF_8);
         byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
         byte[] typeBytes = contentType.getBytes(StandardCharsets.UTF_8);
-        if (bucketBytes.length > 63 || keyBytes.length > 1024 || typeBytes.length > 255)
-            throw new StoreException(400, "InvalidArgument", "Object metadata is too long");
-        int headerLength = HEADER_V2 + bucketBytes.length + keyBytes.length + typeBytes.length;
+        validateMetadataLengths(bucketBytes, keyBytes, typeBytes);
         Path destination = object(bucket, key), pending = Files.createTempFile(temporary, "upload-", ".part");
         try {
-            MessageDigest sha = digest("SHA-256"), md5 = digest("MD5");
-            long count = 0;
-            try (OutputStream out = Files.newOutputStream(pending)) {
-                out.write(new byte[headerLength]);
-                byte[] buffer = new byte[65536]; int n;
-                while ((n = input.read(buffer)) != -1) {
-                    count += n;
-                    if (count > length || count > maxObject)
-                        throw new StoreException(413, "EntityTooLarge", "Payload exceeds declared size");
-                    sha.update(buffer, 0, n); md5.update(buffer, 0, n); out.write(buffer, 0, n);
-                }
-            }
-            if (count != length) throw new StoreException(400, "IncompleteBody", "Payload length does not match Content-Length");
-            byte[] hash = sha.digest(), etag = md5.digest();
-            if (!MessageDigest.isEqual(hash, HexFormat.of().parseHex(expectedHash)))
-                throw new StoreException(400, "XAmzContentSHA256Mismatch", "Payload hash mismatch");
-            if (checksum != null && !Base64.getEncoder().encodeToString(hash).equals(checksum))
-                throw new StoreException(400, "BadDigest", "SHA-256 checksum mismatch");
-            long modified = Instant.now().toEpochMilli();
-            ByteBuffer header = ByteBuffer.allocate(headerLength).putLong(MAGIC_V2).putLong(count)
-                .putLong(modified).put(etag).put(hash).putShort((short) bucketBytes.length)
-                .putShort((short) keyBytes.length).putShort((short) typeBytes.length)
-                .put(bucketBytes).put(keyBytes).put(typeBytes);
-            header.flip();
-            try (FileChannel file = FileChannel.open(pending, StandardOpenOption.WRITE)) {
-                while (header.hasRemaining()) file.write(header, header.position());
-                file.force(true);
-            }
-            Metadata metadata = new Metadata(count, modified, SigV4.hex(etag), hash, bucket, key, contentType);
-            synchronized (lock(destination)) {
-                long previous = 0;
-                boolean existed = Files.exists(destination);
-                boolean legacy = false;
-                if (existed) {
-                    if (createOnly) throw new StoreException(412, "PreconditionFailed", "Object already exists");
-                    try (var in = new DataInputStream(Files.newInputStream(destination))) {
-                        Metadata old = readRecord(in).metadata();
-                        previous = old.length();
-                        legacy = old.key() == null;
-                    }
-                }
-                synchronized (this) {
-                    if (used - previous + count > maxTotal)
-                        throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
-                    Files.move(pending, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                    used = used - previous + count;
-                    if (!existed) objectCount++;
-                    if (legacy) legacyCount--;
-                    index.put(indexKey(bucket, key), metadata);
-                    syncDirectory(destination.getParent());
-                }
-            }
+            Metadata metadata = stagePut(pending, input, length, expectedHash, checksum,
+                bucket, key, contentType, bucketBytes, keyBytes, typeBytes);
+            installPending(destination, pending, metadata, createOnly);
             return metadata;
         } finally { Files.deleteIfExists(pending); }
+    }
+
+    private static void validateMetadataLengths(byte[] bucketBytes, byte[] keyBytes, byte[] typeBytes) {
+        if (bucketBytes.length > 63 || keyBytes.length > 1024 || typeBytes.length > 255)
+            throw new StoreException(400, "InvalidArgument", "Object metadata is too long");
+    }
+
+    private Metadata stagePut(Path pending, InputStream input, long length, String expectedHash, String checksum,
+                              String bucket, String key, String contentType,
+                              byte[] bucketBytes, byte[] keyBytes, byte[] typeBytes) throws IOException {
+        int headerLength = HEADER_V2 + bucketBytes.length + keyBytes.length + typeBytes.length;
+        MessageDigest sha = digest("SHA-256"), md5 = digest("MD5");
+        long count = 0;
+        try (OutputStream out = Files.newOutputStream(pending)) {
+            out.write(new byte[headerLength]);
+            byte[] buffer = new byte[65536]; int n;
+            while ((n = input.read(buffer)) != -1) {
+                count += n;
+                if (count > length || count > maxObject)
+                    throw new StoreException(413, "EntityTooLarge", "Payload exceeds declared size");
+                sha.update(buffer, 0, n); md5.update(buffer, 0, n); out.write(buffer, 0, n);
+            }
+        }
+        if (count != length) throw new StoreException(400, "IncompleteBody", "Payload length does not match Content-Length");
+        byte[] hash = sha.digest(), etag = md5.digest();
+        if (!MessageDigest.isEqual(hash, HexFormat.of().parseHex(expectedHash)))
+            throw new StoreException(400, "XAmzContentSHA256Mismatch", "Payload hash mismatch");
+        if (checksum != null && !Base64.getEncoder().encodeToString(hash).equals(checksum))
+            throw new StoreException(400, "BadDigest", "SHA-256 checksum mismatch");
+        long modified = Instant.now().toEpochMilli();
+        ByteBuffer header = ByteBuffer.allocate(headerLength).putLong(MAGIC_V2).putLong(count)
+            .putLong(modified).put(etag).put(hash).putShort((short) bucketBytes.length)
+            .putShort((short) keyBytes.length).putShort((short) typeBytes.length)
+            .put(bucketBytes).put(keyBytes).put(typeBytes);
+        header.flip();
+        try (FileChannel file = FileChannel.open(pending, StandardOpenOption.WRITE)) {
+            while (header.hasRemaining()) file.write(header, header.position());
+            file.force(true);
+        }
+        return new Metadata(count, modified, SigV4.hex(etag), hash, bucket, key, contentType);
+    }
+
+    private void installPending(Path destination, Path pending, Metadata metadata, boolean createOnly) throws IOException {
+        synchronized (lock(destination)) {
+            long previous = 0;
+            boolean existed = Files.exists(destination);
+            boolean legacy = false;
+            if (existed) {
+                if (createOnly) throw new StoreException(412, "PreconditionFailed", "Object already exists");
+                try (var in = new DataInputStream(Files.newInputStream(destination))) {
+                    Metadata old = readRecord(in).metadata();
+                    previous = old.length();
+                    legacy = old.key() == null;
+                }
+            }
+            synchronized (this) {
+                if (used - previous + metadata.length() > maxTotal)
+                    throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
+                Files.move(pending, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                used = used - previous + metadata.length();
+                if (!existed) objectCount++;
+                if (legacy) legacyCount--;
+                index.put(indexKey(metadata.bucket(), metadata.key()), metadata);
+                syncDirectory(destination.getParent());
+            }
+        }
     }
 
     public OpenObject open(String bucket, String key) throws IOException {

@@ -69,56 +69,10 @@ final class NodeRegistry {
             try (Statement statement = connection.createStatement()) {
                 statement.execute("SELECT pg_advisory_xact_lock(6834071092781)");
             }
-            Map<String, NodeClient.Node> stored = new HashMap<>();
-            try (Statement statement = connection.createStatement();
-                 ResultSet result = statement.executeQuery("SELECT node_id, host_id, endpoint FROM cluster_nodes WHERE state <> 'retired'")) {
-                while (result.next()) {
-                    URI url = URI.create(result.getString(3));
-                    stored.put(url.toString(), new NodeClient.Node((UUID) result.getObject(1),
-                        (UUID) result.getObject(2), url));
-                }
-            }
-            if (stored.isEmpty()) {
-                try (Statement statement = connection.createStatement();
-                     ResultSet result = statement.executeQuery("SELECT EXISTS (SELECT 1 FROM cluster_segments)")) {
-                    result.next();
-                    if (result.getBoolean(1)) throw new IOException("Existing segments have no registered node identities");
-                }
-                for (URI url : urls) {
-                    NodeIdentity identity = NodeClient.probe(url, token);
-                    try (PreparedStatement insert = connection.prepareStatement(
-                            "INSERT INTO cluster_nodes (node_id, host_id, endpoint, state) VALUES (?, ?, ?, 'active')")) {
-                        insert.setObject(1, identity.nodeId());
-                        insert.setObject(2, identity.hostId());
-                        insert.setString(3, url.toString());
-                        insert.executeUpdate();
-                    }
-                    stored.put(url.toString(), new NodeClient.Node(identity.nodeId(), identity.hostId(), url));
-                }
-            }
-            List<NodeClient.Node> configured = new ArrayList<>();
-            Set<UUID> configuredIds = new HashSet<>();
-            for (URI url : urls) {
-                NodeClient.Node node = stored.get(url.toString());
-                if (node == null) throw new IOException("Unregistered storage node URL: " + url);
-                NodeIdentity actual = null;
-                try {
-                    actual = NodeClient.probe(url, token);
-                } catch (IOException offline) { }
-                if (actual != null && (!actual.nodeId().equals(node.id()) || !actual.hostId().equals(node.hostId())))
-                    throw new IOException("Storage node identity changed at " + url);
-                configured.add(node);
-                configuredIds.add(node.id());
-            }
-            try (Statement statement = connection.createStatement();
-                 ResultSet result = statement.executeQuery(
-                     "SELECT DISTINCT unnest(s.replica_ids) FROM cluster_segments s JOIN cluster_objects o ON o.generation=s.generation")) {
-                while (result.next()) {
-                    UUID id = (UUID) result.getObject(1);
-                    if (!configuredIds.contains(id))
-                        throw new IOException("A live segment refers to a node missing from CLUSTER_NODES: " + id);
-                }
-            }
+            Map<String, NodeClient.Node> stored = registeredNodes(connection);
+            if (stored.isEmpty()) registerInitialNodes(connection, urls, token, stored);
+            List<NodeClient.Node> configured = configuredNodes(urls, token, stored);
+            ensureLiveReplicasConfigured(connection, configured);
             NodeClient nodes = new NodeClient(configured, token, repairToken);
             connection.commit();
             return nodes;
@@ -130,6 +84,70 @@ final class NodeRegistry {
         } finally {
             try { connection.setAutoCommit(true); }
             catch (SQLException error) { throw new IOException("Could not restore metadata connection", error); }
+        }
+    }
+
+    private static Map<String, NodeClient.Node> registeredNodes(Connection connection) throws SQLException {
+        Map<String, NodeClient.Node> stored = new HashMap<>();
+        try (Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery("SELECT node_id, host_id, endpoint FROM cluster_nodes WHERE state <> 'retired'")) {
+            while (result.next()) {
+                URI url = URI.create(result.getString(3));
+                stored.put(url.toString(), new NodeClient.Node((UUID) result.getObject(1),
+                    (UUID) result.getObject(2), url));
+            }
+        }
+        return stored;
+    }
+
+    private static void registerInitialNodes(Connection connection, List<URI> urls, String token,
+                                             Map<String, NodeClient.Node> stored) throws SQLException, IOException {
+        try (Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery("SELECT EXISTS (SELECT 1 FROM cluster_segments)")) {
+            result.next();
+            if (result.getBoolean(1)) throw new IOException("Existing segments have no registered node identities");
+        }
+        for (URI url : urls) {
+            NodeIdentity identity = NodeClient.probe(url, token);
+            try (PreparedStatement insert = connection.prepareStatement(
+                    "INSERT INTO cluster_nodes (node_id, host_id, endpoint, state) VALUES (?, ?, ?, 'active')")) {
+                insert.setObject(1, identity.nodeId());
+                insert.setObject(2, identity.hostId());
+                insert.setString(3, url.toString());
+                insert.executeUpdate();
+            }
+            stored.put(url.toString(), new NodeClient.Node(identity.nodeId(), identity.hostId(), url));
+        }
+    }
+
+    private static List<NodeClient.Node> configuredNodes(List<URI> urls, String token,
+                                                         Map<String, NodeClient.Node> stored) throws IOException {
+        List<NodeClient.Node> configured = new ArrayList<>();
+        for (URI url : urls) {
+            NodeClient.Node node = stored.get(url.toString());
+            if (node == null) throw new IOException("Unregistered storage node URL: " + url);
+            NodeIdentity actual = null;
+            try { actual = NodeClient.probe(url, token); }
+            catch (IOException offline) { }
+            if (actual != null && (!actual.nodeId().equals(node.id()) || !actual.hostId().equals(node.hostId())))
+                throw new IOException("Storage node identity changed at " + url);
+            configured.add(node);
+        }
+        return configured;
+    }
+
+    private static void ensureLiveReplicasConfigured(Connection connection, List<NodeClient.Node> configured)
+        throws SQLException, IOException {
+        Set<UUID> configuredIds = new HashSet<>();
+        for (NodeClient.Node node : configured) configuredIds.add(node.id());
+        try (Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery(
+                 "SELECT DISTINCT unnest(s.replica_ids) FROM cluster_segments s JOIN cluster_objects o ON o.generation=s.generation")) {
+            while (result.next()) {
+                UUID id = (UUID) result.getObject(1);
+                if (!configuredIds.contains(id))
+                    throw new IOException("A live segment refers to a node missing from CLUSTER_NODES: " + id);
+            }
         }
     }
 }
