@@ -4,7 +4,7 @@
 
 Small S3-compatible object storage for LunarSky.
 
-Source: [GitHub](https://github.com/LunarSkyOSS/ObjectStore) · [Gitea mirror](https://git.lunarsky.cloud/admin/ObjectStore)
+Source: [GitHub](https://github.com/LunarSkyOSS/ObjectStore) · [Gitea mirror](https://git.lunarsky.cloud/admin/ObjectStore) · [Documentation](https://docs.lunarsky.cloud/objectstore/)
 
 **Development software. Do not use it for production data.** It is provided as is, without warranty, under the [MIT License](LICENSE).
 
