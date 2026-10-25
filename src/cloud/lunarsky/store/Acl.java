@@ -65,6 +65,8 @@ final class Acl {
                     principal = entry.substring(4, entry.length() - 1);
                 else if (entry.startsWith("uri=\"") && entry.endsWith("\""))
                     principal = entry.substring(5, entry.length() - 1);
+                else if (entry.startsWith("emailAddress=\""))
+                    throw new StoreException(405, "MethodNotAllowed", "Email ACL grantees are no longer supported");
                 else throw new StoreException(400, "InvalidArgument", "Invalid ACL grant");
                 if (!identities.contains(principal) && !principal.equals(ALL_USERS) &&
                     !principal.equals(AUTHENTICATED_USERS))
@@ -122,6 +124,8 @@ final class Acl {
                 String principal = switch (type) {
                     case "CanonicalUser" -> text(grantee, "ID");
                     case "Group" -> text(grantee, "URI");
+                    case "AmazonCustomerByEmail" -> throw new StoreException(405, "MethodNotAllowed",
+                        "Email ACL grantees are no longer supported");
                     default -> throw new IllegalArgumentException();
                 };
                 Integer permission = PERMISSIONS.get(text(grant, "Permission"));
@@ -130,7 +134,8 @@ final class Acl {
             }
             grants.remove(owner);
             return validate(encoded(grants), identities);
-        } catch (Exception error) {
+        } catch (StoreException error) { throw error; }
+        catch (Exception error) {
             throw new StoreException(400, "MalformedACLError", "Invalid access control policy");
         }
     }

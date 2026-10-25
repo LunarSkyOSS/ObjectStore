@@ -42,14 +42,15 @@ Legacy single-node objects remain readable but stay out of listings until overwr
 - ✅ User metadata on object and multipart uploads; object tags on upload, copy, and the tagging subresource
 - ✅ CRC64NVME and XXHash checksums, checksum trailers, and persisted object checksum metadata
 - ✅ Bucket versioning with retained versions, delete markers, and version-specific reads, copies, deletes, and tags in both modes
-- ✅ Basic bucket and object ACL grants, public reads, and multiple access-key identities
-- ⬜ Full AWS ACL ownership controls, email grantees, and bucket policies
+- ✅ Bucket and object ACL grants, bucket policies, Object Ownership controls, and Block Public Access
+- ✅ Scoped identity policies and externally provisioned, expiring session credentials
+- ⬜ Full IAM, STS issuance, cross-account ACL ownership, and conditional policies
 
 This is an S3 subset. Unsupported operations and Amazon-specific headers are rejected. Bucket names use three to 63 lowercase letters, digits, or hyphens; the default bucket cannot be deleted. Bucket creation accepts an empty body for the configured region. Tags do not control access.
 
 Versioning supports enabled and suspended states. Old versions and delete markers count toward capacity; deleting a specific version is permanent. Lifecycle expiration, MFA Delete, and `ListObjectVersions` delimiter grouping are unsupported. User metadata accepts printable ASCII only.
 
-`PutObject` checksums are validated and retained; without one, ObjectStore stores CRC64NVME, including for completed multipart uploads. Request `x-amz-checksum-mode: ENABLED` on GET or HEAD to receive it. `UploadPart` checksums are validated but are not returned by `ListParts` or combined into a multipart checksum. Presigned URLs expire within seven days. Signed `aws-chunked` uploads support one checksum trailer; temporary credentials and other streaming modes are unsupported. Copies obey the object size limit.
+`PutObject` checksums are validated and retained; without one, ObjectStore stores CRC64NVME, including for completed multipart uploads. Request `x-amz-checksum-mode: ENABLED` on GET or HEAD to receive it. `UploadPart` checksums are validated but are not returned by `ListParts` or combined into a multipart checksum. Presigned URLs expire within seven days. Signed `aws-chunked` uploads support one checksum trailer; other streaming modes are unsupported. Copies obey the object size limit.
 
 ## Single-node setup
 

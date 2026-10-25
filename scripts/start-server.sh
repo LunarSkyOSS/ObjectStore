@@ -15,7 +15,7 @@ for setting in request response; do
   [ "${#value}" -le 5 ] || { echo "$setting timeout exceeds one day" >&2; exit 1; }
   if [ "$value" -gt 0 ]; then
     [ "$value" -le 86400 ] || { echo "$setting timeout exceeds one day" >&2; exit 1; }
-    set -- "$@" "-Dsun.net.httpserver.$property=$((value * 1000))"
+    set -- "$@" "-Dsun.net.httpserver.$property=$value"
   fi
 done
 

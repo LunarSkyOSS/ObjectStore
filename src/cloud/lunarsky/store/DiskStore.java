@@ -32,6 +32,7 @@ final class DiskStore implements ObjectStorage {
     private static final int BUCKET_MAGIC = 0x4c534243;
     private static final int BUCKET_MAGIC_V2 = 0x4c534244;
     private static final int BUCKET_MAGIC_V3 = 0x4c534245;
+    private static final int BUCKET_MAGIC_V4 = 0x4c534246;
     private static final int VERSION_MAGIC = 0x4c53564d;
     private final Path root, objects, temporary, catalog, versions;
     private final FileChannel lockChannel;
@@ -94,7 +95,8 @@ final class DiskStore implements ObjectStorage {
             if (Files.exists(catalog)) {
                 try (DataInputStream input = new DataInputStream(Files.newInputStream(catalog))) {
                     int magic = input.readInt();
-                    if (magic != BUCKET_MAGIC && magic != BUCKET_MAGIC_V2 && magic != BUCKET_MAGIC_V3)
+                    if (magic != BUCKET_MAGIC && magic != BUCKET_MAGIC_V2 &&
+                        magic != BUCKET_MAGIC_V3 && magic != BUCKET_MAGIC_V4)
                         throw new IOException("Invalid bucket catalog");
                     int count = input.readInt();
                     if (count < 0 || count > 1000) throw new IOException("Invalid bucket catalog");
@@ -102,20 +104,35 @@ final class DiskStore implements ObjectStorage {
                         String name = input.readUTF();
                         long created = input.readLong();
                         VersioningState state = VersioningState.NEVER;
-                        if (magic == BUCKET_MAGIC_V2 || magic == BUCKET_MAGIC_V3) {
+                        if (magic != BUCKET_MAGIC) {
                             int ordinal = input.readUnsignedByte();
                             if (ordinal >= VersioningState.values().length)
                                 throw new IOException("Invalid bucket versioning state");
                             state = VersioningState.values()[ordinal];
                         }
                         Map<String, String> acl = Map.of();
-                        if (magic == BUCKET_MAGIC_V3) {
+                        if (magic == BUCKET_MAGIC_V3 || magic == BUCKET_MAGIC_V4) {
                             int size = input.readUnsignedShort();
                             if (size > ACL_AREA) throw new IOException("Invalid bucket ACL");
                             acl = ObjectAttributes.decode(input.readNBytes(size));
                         }
+                        ObjectOwnership ownership = ObjectOwnership.OBJECT_WRITER;
+                        PublicAccessBlock block = PublicAccessBlock.open();
+                        String policy = null;
+                        if (magic == BUCKET_MAGIC_V4) {
+                            int ordinal = input.readUnsignedByte();
+                            int flags = input.readUnsignedByte();
+                            if (ordinal >= ObjectOwnership.values().length || (flags & ~15) != 0)
+                                throw new IOException("Invalid bucket access settings");
+                            ownership = ObjectOwnership.values()[ordinal];
+                            block = new PublicAccessBlock((flags & 1) != 0, (flags & 2) != 0,
+                                (flags & 4) != 0, (flags & 8) != 0);
+                            policy = input.readUTF();
+                            if (policy.isEmpty()) policy = null;
+                        }
                         if (!validBucket(name) || created < 0 ||
-                            buckets.put(name, new Bucket(name, created, state, acl)) != null)
+                            buckets.put(name, new Bucket(name, created, state, acl,
+                                ownership, block, policy)) != null)
                             throw new IOException("Invalid bucket catalog");
                     }
                     if (input.read() != -1) throw new IOException("Invalid bucket catalog");
@@ -212,7 +229,7 @@ final class DiskStore implements ObjectStorage {
         Path pending = Files.createTempFile(temporary, "buckets-", ".part");
         try {
             try (DataOutputStream output = new DataOutputStream(Files.newOutputStream(pending))) {
-                output.writeInt(BUCKET_MAGIC_V3);
+                output.writeInt(BUCKET_MAGIC_V4);
                 output.writeInt(next.size());
                 for (Bucket entry : next.values()) {
                     output.writeUTF(entry.name());
@@ -221,6 +238,13 @@ final class DiskStore implements ObjectStorage {
                     byte[] acl = ObjectAttributes.encode(entry.acl(), ACL_AREA);
                     output.writeShort(acl.length);
                     output.write(acl);
+                    output.writeByte(entry.ownership().ordinal());
+                    PublicAccessBlock block = entry.publicAccessBlock();
+                    output.writeByte((block.blockPublicAcls() ? 1 : 0) |
+                        (block.ignorePublicAcls() ? 2 : 0) |
+                        (block.blockPublicPolicy() ? 4 : 0) |
+                        (block.restrictPublicBuckets() ? 8 : 0));
+                    output.writeUTF(entry.policy() == null ? "" : entry.policy());
                 }
             }
             try (FileChannel channel = FileChannel.open(pending, StandardOpenOption.WRITE)) { channel.force(true); }
@@ -237,7 +261,8 @@ final class DiskStore implements ObjectStorage {
         if (old.versioning() == VersioningState.NEVER && state == VersioningState.SUSPENDED)
             throw new StoreException(400, "InvalidArgument", "Enable versioning before suspending it");
         NavigableMap<String, Bucket> next = new TreeMap<>(buckets);
-        next.put(name, new Bucket(name, old.created(), state, old.acl()));
+        next.put(name, new Bucket(name, old.created(), state, old.acl(),
+            old.ownership(), old.publicAccessBlock(), old.policy()));
         saveBuckets(next);
         buckets.clear();
         buckets.putAll(next);
@@ -246,7 +271,37 @@ final class DiskStore implements ObjectStorage {
     @Override public synchronized void setBucketAcl(String name, Map<String, String> acl) throws IOException {
         Bucket old = bucket(name);
         NavigableMap<String, Bucket> next = new TreeMap<>(buckets);
-        next.put(name, new Bucket(name, old.created(), old.versioning(), Map.copyOf(acl)));
+        next.put(name, new Bucket(name, old.created(), old.versioning(), Map.copyOf(acl),
+            old.ownership(), old.publicAccessBlock(), old.policy()));
+        saveBuckets(next);
+        buckets.clear();
+        buckets.putAll(next);
+    }
+
+    @Override public synchronized void setBucketOwnership(String name, ObjectOwnership ownership)
+        throws IOException {
+        Bucket old = bucket(name);
+        updateBucket(new Bucket(name, old.created(), old.versioning(), old.acl(),
+            ownership, old.publicAccessBlock(), old.policy()));
+    }
+
+    @Override public synchronized void setPublicAccessBlock(String name, PublicAccessBlock block)
+        throws IOException {
+        Bucket old = bucket(name);
+        updateBucket(new Bucket(name, old.created(), old.versioning(), old.acl(),
+            old.ownership(), block, old.policy()));
+    }
+
+    @Override public synchronized void setBucketPolicy(String name, String policy)
+        throws IOException {
+        Bucket old = bucket(name);
+        updateBucket(new Bucket(name, old.created(), old.versioning(), old.acl(),
+            old.ownership(), old.publicAccessBlock(), policy));
+    }
+
+    private void updateBucket(Bucket bucket) throws IOException {
+        NavigableMap<String, Bucket> next = new TreeMap<>(buckets);
+        next.put(bucket.name(), bucket);
         saveBuckets(next);
         buckets.clear();
         buckets.putAll(next);

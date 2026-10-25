@@ -148,6 +148,15 @@ assert "ListParts" in capabilities["operations"], capabilities
 assert capabilities["limits"]["maxObjectBytes"] > 0, capabilities
 assert headers.get_content_type() == "application/json", headers
 
+ownership = b"<OwnershipControls><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>"
+status, _, _ = request("PUT", f"/{bucket}?ownershipControls", ownership)
+assert status == 200, status
+public_access = (b"<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls>"
+                 b"<IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy>"
+                 b"<RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>")
+status, _, _ = request("PUT", f"/{bucket}?publicAccessBlock", public_access)
+assert status == 200, status
+
 key = f"/{bucket}/cluster-test/http.txt"
 body = b"HTTP gateway integration test"
 status, _, _ = request("PUT", key, body)

@@ -8,9 +8,23 @@ import java.util.Map;
 /** Storage operations shared by the local and cluster gateways. */
 interface ObjectStorage extends AutoCloseable {
     enum VersioningState { NEVER, ENABLED, SUSPENDED }
+    enum ObjectOwnership { BUCKET_OWNER_ENFORCED, BUCKET_OWNER_PREFERRED, OBJECT_WRITER }
+    record PublicAccessBlock(boolean blockPublicAcls, boolean ignorePublicAcls,
+                             boolean blockPublicPolicy, boolean restrictPublicBuckets) {
+        static PublicAccessBlock secure() { return new PublicAccessBlock(true, true, true, true); }
+        static PublicAccessBlock open() { return new PublicAccessBlock(false, false, false, false); }
+    }
     record Limits(long maxObjectBytes, long maxTotalBytes) {}
-    record Bucket(String name, long created, VersioningState versioning, Map<String, String> acl) {
-        Bucket(String name, long created) { this(name, created, VersioningState.NEVER, Map.of()); }
+    record Bucket(String name, long created, VersioningState versioning, Map<String, String> acl,
+                  ObjectOwnership ownership, PublicAccessBlock publicAccessBlock, String policy) {
+        Bucket(String name, long created) {
+            this(name, created, VersioningState.NEVER, Map.of(),
+                ObjectOwnership.BUCKET_OWNER_ENFORCED, PublicAccessBlock.secure(), null);
+        }
+        Bucket(String name, long created, VersioningState versioning, Map<String, String> acl) {
+            this(name, created, versioning, acl,
+                ObjectOwnership.OBJECT_WRITER, PublicAccessBlock.open(), null);
+        }
         Bucket(String name, long created, VersioningState versioning) {
             this(name, created, versioning, Map.of());
         }
@@ -114,6 +128,9 @@ interface ObjectStorage extends AutoCloseable {
     void createBucket(String bucket) throws IOException;
     void deleteBucket(String bucket) throws IOException;
     void setBucketAcl(String bucket, Map<String, String> acl) throws IOException;
+    void setBucketOwnership(String bucket, ObjectOwnership ownership) throws IOException;
+    void setPublicAccessBlock(String bucket, PublicAccessBlock block) throws IOException;
+    void setBucketPolicy(String bucket, String policy) throws IOException;
     void setObjectAcl(String bucket, String key, String versionId, Map<String, String> acl) throws IOException;
     Limits limits();
     default boolean ready() { return true; }

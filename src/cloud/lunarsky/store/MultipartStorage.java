@@ -6,7 +6,16 @@ import java.util.List;
 import java.util.Map;
 
 interface MultipartStorage {
-    record Part(int number, String etag) {}
+    record Part(int number, String etag, String checksumCrc32) {
+        Part(int number, String etag) { this(number, etag, null); }
+
+        void verifyCrc32(long value) {
+            if (checksumCrc32 == null) return;
+            byte[] bytes = java.nio.ByteBuffer.allocate(4).putInt((int) value).array();
+            if (!checksumCrc32.equals(java.util.Base64.getEncoder().encodeToString(bytes)))
+                throw new StoreException(400, "BadDigest", "Part CRC32 checksum mismatch");
+        }
+    }
     record PartInfo(int number, long length, String etag, long modified) {}
     record PartPage(List<PartInfo> parts, int nextMarker, boolean truncated) {}
     record UploadInfo(String id, String key, long created) {}

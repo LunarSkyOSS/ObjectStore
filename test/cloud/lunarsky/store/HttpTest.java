@@ -71,17 +71,35 @@ public final class HttpTest {
     }
 
     private static URI presignedUri(URI uri, String method, int expires) {
+        return presignedUriAs(uri, method, expires, ACCESS, SECRET, null);
+    }
+
+    static URI presignedUriAs(URI uri, String method, int expires, String access, String secret,
+                             String token) {
+        return presignedUriAs(uri, method, expires, access, secret, token, false);
+    }
+
+    private static URI presignedUriAs(URI uri, String method, int expires, String access, String secret,
+                                      String token, boolean sdkContentHash) {
+        return presignedUriAs(uri, method, expires, access, secret, token, sdkContentHash, "");
+    }
+
+    private static URI presignedUriAs(URI uri, String method, int expires, String access, String secret,
+                                      String token, boolean sdkContentHash, String applicationQuery) {
         String date = DATE.format(Instant.now());
         String scope = date.substring(0, 8) + "/" + REGION + "/s3/aws4_request";
         String query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=" +
-            SigV4.encode(ACCESS + "/" + scope, false) + "&X-Amz-Date=" + date +
+            SigV4.encode(access + "/" + scope, false) + "&X-Amz-Date=" + date +
             "&X-Amz-Expires=" + expires + "&X-Amz-SignedHeaders=host";
+        if (token != null) query += "&X-Amz-Security-Token=" + SigV4.encode(token, false);
+        if (sdkContentHash) query += "&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD";
+        if (!applicationQuery.isEmpty()) query += "&" + applicationQuery;
         String canonical = method + "\n" + uri.getRawPath() + "\n" +
             SigV4.canonicalQuery(query) + "\nhost:" + uri.getAuthority() +
             "\n\nhost\nUNSIGNED-PAYLOAD";
         String toSign = "AWS4-HMAC-SHA256\n" + date + "\n" + scope + "\n" +
             SigV4.hex(SigV4.hash(canonical.getBytes(StandardCharsets.UTF_8)));
-        String signature = SigV4.hex(SigV4.hmac(SigV4.signingKey(SECRET,
+        String signature = SigV4.hex(SigV4.hmac(SigV4.signingKey(secret,
             date.substring(0, 8), REGION), toSign));
         return URI.create(uri + "?" + query + "&X-Amz-Signature=" + signature);
     }
@@ -96,6 +114,27 @@ public final class HttpTest {
             HttpResponse.BodyHandlers.ofByteArray());
         status(200, read);
         if (!java.util.Arrays.equals(body, read.body())) throw new AssertionError("Presigned object mismatch");
+        URI sdkObject = URI.create(base + "/objects/sdk-v3-presigned");
+        URI sdkPut = presignedUriAs(sdkObject, "PUT", 60, ACCESS, SECRET, null, true);
+        status(200, client.send(HttpRequest.newBuilder(sdkPut)
+            .PUT(HttpRequest.BodyPublishers.ofByteArray(body)).build(), HttpResponse.BodyHandlers.ofByteArray()));
+        URI sdkGet = presignedUriAs(sdkObject, "GET", 60, ACCESS, SECRET, null, true);
+        status(200, client.send(HttpRequest.newBuilder(sdkGet).GET().build(),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(403, client.send(HttpRequest.newBuilder(URI.create(sdkGet.toString().replace(
+            "X-Amz-Content-Sha256=UNSIGNED-PAYLOAD", "X-Amz-Content-Sha256=changed")))
+            .GET().build(), HttpResponse.BodyHandlers.ofByteArray()));
+        status(204, client.send(HttpRequest.newBuilder(presignedUriAs(sdkObject, "DELETE", 60,
+            ACCESS, SECRET, null, true)).DELETE().build(), HttpResponse.BodyHandlers.ofByteArray()));
+        URI checksumObject = URI.create(base + "/objects/sdk-v3-checksum");
+        String checksumQuery = "x-amz-checksum-crc32=" +
+            SigV4.encode(encodedChecksum("CRC32", body), false) +
+            "&x-amz-sdk-checksum-algorithm=CRC32&x-id=PutObject";
+        status(200, client.send(HttpRequest.newBuilder(presignedUriAs(checksumObject, "PUT", 60,
+            ACCESS, SECRET, null, true, checksumQuery))
+            .PUT(HttpRequest.BodyPublishers.ofByteArray(body)).build(), HttpResponse.BodyHandlers.ofByteArray()));
+        status(204, client.send(HttpRequest.newBuilder(presignedUri(checksumObject, "DELETE", 60))
+            .DELETE().build(), HttpResponse.BodyHandlers.ofByteArray()));
         URI tampered = URI.create(presignedUri(object, "GET", 60).toString().replace("presigned-test", "different"));
         status(403, client.send(HttpRequest.newBuilder(tampered).GET().build(),
             HttpResponse.BodyHandlers.ofByteArray()));
@@ -104,6 +143,7 @@ public final class HttpTest {
     }
 
     private static void testAcl(HttpClient client, String base) throws Exception {
+        enableAcl(client, URI.create(base + "/objects"));
         byte[] body = "private object".getBytes(StandardCharsets.UTF_8);
         URI object = URI.create(base + "/objects/acl-test");
         URI objectAcl = URI.create(object + "?acl");
@@ -166,6 +206,7 @@ public final class HttpTest {
         URI historyBucket = URI.create(base + "/acl-history");
         status(200, client.send(signedUri(historyBucket, "PUT", new byte[0], Map.of()),
             HttpResponse.BodyHandlers.ofByteArray()));
+        enableAcl(client, historyBucket);
         byte[] versioning = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
             .getBytes(StandardCharsets.UTF_8);
         status(200, client.send(signedUri(URI.create(historyBucket + "?versioning"),
@@ -195,6 +236,19 @@ public final class HttpTest {
             Map.of("x-amz-acl", "private")), HttpResponse.BodyHandlers.ofByteArray()));
         status(403, client.send(HttpRequest.newBuilder(historical).GET().build(),
             HttpResponse.BodyHandlers.ofByteArray()));
+    }
+
+    private static void enableAcl(HttpClient client, URI bucket) throws Exception {
+        byte[] ownership = ("<OwnershipControls><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership>" +
+            "</Rule></OwnershipControls>").getBytes(StandardCharsets.UTF_8);
+        status(200, client.send(signedUri(URI.create(bucket + "?ownershipControls"),
+            "PUT", ownership, Map.of()), HttpResponse.BodyHandlers.ofByteArray()));
+        byte[] publicAccess = ("<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls>" +
+            "<IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy>" +
+            "<RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>")
+            .getBytes(StandardCharsets.UTF_8);
+        status(200, client.send(signedUri(URI.create(bucket + "?publicAccessBlock"),
+            "PUT", publicAccess, Map.of()), HttpResponse.BodyHandlers.ofByteArray()));
     }
 
     private static void testStreaming(HttpClient client, String base) throws Exception {
@@ -413,7 +467,8 @@ public final class HttpTest {
             "PUT", body, Map.of("content-type", "text/plain")), HttpResponse.BodyHandlers.ofByteArray()));
         String header = "/objects/" + SigV4.encode(source, true);
         var result = client.send(signedUri(URI.create(base + "/objects/" + target), "PUT",
-            new byte[0], Map.of("x-amz-copy-source", header)), HttpResponse.BodyHandlers.ofString());
+            new byte[0], Map.of("x-amz-copy-source", header,
+                "content-type", "application/x-sdk-copy")), HttpResponse.BodyHandlers.ofString());
         if (result.statusCode() != 200 || !result.body().contains("<CopyObjectResult>") ||
             !result.body().contains("<ETag>&quot;"))
             throw new AssertionError("CopyObject failed: " + result.body());
@@ -536,18 +591,32 @@ public final class HttpTest {
     }
 
     private static void testMultipart(HttpClient client, String base) throws Exception {
+        URI endpoint = ObjectStoreServer.publicEndpoint(Map.of("S3_PUBLIC_ENDPOINT", "https://s3.example.test/"));
+        if (!"https://s3.example.test/objects/folder/a%20b.mp4".equals(
+            MultipartHandler.objectLocation(endpoint, "127.0.0.1:9000", "http",
+                "/objects/folder/a%20b.mp4", "objects", "folder/a b.mp4")))
+            throw new AssertionError("Configured multipart location is incorrect");
+        try {
+            ObjectStoreServer.publicEndpoint(Map.of("S3_PUBLIC_ENDPOINT", "https://s3.example.test/subpath"));
+            throw new AssertionError("Public endpoint with a path was accepted");
+        } catch (IllegalArgumentException expected) { }
         String movie = "folder/video.mp4";
         URI initiate = URI.create(base + "/objects/" + movie + "?uploads=");
         var created = client.send(signedUri(initiate, "POST", new byte[0],
-            Map.of("content-type", "video/mp4")), HttpResponse.BodyHandlers.ofString());
+            Map.of("content-type", "video/mp4", "x-amz-checksum-algorithm", "CRC32")),
+            HttpResponse.BodyHandlers.ofString());
         if (created.statusCode() != 200) throw new AssertionError("Multipart initiation failed: " + created.body());
         String upload = created.body().split("<UploadId>")[1].split("</UploadId>")[0];
         byte[] first = "hello ".getBytes(StandardCharsets.UTF_8);
         byte[] second = "world".getBytes(StandardCharsets.UTF_8);
         var partOne = client.send(signedUri(URI.create(base + "/objects/" + movie +
-            "?partNumber=1&uploadId=" + upload), "PUT", first, Map.of()), HttpResponse.BodyHandlers.ofByteArray());
+            "?partNumber=1&uploadId=" + upload), "PUT", first,
+            Map.of("x-amz-checksum-crc32", encodedChecksum("CRC32", first),
+                "x-amz-sdk-checksum-algorithm", "CRC32")), HttpResponse.BodyHandlers.ofByteArray());
         var partTwo = client.send(signedUri(URI.create(base + "/objects/" + movie +
-            "?partNumber=2&uploadId=" + upload), "PUT", second, Map.of()), HttpResponse.BodyHandlers.ofByteArray());
+            "?partNumber=2&uploadId=" + upload), "PUT", second,
+            Map.of("x-amz-checksum-crc32", encodedChecksum("CRC32", second),
+                "x-amz-sdk-checksum-algorithm", "CRC32")), HttpResponse.BodyHandlers.ofByteArray());
         status(200, partOne);
         status(200, partTwo);
         var rejectedPart = client.send(signedUri(URI.create(base + "/objects/" + movie +
@@ -567,11 +636,20 @@ public final class HttpTest {
             throw new AssertionError("Multipart upload listing failed: " + uploads.body());
         String completion = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" +
             partOne.headers().firstValue("etag").orElseThrow() +
-            "</ETag></Part><Part><PartNumber>2</PartNumber><ETag>" +
+            "</ETag><ChecksumCRC32>" + encodedChecksum("CRC32", first) +
+            "</ChecksumCRC32></Part><Part><PartNumber>2</PartNumber><ETag>" +
             partTwo.headers().firstValue("etag").orElseThrow() +
-            "</ETag></Part></CompleteMultipartUpload>";
-        status(200, client.send(signedUri(URI.create(base + "/objects/" + movie + "?uploadId=" + upload),
-            "POST", completion.getBytes(StandardCharsets.UTF_8), Map.of()), HttpResponse.BodyHandlers.ofByteArray()));
+            "</ETag><ChecksumCRC32>" + encodedChecksum("CRC32", second) +
+            "</ChecksumCRC32></Part></CompleteMultipartUpload>";
+        String mismatched = completion.replace(encodedChecksum("CRC32", first), "AAAAAA==");
+        status(400, client.send(signedUri(URI.create(base + "/objects/" + movie + "?uploadId=" + upload),
+            "POST", mismatched.getBytes(StandardCharsets.UTF_8), Map.of()),
+            HttpResponse.BodyHandlers.ofString()));
+        var completed = client.send(signedUri(URI.create(base + "/objects/" + movie + "?uploadId=" + upload),
+            "POST", completion.getBytes(StandardCharsets.UTF_8), Map.of()), HttpResponse.BodyHandlers.ofString());
+        status(200, completed);
+        if (!completed.body().contains("<Location>" + base + "/objects/" + movie + "</Location>"))
+            throw new AssertionError("Multipart completion omitted the object location: " + completed.body());
         var assembled = client.send(signed(base, "GET", movie, new byte[0]), HttpResponse.BodyHandlers.ofByteArray());
         status(200, assembled);
         if (!"hello world".equals(new String(assembled.body(), StandardCharsets.UTF_8)) ||

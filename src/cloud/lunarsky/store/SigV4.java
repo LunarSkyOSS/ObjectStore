@@ -30,6 +30,7 @@ final class SigV4 {
     private static final DateTimeFormatter DATE = DateTimeFormatter.ofPattern("uuuuMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
     private static final Pattern HEX = Pattern.compile("[0-9a-f]{64}");
     private final Map<String, String> identities;
+    private final Map<String, SessionCredentials.Session> sessions;
     private final String root;
     private final String region;
     private final Clock clock;
@@ -39,15 +40,27 @@ final class SigV4 {
     }
 
     SigV4(Map<String, String> identities, String root, String region, Clock clock) {
+        this(identities, Map.of(), root, region, clock);
+    }
+
+    SigV4(Map<String, String> identities, Map<String, SessionCredentials.Session> sessions,
+          String root, String region, Clock clock) {
         this.identities = Map.copyOf(identities);
+        this.sessions = Map.copyOf(sessions);
         if (!this.identities.containsKey(root)) throw new IllegalArgumentException("Missing root identity");
+        if (this.sessions.keySet().stream().anyMatch(this.identities::containsKey))
+            throw new IllegalArgumentException("Session and permanent keys overlap");
         this.root = root;
         this.region = region;
         this.clock = clock;
     }
 
     String root() { return root; }
-    Set<String> identities() { return identities.keySet(); }
+    Set<String> identities() {
+        var all = new java.util.HashSet<>(identities.keySet());
+        all.addAll(sessions.keySet());
+        return Set.copyOf(all);
+    }
 
     String verify(String method, URI uri, Headers headers) {
         return verifyRequest(method, uri, headers).payload();
@@ -57,6 +70,7 @@ final class SigV4 {
         if (hasPresignedQuery(uri.getRawQuery())) return verifyPresigned(method, uri, headers);
         Map<String, String> fields = authorizationFields(headers);
         String[] credential = credentialScope(fields.get("Credential"));
+        validateSession(credential[0], single(headers, "x-amz-security-token"));
         String date = signingDate(headers, credential[1]);
         String payload = payloadHash(headers);
         String signedHeaders = fields.get("SignedHeaders");
@@ -76,11 +90,19 @@ final class SigV4 {
         if (headers.containsKey("authorization")) denied("Use one authentication method");
         PresignedQuery query = presignedQuery(uri.getRawQuery());
         Map<String, String> fields = query.fields();
-        if (!fields.keySet().equals(Set.of("X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date",
-                "X-Amz-Expires", "X-Amz-SignedHeaders", "X-Amz-Signature")) ||
+        Set<String> expected = Set.of("X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date",
+            "X-Amz-Expires", "X-Amz-SignedHeaders", "X-Amz-Signature");
+        Set<String> allowed = new java.util.HashSet<>(expected);
+        allowed.add("X-Amz-Security-Token");
+        allowed.add("X-Amz-Content-Sha256");
+        if (!fields.keySet().containsAll(expected) || !allowed.containsAll(fields.keySet()) ||
+            fields.containsKey("X-Amz-Content-Sha256") &&
+                !"UNSIGNED-PAYLOAD".equals(fields.get("X-Amz-Content-Sha256")) ||
             !"AWS4-HMAC-SHA256".equals(fields.get("X-Amz-Algorithm")))
             denied("Invalid presigned parameters");
         String[] credential = credentialScope(fields.get("X-Amz-Credential"));
+        if (headers.containsKey("x-amz-security-token")) denied("Presigned session token must be in the query");
+        validateSession(credential[0], fields.get("X-Amz-Security-Token"));
         String date = fields.get("X-Amz-Date");
         validatePresignedTime(date, credential[1], fields.get("X-Amz-Expires"));
         String signedHeaders = fields.get("X-Amz-SignedHeaders");
@@ -162,15 +184,27 @@ final class SigV4 {
 
     private String[] credentialScope(String value) {
         String[] credential = value.split("/", -1);
-        if (credential.length != 5 || !identities.containsKey(credential[0]) || !credential[2].equals(region)
+        if (credential.length != 5 || !(identities.containsKey(credential[0]) || sessions.containsKey(credential[0])) || !credential[2].equals(region)
             || !credential[3].equals("s3") || !credential[4].equals("aws4_request")) denied("Invalid credential scope");
         return credential;
     }
 
     private String secret(String accessKey) {
         String secret = identities.get(accessKey);
+        if (secret == null && sessions.containsKey(accessKey)) secret = sessions.get(accessKey).secret();
         if (secret == null) denied("Invalid credential scope");
         return secret;
+    }
+
+    private void validateSession(String accessKey, String token) {
+        SessionCredentials.Session session = sessions.get(accessKey);
+        if (session == null) {
+            if (token != null) denied("Unexpected session token");
+            return;
+        }
+        if (token == null || !MessageDigest.isEqual(token.getBytes(StandardCharsets.UTF_8),
+            session.token().getBytes(StandardCharsets.UTF_8)) || !clock.instant().isBefore(session.expires()))
+            denied("Invalid or expired session token");
     }
 
     private String signingDate(Headers headers, String credentialDate) {
@@ -190,7 +224,6 @@ final class SigV4 {
             payload.equals("STREAMING-AWS4-HMAC-SHA256-PAYLOAD") ||
             payload.equals("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER")))
             throw new StoreException(400, "NotImplemented", "Unsupported SHA-256 payload mode");
-        if (headers.containsKey("x-amz-security-token")) denied("Temporary credentials are unsupported");
         return payload;
     }
 

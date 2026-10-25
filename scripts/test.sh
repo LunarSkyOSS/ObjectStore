@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
+sh scripts/test-start-server.sh
 mkdir -p out/classes
 javac --release 21 --add-modules jdk.httpserver,java.net.http -cp lib/hash4j-0.30.0.jar -d out/classes \
   src/cloud/lunarsky/store/*.java test/cloud/lunarsky/store/*.java

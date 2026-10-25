@@ -21,7 +21,7 @@ final class SchemaMigrator {
                     result.next();
                     version = result.getInt(1);
                 }
-                if (version > 10) throw new IOException("Metadata schema is newer than this ObjectStore build");
+                if (version > 11) throw new IOException("Metadata schema is newer than this ObjectStore build");
                 if (version < 1) {
                     statement.execute("CREATE TABLE IF NOT EXISTS cluster_usage (bucket text PRIMARY KEY, used_bytes bigint NOT NULL CHECK (used_bytes >= 0))");
                     statement.execute("CREATE TABLE IF NOT EXISTS cluster_objects (bucket text NOT NULL, object_key text COLLATE \"C\" NOT NULL, generation uuid NOT NULL, length bigint NOT NULL, modified bigint NOT NULL, etag text NOT NULL, sha256 bytea NOT NULL, content_type text NOT NULL, PRIMARY KEY (bucket, object_key))");
@@ -98,6 +98,17 @@ final class SchemaMigrator {
                     statement.execute("ALTER TABLE cluster_uploads ADD COLUMN acl bytea");
                     statement.execute("INSERT INTO cluster_schema_migrations VALUES (10)");
                 }
+                if (version < 11) {
+                    statement.execute("ALTER TABLE cluster_buckets ADD COLUMN object_ownership text NOT NULL " +
+                        "DEFAULT 'OBJECT_WRITER' CHECK (object_ownership IN " +
+                        "('BUCKET_OWNER_ENFORCED', 'BUCKET_OWNER_PREFERRED', 'OBJECT_WRITER'))");
+                    statement.execute("ALTER TABLE cluster_buckets ADD COLUMN block_public_acls boolean NOT NULL DEFAULT false");
+                    statement.execute("ALTER TABLE cluster_buckets ADD COLUMN ignore_public_acls boolean NOT NULL DEFAULT false");
+                    statement.execute("ALTER TABLE cluster_buckets ADD COLUMN block_public_policy boolean NOT NULL DEFAULT false");
+                    statement.execute("ALTER TABLE cluster_buckets ADD COLUMN restrict_public_buckets boolean NOT NULL DEFAULT false");
+                    statement.execute("ALTER TABLE cluster_buckets ADD COLUMN bucket_policy text");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (11)");
+                }
                 statement.execute("INSERT INTO cluster_format SELECT 1, CASE WHEN EXISTS (SELECT 1 FROM cluster_segments WHERE replica_ids IS NULL) THEN 1 ELSE 2 END WHERE NOT EXISTS (SELECT 1 FROM cluster_format)");
             }
             try (PreparedStatement insert = connection.prepareStatement("INSERT INTO cluster_usage VALUES (?, 0) ON CONFLICT DO NOTHING")) {
@@ -105,7 +116,9 @@ final class SchemaMigrator {
                 insert.executeUpdate();
             }
             try (PreparedStatement insert = connection.prepareStatement(
-                "INSERT INTO cluster_buckets (name, created_at) VALUES (?, ?) ON CONFLICT DO NOTHING")) {
+                "INSERT INTO cluster_buckets (name, created_at, object_ownership, block_public_acls, " +
+                "ignore_public_acls, block_public_policy, restrict_public_buckets) " +
+                "VALUES (?, ?, 'BUCKET_OWNER_ENFORCED', true, true, true, true) ON CONFLICT DO NOTHING")) {
                 insert.setString(1, bucket);
                 insert.setLong(2, System.currentTimeMillis());
                 insert.executeUpdate();

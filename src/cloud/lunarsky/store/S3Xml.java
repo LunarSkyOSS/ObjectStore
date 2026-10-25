@@ -77,17 +77,23 @@ final class S3Xml {
             for (int i = 0; i < nodes.getLength(); i++) {
                 if (!(nodes.item(i) instanceof org.w3c.dom.Element element)) continue;
                 if (!element.getTagName().equals("Part")) throw new IllegalArgumentException();
-                String number = null, etag = null;
+                String number = null, etag = null, checksumCrc32 = null;
                 var fields = element.getChildNodes();
                 for (int j = 0; j < fields.getLength(); j++) {
                     if (!(fields.item(j) instanceof org.w3c.dom.Element field)) continue;
-                    if (field.getTagName().equals("PartNumber")) number = field.getTextContent().trim();
-                    else if (field.getTagName().equals("ETag")) etag = field.getTextContent().trim();
+                    if (field.getTagName().equals("PartNumber") && number == null)
+                        number = field.getTextContent().trim();
+                    else if (field.getTagName().equals("ETag") && etag == null)
+                        etag = field.getTextContent().trim();
+                    else if (field.getTagName().equals("ChecksumCRC32") && checksumCrc32 == null)
+                        checksumCrc32 = field.getTextContent().trim();
                     else throw new IllegalArgumentException();
                 }
                 if (number == null || etag == null || !etag.matches("\"?[0-9a-f]{32}\"?"))
                     throw new IllegalArgumentException();
-                parts.add(new MultipartStorage.Part(Integer.parseInt(number), etag));
+                if (checksumCrc32 != null && java.util.Base64.getDecoder().decode(checksumCrc32).length != 4)
+                    throw new IllegalArgumentException();
+                parts.add(new MultipartStorage.Part(Integer.parseInt(number), etag, checksumCrc32));
                 if (parts.size() > 10000) throw new IllegalArgumentException();
             }
             return parts;

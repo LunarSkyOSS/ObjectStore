@@ -1,6 +1,7 @@
 package cloud.lunarsky.store;
 
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.Headers;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -15,6 +16,7 @@ final class S3Request {
         for (String name : headers.keySet()) {
             String lower = name.toLowerCase(java.util.Locale.ROOT);
             if (lower.startsWith("x-amz-") && !lower.startsWith("x-amz-meta-") && !java.util.Set.of("x-amz-date", "x-amz-content-sha256",
+                "x-amz-security-token",
                 "x-amz-sdk-checksum-algorithm", "x-amz-user-agent", "x-amz-copy-source",
                 "x-amz-metadata-directive", "x-amz-tagging", "x-amz-tagging-directive",
                 "x-amz-decoded-content-length", "x-amz-trailer", "x-amz-checksum-mode",
@@ -39,6 +41,19 @@ final class S3Request {
             if (!MessageDigest.isEqual(expected, actual))
                 throw new StoreException(400, "BadDigest", "Content-MD5 mismatch");
         } catch (java.security.NoSuchAlgorithmException error) { throw new IllegalStateException(error); }
+    }
+    static UploadChecksums uploadChecksums(Headers headers, Map<String, String> query) {
+        if (query.keySet().stream().noneMatch(name -> name.startsWith("x-amz-checksum-") ||
+            name.equals("x-amz-sdk-checksum-algorithm"))) return UploadChecksums.from(headers);
+        Headers combined = new Headers();
+        headers.forEach((name, values) -> combined.put(name, java.util.List.copyOf(values)));
+        query.forEach((name, value) -> {
+            if (!name.startsWith("x-amz-checksum-") && !name.equals("x-amz-sdk-checksum-algorithm")) return;
+            if (combined.containsKey(name))
+                throw new StoreException(400, "InvalidRequest", "Duplicate checksum in query and header");
+            combined.set(name, value);
+        });
+        return UploadChecksums.from(combined);
     }
     static String contentType(com.sun.net.httpserver.Headers headers) {
         String value = SigV4.single(headers, "content-type");

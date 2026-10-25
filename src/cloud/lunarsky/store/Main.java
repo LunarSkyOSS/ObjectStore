@@ -2,6 +2,7 @@ package cloud.lunarsky.store;
 
 import com.sun.net.httpserver.HttpExchange;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -62,12 +63,29 @@ public final class Main {
     Main(ObjectStorage store, MultipartStorage multipart, SigV4 authentication, String bucket,
          ClientLimits clientLimits, int maxInFlight, String virtualHostSuffix,
          BrowserCors cors, KeyScopes keyScopes, RequestMetrics metrics) throws IOException {
+        this(store, multipart, authentication, bucket, clientLimits, maxInFlight, virtualHostSuffix,
+            cors, keyScopes, metrics, Map.of());
+    }
+
+    Main(ObjectStorage store, MultipartStorage multipart, SigV4 authentication, String bucket,
+         ClientLimits clientLimits, int maxInFlight, String virtualHostSuffix,
+         BrowserCors cors, KeyScopes keyScopes, RequestMetrics metrics,
+         Map<String, BucketPolicy> identityPolicies) throws IOException {
+        this(store, multipart, authentication, bucket, clientLimits, maxInFlight, virtualHostSuffix,
+            cors, keyScopes, metrics, identityPolicies, null);
+    }
+
+    Main(ObjectStorage store, MultipartStorage multipart, SigV4 authentication, String bucket,
+         ClientLimits clientLimits, int maxInFlight, String virtualHostSuffix,
+         BrowserCors cors, KeyScopes keyScopes, RequestMetrics metrics,
+         Map<String, BucketPolicy> identityPolicies, URI publicEndpoint) throws IOException {
         if (maxInFlight < 1 || maxInFlight > 1024)
             throw new IllegalArgumentException("MAX_IN_FLIGHT_REQUESTS must be between 1 and 1024");
         this.store = store;
         this.authentication = authentication;
-        this.access = new S3Access(store, authentication.root());
-        MultipartHandler multipartHandler = new MultipartHandler(store, multipart, authentication);
+        this.access = new S3Access(store, authentication.root(), identityPolicies);
+        MultipartHandler multipartHandler = new MultipartHandler(store, multipart, authentication, access,
+            publicEndpoint);
         this.bucketHandler = new BucketHandler(store, multipart, multipartHandler,
             authentication, access, bucket);
         this.objectHandler = new ObjectHandler(store, multipartHandler, authentication, access);

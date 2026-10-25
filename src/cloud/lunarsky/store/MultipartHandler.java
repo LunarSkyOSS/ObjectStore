@@ -1,7 +1,9 @@
 package cloud.lunarsky.store;
 
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpsExchange;
 import java.io.IOException;
+import java.net.URI;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -12,13 +14,18 @@ final class MultipartHandler {
     private final ObjectStorage store;
     private final MultipartStorage multipart;
     private final SigV4 authentication;
+    private final S3Access access;
     private final String owner;
+    private final URI publicEndpoint;
 
-    MultipartHandler(ObjectStorage store, MultipartStorage multipart, SigV4 authentication) {
+    MultipartHandler(ObjectStorage store, MultipartStorage multipart, SigV4 authentication,
+                     S3Access access, URI publicEndpoint) {
         this.store = store;
         this.multipart = multipart;
         this.authentication = authentication;
+        this.access = access;
         this.owner = authentication.root();
+        this.publicEndpoint = publicEndpoint;
     }
 
     void handleMultipart(HttpExchange exchange, String method, Map<String, String> query,
@@ -36,15 +43,24 @@ final class MultipartHandler {
              headers.containsKey("x-amz-acl") || headers.keySet().stream().anyMatch(
                  name -> name.toLowerCase(Locale.ROOT).startsWith("x-amz-grant-"))))
             S3Request.unsupported("Multipart object attributes belong on initiation");
+        boolean initiate = query.containsKey("uploads");
         if (!method.equals("PUT") && (headers.containsKey("content-md5") ||
             headers.containsKey("x-amz-sdk-checksum-algorithm") ||
-            headers.keySet().stream().anyMatch(name -> name.toLowerCase(Locale.ROOT).startsWith("x-amz-checksum-"))))
+            headers.keySet().stream().anyMatch(name -> {
+                String lower = name.toLowerCase(Locale.ROOT);
+                return lower.startsWith("x-amz-checksum-") &&
+                    !(initiate && lower.equals("x-amz-checksum-algorithm"));
+            })))
             S3Request.unsupported("Multipart checksum header");
-        if (query.containsKey("uploads")) {
+        if (initiate) {
+            String algorithm = SigV4.single(headers, "x-amz-checksum-algorithm");
+            if (algorithm != null && !algorithm.equals("CRC32"))
+                S3Request.unsupported("Multipart checksum algorithm");
             S3Request.requireEmptyBody(exchange, hash);
             Map<String, String> acl = Acl.fromHeaders(headers, authentication.identities());
+            BucketSecurity.checkAcl(store.bucket(bucketName), headers, acl, false);
             if (!acl.isEmpty() && !owner.equals(verified.principal()))
-                Acl.require(store.bucket(bucketName).acl(), verified.principal(), owner, Acl.WRITE_ACP);
+                access.requireBucket(bucketName, verified.principal(), Acl.WRITE_ACP);
             String id = multipart.create(bucketName, key, S3Request.contentType(headers),
                 ObjectAttributes.userMetadata(headers),
                 ObjectAttributes.tagsHeader(SigV4.single(headers, "x-amz-tagging")), acl);
@@ -77,7 +93,8 @@ final class MultipartHandler {
                 var meta = multipart.complete(id, bucketName, key, parts);
                 if (meta.versionId() != null)
                     exchange.getResponseHeaders().set("x-amz-version-id", meta.versionId());
-                S3Xml.sendXml(exchange, 200, "<CompleteMultipartUploadResult><Bucket>" + S3Xml.xml(bucketName) +
+                S3Xml.sendXml(exchange, 200, "<CompleteMultipartUploadResult><Location>" +
+                    S3Xml.xml(location(exchange, bucketName, key)) + "</Location><Bucket>" + S3Xml.xml(bucketName) +
                     "</Bucket><Key>" + S3Xml.xml(key) + "</Key><ETag>&quot;" + meta.etag() +
                     "&quot;</ETag></CompleteMultipartUploadResult>");
             }
@@ -92,6 +109,20 @@ final class MultipartHandler {
             }
             default -> S3Request.unsupported("Multipart operation");
         }
+    }
+
+    private String location(HttpExchange exchange, String bucket, String key) {
+        String host = SigV4.single(exchange.getRequestHeaders(), "host");
+        if (host == null) throw new StoreException(400, "InvalidRequest", "Missing Host header");
+        String scheme = exchange instanceof HttpsExchange ? "https" : "http";
+        return objectLocation(publicEndpoint, host, scheme, exchange.getRequestURI().getRawPath(), bucket, key);
+    }
+
+    static String objectLocation(URI endpoint, String host, String scheme, String rawPath,
+                                 String bucket, String key) {
+        if (endpoint != null)
+            return endpoint + "/" + bucket + "/" + SigV4.encode(key, true);
+        return URI.create(scheme + "://" + host + rawPath).toASCIIString();
     }
 
     private void listParts(HttpExchange exchange, String id, String key, Map<String, String> query,

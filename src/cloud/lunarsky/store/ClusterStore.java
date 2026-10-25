@@ -78,12 +78,16 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
 
     @Override public Bucket bucket(String name) throws IOException {
         try (Connection connection = connect(); PreparedStatement query = connection.prepareStatement(
-            "SELECT created_at, versioning_state, acl FROM cluster_buckets WHERE name=?")) {
+            "SELECT created_at, versioning_state, acl, object_ownership, block_public_acls, " +
+            "ignore_public_acls, block_public_policy, restrict_public_buckets, bucket_policy " +
+            "FROM cluster_buckets WHERE name=?")) {
             query.setString(1, name);
             try (ResultSet result = query.executeQuery()) {
                 if (!result.next()) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
                 return new Bucket(name, result.getLong(1), VersioningState.valueOf(result.getString(2)),
-                    ObjectAttributes.decode(result.getBytes(3)));
+                    ObjectAttributes.decode(result.getBytes(3)), ObjectOwnership.valueOf(result.getString(4)),
+                    new PublicAccessBlock(result.getBoolean(5), result.getBoolean(6),
+                        result.getBoolean(7), result.getBoolean(8)), result.getString(9));
             }
         } catch (SQLException error) { throw databaseError(error); }
     }
@@ -91,9 +95,14 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     @Override public List<Bucket> buckets() throws IOException {
         List<Bucket> result = new ArrayList<>();
         try (Connection connection = connect(); var query = connection.createStatement();
-             ResultSet rows = query.executeQuery("SELECT name, created_at, versioning_state, acl FROM cluster_buckets ORDER BY name")) {
+             ResultSet rows = query.executeQuery("SELECT name, created_at, versioning_state, acl, " +
+                 "object_ownership, block_public_acls, ignore_public_acls, block_public_policy, " +
+                 "restrict_public_buckets, bucket_policy FROM cluster_buckets ORDER BY name")) {
             while (rows.next()) result.add(new Bucket(rows.getString(1), rows.getLong(2),
-                VersioningState.valueOf(rows.getString(3)), ObjectAttributes.decode(rows.getBytes(4))));
+                VersioningState.valueOf(rows.getString(3)), ObjectAttributes.decode(rows.getBytes(4)),
+                ObjectOwnership.valueOf(rows.getString(5)),
+                new PublicAccessBlock(rows.getBoolean(6), rows.getBoolean(7),
+                    rows.getBoolean(8), rows.getBoolean(9)), rows.getString(10)));
             return result;
         } catch (SQLException error) { throw databaseError(error); }
     }
@@ -127,6 +136,38 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         try (Connection connection = connect(); PreparedStatement update = connection.prepareStatement(
             "UPDATE cluster_buckets SET acl=? WHERE name=?")) {
             update.setBytes(1, ObjectAttributes.encode(acl, 2048));
+            update.setString(2, bucket);
+            if (update.executeUpdate() == 0)
+                throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public void setBucketOwnership(String bucket, ObjectOwnership ownership) throws IOException {
+        updateBucketAccess(bucket, "object_ownership", ownership.name());
+    }
+
+    @Override public void setPublicAccessBlock(String bucket, PublicAccessBlock block) throws IOException {
+        try (Connection connection = connect(); PreparedStatement update = connection.prepareStatement(
+            "UPDATE cluster_buckets SET block_public_acls=?, ignore_public_acls=?, " +
+            "block_public_policy=?, restrict_public_buckets=? WHERE name=?")) {
+            update.setBoolean(1, block.blockPublicAcls());
+            update.setBoolean(2, block.ignorePublicAcls());
+            update.setBoolean(3, block.blockPublicPolicy());
+            update.setBoolean(4, block.restrictPublicBuckets());
+            update.setString(5, bucket);
+            if (update.executeUpdate() == 0)
+                throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    @Override public void setBucketPolicy(String bucket, String policy) throws IOException {
+        updateBucketAccess(bucket, "bucket_policy", policy);
+    }
+
+    private void updateBucketAccess(String bucket, String column, String value) throws IOException {
+        try (Connection connection = connect(); PreparedStatement update = connection.prepareStatement(
+            "UPDATE cluster_buckets SET " + column + "=? WHERE name=?")) {
+            update.setString(1, value);
             update.setString(2, bucket);
             if (update.executeUpdate() == 0)
                 throw new StoreException(404, "NoSuchBucket", "Bucket not found");
@@ -171,7 +212,9 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                         throw new StoreException(400, "TooManyBuckets", "Bucket limit reached");
                 }
                 try (PreparedStatement insert = connection.prepareStatement(
-                    "INSERT INTO cluster_buckets (name, created_at) VALUES (?, ?) ON CONFLICT DO NOTHING")) {
+                    "INSERT INTO cluster_buckets (name, created_at, object_ownership, block_public_acls, " +
+                    "ignore_public_acls, block_public_policy, restrict_public_buckets) " +
+                    "VALUES (?, ?, 'BUCKET_OWNER_ENFORCED', true, true, true, true) ON CONFLICT DO NOTHING")) {
                     insert.setString(1, name);
                     insert.setLong(2, Instant.now().toEpochMilli());
                     if (insert.executeUpdate() == 0)
@@ -599,17 +642,20 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                         throw new StoreException(413, "EntityTooLarge", "Object exceeds the configured size limit");
                     total += part.length();
                     MessageDigest partHash = digest("MD5");
+                    java.util.zip.CRC32 partCrc32 = new java.util.zip.CRC32();
                     for (Segment segment : part.segments()) {
                         byte[] bytes = readableSegment(segment);
                         if (bytes == null) throw new StoreException(503, "SlowDown", "A part has no verified replica");
                         fullHash.update(bytes);
                         crc64.update(bytes, 0, bytes.length);
                         partHash.update(bytes);
+                        partCrc32.update(bytes, 0, bytes.length);
                         selected.add(segment);
                     }
                     byte[] md5 = partHash.digest();
                     if (!part.etag().equals(HexFormat.of().formatHex(md5)))
                         throw new StoreException(503, "SlowDown", "A part failed integrity verification");
+                    requested.verifyCrc32(partCrc32.getValue());
                     etagHash.update(md5);
                 }
                 long replaced = state == VersioningState.ENABLED ? 0 : nullVersionLength(connection, bucket, key);

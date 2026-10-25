@@ -40,30 +40,105 @@ final class BucketHandler {
     void handleBucket(HttpExchange exchange, Map<String, String> query, String hash,
                               String bucketName, String principal) throws IOException {
         String method = exchange.getRequestMethod();
+        if (query.size() >= 1 && query.size() <= 2 &&
+            query.keySet().stream().allMatch(java.util.Set.of("ownershipControls", "x-id")::contains) &&
+            query.containsKey("ownershipControls") && query.get("ownershipControls").isEmpty()) {
+            access.requireOwner(principal);
+            if (method.equals("GET")) {
+                S3Request.requireEmptyBody(exchange, hash);
+                S3Xml.sendXml(exchange, 200, BucketSecurity.ownershipXml(store.bucket(bucketName).ownership()));
+            } else if (method.equals("PUT")) {
+                byte[] body = S3Request.signedBody(exchange, hash, 65536);
+                S3Request.verifyContentMd5(exchange.getRequestHeaders(), body);
+                store.setBucketOwnership(bucketName, BucketSecurity.parseOwnership(body));
+                exchange.sendResponseHeaders(200, -1);
+            } else if (method.equals("DELETE")) {
+                S3Request.requireEmptyBody(exchange, hash);
+                store.setBucketOwnership(bucketName, ObjectStorage.ObjectOwnership.OBJECT_WRITER);
+                exchange.sendResponseHeaders(204, -1);
+            } else S3Request.unsupported("Ownership controls operation");
+            return;
+        }
+        if (query.size() >= 1 && query.size() <= 2 &&
+            query.keySet().stream().allMatch(java.util.Set.of("publicAccessBlock", "x-id")::contains) &&
+            query.containsKey("publicAccessBlock") && query.get("publicAccessBlock").isEmpty()) {
+            access.requireOwner(principal);
+            if (method.equals("GET")) {
+                S3Request.requireEmptyBody(exchange, hash);
+                S3Xml.sendXml(exchange, 200, BucketSecurity.publicAccessXml(
+                    store.bucket(bucketName).publicAccessBlock()));
+            } else if (method.equals("PUT")) {
+                byte[] body = S3Request.signedBody(exchange, hash, 65536);
+                S3Request.verifyContentMd5(exchange.getRequestHeaders(), body);
+                store.setPublicAccessBlock(bucketName, BucketSecurity.parsePublicAccess(body));
+                exchange.sendResponseHeaders(200, -1);
+            } else if (method.equals("DELETE")) {
+                S3Request.requireEmptyBody(exchange, hash);
+                store.setPublicAccessBlock(bucketName, ObjectStorage.PublicAccessBlock.open());
+                exchange.sendResponseHeaders(204, -1);
+            } else S3Request.unsupported("Public access block operation");
+            return;
+        }
+        if (query.size() >= 1 && query.size() <= 2 &&
+            query.keySet().stream().allMatch(java.util.Set.of("policy", "x-id")::contains) &&
+            query.containsKey("policy") && query.get("policy").isEmpty()) {
+            access.requireOwner(principal);
+            var current = store.bucket(bucketName);
+            if (method.equals("GET")) {
+                S3Request.requireEmptyBody(exchange, hash);
+                if (current.policy() == null)
+                    throw new StoreException(404, "NoSuchBucketPolicy", "Bucket has no policy");
+                byte[] body = current.policy().getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+            } else if (method.equals("PUT")) {
+                byte[] body = S3Request.signedBody(exchange, hash, 20480);
+                S3Request.verifyContentMd5(exchange.getRequestHeaders(), body);
+                String policy = new String(body, StandardCharsets.UTF_8);
+                BucketPolicy parsed = BucketPolicy.parse(policy, bucketName);
+                if (current.publicAccessBlock().blockPublicPolicy() && parsed.publicAllow())
+                    throw new StoreException(403, "AccessDenied", "Public bucket policies are blocked");
+                store.setBucketPolicy(bucketName, policy);
+                exchange.sendResponseHeaders(204, -1);
+            } else if (method.equals("DELETE")) {
+                S3Request.requireEmptyBody(exchange, hash);
+                store.setBucketPolicy(bucketName, null);
+                exchange.sendResponseHeaders(204, -1);
+            } else S3Request.unsupported("Bucket policy operation");
+            return;
+        }
         if (query.containsKey("acl") && query.get("acl").isEmpty() &&
             query.keySet().stream().allMatch(java.util.Set.of("acl", "x-id")::contains) &&
             (!query.containsKey("x-id") ||
              query.get("x-id").equals(method.equals("GET") ? "GetBucketAcl" : "PutBucketAcl")) &&
             (method.equals("GET") || method.equals("PUT"))) {
             var current = store.bucket(bucketName);
-            Acl.require(current.acl(), principal, owner,
+            access.requireBucket(bucketName, principal,
                 method.equals("GET") ? Acl.READ_ACP : Acl.WRITE_ACP);
             if (method.equals("GET")) {
                 S3Request.requireEmptyBody(exchange, hash);
-                S3Xml.sendXml(exchange, 200, Acl.xml(current.acl(), owner));
+                S3Xml.sendXml(exchange, 200, Acl.xml(
+                    current.ownership() == ObjectStorage.ObjectOwnership.BUCKET_OWNER_ENFORCED
+                        ? Map.of() : current.acl(), owner));
             } else {
+                if (current.ownership() == ObjectStorage.ObjectOwnership.BUCKET_OWNER_ENFORCED)
+                    throw new StoreException(400, "AccessControlListNotSupported", "ACLs are disabled for this bucket");
                 if (exchange.getRequestHeaders().containsKey("x-amz-acl") ||
                     exchange.getRequestHeaders().keySet().stream().anyMatch(
                         name -> name.toLowerCase(Locale.ROOT).startsWith("x-amz-grant-"))) {
                     S3Request.requireEmptyBody(exchange, hash);
                     S3Request.verifyContentMd5(exchange.getRequestHeaders(), new byte[0]);
-                    store.setBucketAcl(bucketName, Acl.fromHeaders(exchange.getRequestHeaders(),
-                        authentication.identities()));
+                    Map<String, String> acl = Acl.fromHeaders(exchange.getRequestHeaders(),
+                        authentication.identities());
+                    BucketSecurity.checkAcl(current, exchange.getRequestHeaders(), acl, true);
+                    store.setBucketAcl(bucketName, acl);
                 } else {
                     byte[] body = S3Request.signedBody(exchange, hash, 65536);
                     S3Request.verifyContentMd5(exchange.getRequestHeaders(), body);
-                    store.setBucketAcl(bucketName, Acl.fromXml(body,
-                        owner, authentication.identities()));
+                    Map<String, String> acl = Acl.fromXml(body, owner, authentication.identities());
+                    BucketSecurity.checkAcl(current, exchange.getRequestHeaders(), acl, true);
+                    store.setBucketAcl(bucketName, acl);
                 }
                 exchange.sendResponseHeaders(200, -1);
             }
@@ -81,9 +156,20 @@ final class BucketHandler {
             switch (method) {
                 case "PUT" -> {
                     access.requireOwner(principal);
+                    String requestedOwnership = SigV4.single(exchange.getRequestHeaders(), "x-amz-object-ownership");
+                    ObjectStorage.ObjectOwnership ownership = requestedOwnership == null
+                        ? ObjectStorage.ObjectOwnership.BUCKET_OWNER_ENFORCED
+                        : BucketSecurity.ownership(requestedOwnership);
                     Map<String, String> acl = Acl.fromHeaders(exchange.getRequestHeaders(),
                         authentication.identities());
+                    BucketSecurity.checkAcl(new ObjectStorage.Bucket(bucketName, 0,
+                        ObjectStorage.VersioningState.NEVER, Map.of(), ownership,
+                        ObjectStorage.PublicAccessBlock.secure(), null),
+                        exchange.getRequestHeaders(), acl, false);
                     store.createBucket(bucketName);
+                    if (requestedOwnership != null &&
+                        ownership != ObjectStorage.ObjectOwnership.BUCKET_OWNER_ENFORCED)
+                        store.setBucketOwnership(bucketName, ownership);
                     if (!acl.isEmpty()) store.setBucketAcl(bucketName, acl);
                     exchange.getResponseHeaders().set("Location", "/" + bucketName);
                     exchange.sendResponseHeaders(200, -1);

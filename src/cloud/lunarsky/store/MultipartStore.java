@@ -155,16 +155,19 @@ final class MultipartStore implements MultipartStorage {
             total += length;
             if (total > store.maxObject()) throw new StoreException(413, "EntityTooLarge", "Object exceeds the configured size limit");
             MessageDigest md5 = digest("MD5");
+            java.util.zip.CRC32 crc32 = new java.util.zip.CRC32();
             try (var input = Files.newInputStream(file)) {
                 byte[] buffer = new byte[65536];
                 int n;
                 while ((n = input.read(buffer)) != -1) {
                     sha.update(buffer, 0, n);
                     md5.update(buffer, 0, n);
+                    crc32.update(buffer, 0, n);
                 }
             }
             if (!SigV4.hex(md5.digest()).equals(part.etag().replace("\"", "")))
                 throw new StoreException(400, "InvalidPart", "Part ETag mismatch");
+            part.verifyCrc32(crc32.getValue());
             paths.add(file);
         }
         ObjectStorage.Metadata result;

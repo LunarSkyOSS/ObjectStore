@@ -44,12 +44,17 @@ final class ObjectStoreServer {
             multipart = new MultipartStore(disk);
         } else throw new IllegalArgumentException("Invalid STORE_MODE");
         Map<String, String> identities = identities(env, access, secret);
-        var app = new Main(store, multipart, new SigV4(identities,
+        var sessions = SessionCredentials.fromEnvironment(env, identities.keySet());
+        var allIdentities = new java.util.HashSet<>(identities.keySet());
+        allIdentities.addAll(sessions.keySet());
+        var app = new Main(store, multipart, new SigV4(identities, sessions,
             access, region, Clock.systemUTC()), bucket, ClientLimits.fromEnvironment(env),
             positiveInt(env, "MAX_IN_FLIGHT_REQUESTS", 16, 1024),
             env.getOrDefault("S3_VIRTUAL_HOST_SUFFIX", ""), BrowserCors.fromEnvironment(env),
-            KeyScopes.fromEnvironment(env, access, identities.keySet()),
-            new RequestMetrics(env.get("METRICS_BEARER_TOKEN")));
+            KeyScopes.fromEnvironment(env, access, allIdentities),
+            new RequestMetrics(env.get("METRICS_BEARER_TOKEN")),
+            IdentityPolicies.fromEnvironment(env, access, allIdentities),
+            publicEndpoint(env));
         int port = Integer.parseInt(env.getOrDefault("PORT", "9000"));
         var server = HttpServer.create(mode.equals("cluster")
             ? new InetSocketAddress(env.getOrDefault("BIND_ADDRESS", "127.0.0.1"), port)
@@ -87,6 +92,22 @@ final class ObjectStoreServer {
                 throw new IllegalArgumentException("Invalid or duplicate additional credential");
         }
         return values;
+    }
+
+    static URI publicEndpoint(Map<String, String> env) {
+        String configured = env.get("S3_PUBLIC_ENDPOINT");
+        if (configured == null || configured.isBlank()) return null;
+        URI uri;
+        try { uri = URI.create(configured); }
+        catch (IllegalArgumentException error) {
+            throw new IllegalArgumentException("Invalid S3_PUBLIC_ENDPOINT", error);
+        }
+        if (!"http".equals(uri.getScheme()) && !"https".equals(uri.getScheme()) ||
+            uri.getHost() == null || uri.getUserInfo() != null || uri.getRawQuery() != null ||
+            uri.getRawFragment() != null ||
+            !(uri.getRawPath().isEmpty() || uri.getRawPath().equals("/")))
+            throw new IllegalArgumentException("S3_PUBLIC_ENDPOINT must be an HTTP(S) origin");
+        return URI.create(configured.endsWith("/") ? configured.substring(0, configured.length() - 1) : configured);
     }
     private static void printStartup(DiskStore store, MultipartStorage multipart,
                                      String bucket, String region, int port) {

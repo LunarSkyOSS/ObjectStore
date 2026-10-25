@@ -295,6 +295,40 @@ public final class StoreTest {
         }
     }
 
+    private static void testBucketAccessUpgrade(Path root) throws Exception {
+        Path data = Files.createDirectory(root.resolve("bucket-access-upgrade"));
+        try (var output = new DataOutputStream(Files.newOutputStream(data.resolve("buckets.bin")))) {
+            output.writeInt(0x4c534245);
+            output.writeInt(1);
+            output.writeUTF("legacy-bucket");
+            output.writeLong(System.currentTimeMillis());
+            output.writeByte(0);
+            output.writeShort(0);
+        }
+        try (var store = new DiskStore(data, 8, 16)) {
+            var legacy = store.bucket("legacy-bucket");
+            if (legacy.ownership() != ObjectStorage.ObjectOwnership.OBJECT_WRITER ||
+                legacy.publicAccessBlock().blockPublicAcls())
+                throw new AssertionError("Existing bucket access changed during upgrade");
+            store.createBucket("new-bucket");
+            if (store.bucket("new-bucket").ownership() !=
+                ObjectStorage.ObjectOwnership.BUCKET_OWNER_ENFORCED ||
+                !store.bucket("new-bucket").publicAccessBlock().blockPublicPolicy())
+                throw new AssertionError("New bucket did not use secure defaults");
+            store.setBucketPolicy("legacy-bucket", "{\"Version\":\"2012-10-17\"," +
+                "\"Statement\":{\"Effect\":\"Deny\",\"Principal\":\"*\"," +
+                "\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::legacy-bucket/*\"}}");
+        }
+        try (var store = new DiskStore(data, 8, 16)) {
+            if (store.bucket("legacy-bucket").ownership() !=
+                ObjectStorage.ObjectOwnership.OBJECT_WRITER ||
+                store.bucket("legacy-bucket").policy() == null ||
+                store.bucket("new-bucket").ownership() !=
+                ObjectStorage.ObjectOwnership.BUCKET_OWNER_ENFORCED)
+                throw new AssertionError("Bucket access settings were not durable");
+        }
+    }
+
     private static void testAclPersistence(Path root) throws Exception {
         Path data = root.resolve("acl");
         Map<String, String> grant = Map.of("SECONDARYKEY1234", Integer.toString(Acl.READ));
@@ -423,6 +457,7 @@ public final class StoreTest {
             testAttributesRestart(root);
             testV3Record(root);
             testBucketRestart(root);
+            testBucketAccessUpgrade(root);
             testAclPersistence(root);
             testAdditionalKeys(root);
             testVersioning(root);

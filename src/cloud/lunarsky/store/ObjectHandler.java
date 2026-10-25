@@ -42,15 +42,20 @@ final class ObjectHandler {
             try (var object = store.open(bucketName, key, versionId)) {
                 var metadata = object.metadata();
                 if (method.equals("GET")) {
-                    Acl.require(metadata.acl(), principal, owner, Acl.READ_ACP);
+                    access.requireObject(bucketName, key, metadata, principal, Acl.READ_ACP,
+                        versionId == null ? "s3:GetObjectAcl" : "s3:GetObjectVersionAcl");
                     S3Request.requireEmptyBody(exchange, hash);
-                    S3Xml.sendXml(exchange, 200, Acl.xml(metadata.acl(), owner));
+                    S3Xml.sendXml(exchange, 200, Acl.xml(
+                        store.bucket(bucketName).ownership() == ObjectStorage.ObjectOwnership.BUCKET_OWNER_ENFORCED
+                            ? Map.of() : metadata.acl(), owner));
                 } else {
-                    if (!owner.equals(principal)) {
-                        if (metadata.versionId() == null || metadata.versionId().equals("null"))
-                            throw new StoreException(403, "AccessDenied", "Access denied");
-                        Acl.require(metadata.acl(), principal, owner, Acl.WRITE_ACP);
-                    }
+                    if (store.bucket(bucketName).ownership() == ObjectStorage.ObjectOwnership.BUCKET_OWNER_ENFORCED)
+                        throw new StoreException(400, "AccessControlListNotSupported", "ACLs are disabled for this bucket");
+                    if (!owner.equals(principal) &&
+                        (metadata.versionId() == null || metadata.versionId().equals("null")))
+                        throw new StoreException(403, "AccessDenied", "Access denied");
+                    access.requireObject(bucketName, key, metadata, principal, Acl.WRITE_ACP,
+                        versionId == null ? "s3:PutObjectAcl" : "s3:PutObjectVersionAcl");
                     Map<String, String> acl;
                     if (exchange.getRequestHeaders().containsKey("x-amz-acl") ||
                         exchange.getRequestHeaders().keySet().stream().anyMatch(
@@ -63,6 +68,7 @@ final class ObjectHandler {
                         S3Request.verifyContentMd5(exchange.getRequestHeaders(), body);
                         acl = Acl.fromXml(body, owner, authentication.identities());
                     }
+                    BucketSecurity.checkAcl(store.bucket(bucketName), exchange.getRequestHeaders(), acl, true);
                     store.setObjectAcl(bucketName, key, metadata.versionId(), acl);
                     exchange.sendResponseHeaders(200, -1);
                 }
@@ -84,12 +90,18 @@ final class ObjectHandler {
             return;
         }
         boolean multipartRequest = S3Request.multipartRequest(method, query);
+        boolean copy = exchange.getRequestHeaders().containsKey("x-amz-copy-source");
         boolean versionRequest = (method.equals("GET") || method.equals("HEAD") || method.equals("DELETE")) &&
             query.containsKey("versionId") && (query.size() == 1 || query.size() == 2 && query.containsKey("x-id"));
         if (versionRequest && query.containsKey("x-id") &&
             !(method.equals("GET") ? "GetObject" : method.equals("HEAD") ? "HeadObject" : "DeleteObject")
                 .equals(query.get("x-id"))) S3Request.unsupported("Version query operation");
-        if (!multipartRequest && !versionRequest && !query.isEmpty() && !(query.size() == 1 &&
+        boolean directUploadQuery = method.equals("PUT") && !copy &&
+            (query.get("x-id") == null || query.get("x-id").equals("PutObject")) &&
+            query.keySet().stream().allMatch(name -> name.equals("x-id") ||
+                name.equals("x-amz-sdk-checksum-algorithm") ||
+                name.startsWith("x-amz-checksum-") && name.equals(name.toLowerCase(Locale.ROOT)));
+        if (!multipartRequest && !versionRequest && !query.isEmpty() && !directUploadQuery && !(query.size() == 1 &&
             ("PutObject".equals(query.get("x-id")) || "CopyObject".equals(query.get("x-id")) ||
              "GetObject".equals(query.get("x-id")) ||
              "HeadObject".equals(query.get("x-id")) || "DeleteObject".equals(query.get("x-id")))))
@@ -97,11 +109,11 @@ final class ObjectHandler {
         S3Request.validateObjectHeaders(exchange.getRequestHeaders());
         if (multipartRequest) {
             if (method.equals("GET")) access.requireOwner(principal);
-            else access.requireBucket(bucketName, principal, Acl.WRITE);
+            else access.requireWrite(bucketName, key, principal,
+                method.equals("DELETE") ? "s3:AbortMultipartUpload" : "s3:PutObject");
             multipartHandler.handleMultipart(exchange, method, query, key, verified, bucketName);
             return;
         }
-        boolean copy = exchange.getRequestHeaders().containsKey("x-amz-copy-source");
         if (!method.equals("PUT") && (copy || exchange.getRequestHeaders().containsKey("content-md5") ||
             exchange.getRequestHeaders().containsKey("x-amz-metadata-directive") ||
             exchange.getRequestHeaders().containsKey("x-amz-tagging") ||
@@ -114,13 +126,14 @@ final class ObjectHandler {
         if (!method.equals("PUT") || copy) S3Request.requireEmptyBody(exchange, hash);
         switch (method) {
             case "PUT" -> {
-                access.requireBucket(bucketName, principal, Acl.WRITE);
+                access.requireWrite(bucketName, key, principal, "s3:PutObject");
                 if (copy) copyObject(exchange, key, bucketName, principal);
-                else putObject(exchange, key, verified, bucketName);
+                else putObject(exchange, key, verified, bucketName, query);
             }
             case "GET", "HEAD" -> readObject(exchange, key, bucketName, query.get("versionId"), principal);
             case "DELETE" -> {
-                access.requireBucket(bucketName, principal, Acl.WRITE);
+                access.requireWrite(bucketName, key, principal,
+                    query.get("versionId") == null ? "s3:DeleteObject" : "s3:DeleteObjectVersion");
                 deleteObject(exchange, key, bucketName, query.get("versionId"));
             }
             default -> S3Request.unsupported("HTTP method");
@@ -128,7 +141,7 @@ final class ObjectHandler {
     }
 
     private void putObject(HttpExchange exchange, String key, SigV4.Verified verified,
-                           String bucketName) throws IOException {
+                           String bucketName, Map<String, String> query) throws IOException {
         var headers = exchange.getRequestHeaders();
         String length = SigV4.single(headers, "content-length"), condition = SigV4.single(headers, "if-none-match");
         if (condition != null && !condition.equals("*")) S3Request.unsupported("Write condition");
@@ -138,7 +151,7 @@ final class ObjectHandler {
         if (!verified.streaming() && headers.containsKey("content-encoding")) S3Request.unsupported("Encoded payload");
         if (headers.containsKey("x-amz-metadata-directive")) S3Request.unsupported("Copy metadata directive");
         if (headers.containsKey("x-amz-tagging-directive")) S3Request.unsupported("Copy tagging directive");
-        UploadChecksums checksums = UploadChecksums.from(headers);
+        UploadChecksums checksums = S3Request.uploadChecksums(headers, query);
         AwsChunkedInputStream chunked = verified.streaming() ? S3Request.chunkedBody(exchange, verified) : null;
         if (chunked != null) bytes = S3Request.decodedLength(headers);
         else if (headers.containsKey("x-amz-decoded-content-length") || headers.containsKey("x-amz-trailer"))
@@ -147,6 +160,7 @@ final class ObjectHandler {
         Map<String, String> metadata = ObjectAttributes.userMetadata(headers);
         Map<String, String> tags = ObjectAttributes.tagsHeader(SigV4.single(headers, "x-amz-tagging"));
         Map<String, String> acl = Acl.fromHeaders(headers, authentication.identities());
+        BucketSecurity.checkAcl(store.bucket(bucketName), headers, acl, false);
         if (!acl.isEmpty() && !owner.equals(verified.principal()))
             access.requireBucket(bucketName, verified.principal(), Acl.WRITE_ACP);
         ObjectStorage.Metadata data = store.put(bucketName, key,
@@ -197,8 +211,6 @@ final class ObjectHandler {
         String directive = SigV4.single(headers, "x-amz-metadata-directive");
         if (directive != null && !directive.equals("COPY") && !directive.equals("REPLACE"))
             throw new StoreException(400, "InvalidArgument", "Invalid metadata directive");
-        if (!"REPLACE".equals(directive) && headers.containsKey("content-type"))
-            S3Request.unsupported("Content-Type requires REPLACE metadata directive");
         String tagDirective = SigV4.single(headers, "x-amz-tagging-directive");
         if (tagDirective != null && !tagDirective.equals("COPY") && !tagDirective.equals("REPLACE"))
             throw new StoreException(400, "InvalidArgument", "Invalid tagging directive");
@@ -208,7 +220,8 @@ final class ObjectHandler {
             S3Request.unsupported("User metadata requires REPLACE metadata directive");
         try (var object = store.open(sourceBucket, sourceKey, sourceVersion)) {
             var sourceMetadata = object.metadata();
-            Acl.require(sourceMetadata.acl(), principal, owner, Acl.READ);
+            access.requireObject(sourceBucket, sourceKey, sourceMetadata, principal, Acl.READ,
+                sourceVersion == null ? "s3:GetObject" : "s3:GetObjectVersion");
             if (sourceMetadata.versionId() != null)
                 exchange.getResponseHeaders().set("x-amz-copy-source-version-id", sourceMetadata.versionId());
             String type = "REPLACE".equals(directive) ? S3Request.contentType(headers) : sourceMetadata.contentType();
@@ -217,6 +230,7 @@ final class ObjectHandler {
             Map<String, String> tags = "REPLACE".equals(tagDirective)
                 ? ObjectAttributes.tagsHeader(SigV4.single(headers, "x-amz-tagging")) : sourceMetadata.tags();
             Map<String, String> acl = Acl.fromHeaders(headers, authentication.identities());
+            BucketSecurity.checkAcl(store.bucket(bucketName), headers, acl, false);
             if (!acl.isEmpty() && !owner.equals(principal))
                 access.requireBucket(bucketName, principal, Acl.WRITE_ACP);
             var copied = store.put(bucketName, key, object.stream(), sourceMetadata.length(),
@@ -283,7 +297,8 @@ final class ObjectHandler {
             headers.containsKey("if-unmodified-since")) S3Request.unsupported("Conditional read");
         try (var object = store.open(bucketName, key, versionId)) {
             var meta = object.metadata();
-            Acl.require(meta.acl(), principal, owner, Acl.READ);
+            access.requireObject(bucketName, key, meta, principal, Acl.READ,
+                versionId == null ? "s3:GetObject" : "s3:GetObjectVersion");
             String etag = "\"" + meta.etag() + "\"";
             String noneMatch = SigV4.single(headers, "if-none-match");
             if (noneMatch != null && (noneMatch.equals("*") ||
