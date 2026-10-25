@@ -25,6 +25,8 @@ This does not cover Docker logs, swap, other temporary files, external backups, 
 
 The owner can set `x-amz-acl: public-read` or signed `x-amz-grant-*` headers on bucket creation, uploads, copies, and multipart initiation. Use `GET ?acl` to read bucket or object grants; `PUT ?acl` accepts signed grant headers or an XML `AccessControlPolicy`. A grantee ID is its access key. Permissions are `READ`, `WRITE`, `READ_ACP`, `WRITE_ACP`, and `FULL_CONTROL`; `AllUsers` can only read, and `AuthenticatedUsers` is recognized. Anonymous reads require an `AllUsers` grant. Overwriting an object resets its ACL to private unless new grants are supplied; retained versions keep their ACLs.
 
+For a narrower additional key, mount a second private file and set `S3_KEY_SCOPES_FILE` to its container path. Each non-comment line has four **tab-separated** fields: access key, bucket, key prefix, and comma-separated actions (`read`, `write`, `list`). For example, `UPLOADKEY12345678<TAB>media<TAB>users/42/<TAB>read,write,list`. The file must name an identity in `S3_CREDENTIALS_FILE`; the owner key is always unrestricted. Once the scope file is enabled, an additional key with no scope is denied. A list request must include a prefix inside the granted prefix. Copy requires read permission on the source and write permission on the destination. Restricted keys cannot change ACLs or manage buckets. Existing S3 ACL checks still apply, so the bucket must also grant the key the corresponding permissions. Restart the service after editing either file.
+
 The configured owner owns every bucket and object. A `WRITE_ACP` grantee can change an ACL only on a retained, non-null version; current unversioned and null versions require the owner key. Version lists, multipart inspection, tags, versioning controls, bucket creation/deletion, and capabilities remain owner-only. IAM policies, email grantees, Object Ownership, Block Public Access, and temporary credentials are unsupported. Public bucket `READ` exposes names; public object `READ` exposes bytes. Review grants before exposing a gateway.
 
 ## CLI and tests
@@ -46,6 +48,30 @@ Signed `GET /_objectstore/capabilities` returns schema version 1, software versi
 `operations` does not imply every AWS option or permission for the caller. `maxObjectBytes` limits completed objects and individual parts; `maxTotalBytes` is logical capacity; `maxParts` is 10,000. Clients should ignore new fields and unknown operations. This endpoint is an ObjectStore extension, so its absence elsewhere does not imply missing S3 features.
 
 Run `sh scripts/test.sh` with JDK 21 to test from source. See [TESTS.md](TESTS.md) for coverage, the disposable Docker cluster suite, and the limits of those tests.
+
+## Browser access, transfer limits, and metrics
+
+`CORS_ALLOWED_ORIGINS` is disabled by default. Set a comma-separated list of exact `http://` or `https://` origins to permit browser preflight for GET, HEAD, PUT, POST, and DELETE. Browsers still need a signed request or presigned URL; CORS does not grant access. Do not put secret access keys in browser code. For direct browser uploads, issue short-lived presigned URLs from a trusted server and allow that site's origin. Browser preflight requests count against the same admission limits as other requests.
+
+The Docker image no longer has a fixed 30-second request or 60-second response deadline. `OBJECTSTORE_REQUEST_TIMEOUT_SECONDS` and `OBJECTSTORE_RESPONSE_TIMEOUT_SECONDS` default to `0` (no total transfer deadline); positive values are capped at one day. A reverse proxy may have its own upload size, buffering, idle timeout, and response timeout. Configure those for expected video sizes and slow clients. `MAX_OBJECT_BYTES` defaults to 128 MiB and can be raised up to 1 GiB; `MAX_TOTAL_BYTES` defaults to 2 GiB. For a 250 MB video workload, a starting configuration is `MAX_OBJECT_BYTES=536870912` (512 MiB) and a `MAX_TOTAL_BYTES` based on the actual free disk and retention plan. The in-flight cap remains 16 by default. Measure the target machine before raising it; 256 concurrent uploads can exhaust memory or disk bandwidth.
+
+Set `METRICS_BEARER_TOKEN` to a random value of at least 32 characters to enable `GET /metrics` in Prometheus text format. Scrape with `Authorization: Bearer <token>` over a private network or HTTPS. The endpoint reports counts by response class, total request time, and in-flight requests without bucket or user labels. Keep the token private. Metrics are disabled when the variable is empty.
+
+For a bounded local write baseline, run `python3 scripts/benchmark-writes.py --requests 100 --concurrency 8 --size 4096` with `S3_ACCESS_KEY` and `S3_SECRET_KEY` in the environment. It writes under a unique `benchmark/` prefix and deletes successful objects afterward. Results depend on CPU, disks, network, connection reuse, and durability settings; a laptop number does not predict another server. Run a mixed upload/download workload before changing concurrency or public limits.
+
+## Cold snapshots
+
+The local Compose stacks support a cold snapshot of **all** their named data volumes. Stop the stack first, then run one of the following with absolute paths:
+
+```sh
+docker compose --env-file /path/to/objectstore.env -f compose.yaml stop
+sh scripts/snapshot-local.sh single backup /path/to/objectstore.env /path/to/objectstore-snapshot.tar
+
+docker compose --env-file /path/to/cluster.env -f compose.cluster.yaml stop
+sh scripts/snapshot-local.sh cluster backup /path/to/cluster.env /path/to/cluster-snapshot.tar
+```
+
+The script refuses to run while any service in that Compose project is running. It includes PostgreSQL and node volumes for the local cluster, checks each component archive, and writes a checksum manifest. Store the snapshot and a separate copy of the private environment, key-scope, credential, and encryption recovery material off the machine. To restore, build or pull the images, then use the same command with `restore` instead of `backup` on a **fresh empty** set of stopped volumes; the script refuses to overwrite nonempty volumes. Start the stack and run `objectstore verify` or the cluster repair check, then read test objects. The script refuses encrypted bind-mount overlays, which need a separate host-filesystem snapshot. A snapshot is not a substitute for an off-site restore drill. The local Compose cluster is still one physical-host prototype; this script is not a coordinated backup of a deployed multi-host cluster.
 
 The server includes [hash4j](https://github.com/dynatrace-oss/hash4j) for streaming XXHash checksums. Its Apache-2.0 license is included at [lib/LICENSE.hash4j](lib/LICENSE.hash4j).
 
@@ -80,7 +106,7 @@ CLUSTER_TLS_DIR=/private/objectstore-certs docker compose --env-file /path/to/cl
 
 The files must be readable by container UID 10001 without making private keys or passwords world-readable. Add HTTPS URLs for additional nodes when expanding the cluster.
 
-This secures node traffic only. The local cluster still lacks automatic PostgreSQL failover, database TLS configuration, encryption at rest, and production multi-server validation. Its HTTP S3 gateway remains bound to localhost; use a separate trusted proxy for external TLS. Do not treat the TLS overlay as a production deployment.
+This secures node traffic only. The local cluster still lacks automatic PostgreSQL failover and production multi-server validation. PostgreSQL TLS must be configured separately, and at-rest encryption uses the host overlay described above. Its HTTP S3 gateway remains bound to localhost; use a separate trusted proxy for external TLS. Do not treat the TLS overlay as a production deployment.
 
 ## Metadata primary routing
 
@@ -134,6 +160,6 @@ ObjectStore uses the socket peer as the client IP and ignores forwarded-IP heade
 
 Enable these limits only on a deliberately public endpoint. They also apply to direct localhost storage calls to that same endpoint; leave them disabled for the local-only setup or run a separate local-only instance if local storage calls must be exempt. A direct loopback `/health` probe without a forwarded-IP header remains exempt. The byte limit is aggregate ingress plus egress for each IP, and several users behind one NAT share it. If a proxy buffers complete uploads before forwarding them, the upload byte limit controls proxy-to-ObjectStore traffic, not the client's initial upload speed; disable request buffering when end-to-end upload pacing is required. It is a fairness control, not a defense against connection floods before the Java handler runs. Put an internet-facing proxy or firewall in front of the gateway for TLS, connection limits, request timeouts, and buffering controls. Do not expose storage nodes or PostgreSQL publicly.
 
-The default local cluster still uses plaintext node and PostgreSQL connections. The optional TLS overlay secures node traffic, but PostgreSQL TLS, automatic metadata failover, scoped credentials, and physical host verification remain absent. Garbage collection can remove data required by an older metadata backup, so its retention guard is essential. Host UUIDs are operator labels, not proof that machines have separate power, disks, or network paths. Keep `CLUSTER_LOCAL_DEV=true` limited to local tests.
+The default local cluster still uses plaintext node and PostgreSQL connections. The optional TLS overlay secures node traffic, but PostgreSQL TLS, automatic metadata failover, IAM policies, and physical host verification remain absent. The key-scope file limits additional signed identities; it is not an IAM replacement. Garbage collection can remove data required by an older metadata backup, so its retention guard is essential. Host UUIDs are operator labels, not proof that machines have separate power, disks, or network paths. Keep `CLUSTER_LOCAL_DEV=true` limited to local tests.
 
 The standalone cluster node binds to localhost by default. Set `NODE_BIND` only for a private test network; the Compose file binds inside its private Docker network. PostgreSQL JDBC 42.7.14 is bundled in the image with its license inside the JAR.

@@ -39,7 +39,7 @@ public final class HttpTest {
         return signedUriAs(uri, method, body, extra, ACCESS, SECRET);
     }
 
-    private static HttpRequest signedUriAs(URI uri, String method, byte[] body, Map<String, String> extra,
+    static HttpRequest signedUriAs(URI uri, String method, byte[] body, Map<String, String> extra,
                                            String access, String secret) {
         String host = uri.getAuthority();
         String date = DATE.format(Instant.now());
@@ -274,7 +274,7 @@ public final class HttpTest {
         String trailerToSign = "AWS4-HMAC-SHA256-TRAILER\n" + date + "\n" + scope + "\n" +
             previous + "\n" + SigV4.hex(SigV4.hash((trailerName + ":" + checksum + "\n")
                 .getBytes(StandardCharsets.UTF_8)));
-        encoded.write(("x-amz-trailer-signature=" + SigV4.hex(SigV4.hmac(key, trailerToSign)) +
+        encoded.write(("x-amz-trailer-signature:" + SigV4.hex(SigV4.hmac(key, trailerToSign)) +
             "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
         byte[] upload = encoded.toByteArray();
         HttpRequest.Builder request = HttpRequest.newBuilder(object)

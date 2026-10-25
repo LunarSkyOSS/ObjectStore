@@ -127,7 +127,7 @@ final class AwsChunkedInputStream extends FilterInputStream {
         if (!Base64.getEncoder().encodeToString(trailerChecksum()).equals(trailerValue))
             throw new StoreException(400, "BadDigest", "Checksum trailer mismatch");
         String signature = line();
-        if (!signature.matches("x-amz-trailer-signature=[0-9a-f]{64}"))
+        if (!signature.matches("x-amz-trailer-signature:[0-9a-f]{64}"))
             throw invalid("Missing trailer signature");
         String toSign = "AWS4-HMAC-SHA256-TRAILER\n" + authorization.date() + "\n" +
             authorization.scope() + "\n" + previousSignature + "\n" +

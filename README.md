@@ -21,6 +21,7 @@ ObjectStore creates the default bucket at startup. All buckets share one capacit
 - ✅ Configurable size limits and CLI verification
 - ✅ Local cluster prototype with host-aware placement and optional node TLS
 - ✅ Opt-in repair, rebalance, guarded garbage collection, and metadata backup
+- ✅ Cold snapshot and restore tooling for the local Compose stacks
 - ✅ Manual [two-machine durability and restore drill](tests/two-host/README.md)
 - ⬜ Production multi-server deployment and metadata failover
 
@@ -102,6 +103,10 @@ Maven (`pom.xml`):
 ```
 
 See [client installation and examples](https://docs.lunarsky.cloud/objectstore/v0.0.8/client/install). The [AWT image manager](client/examples/README.md) is a small desktop example.
+
+## Rust client
+
+The [Rust adapter](rust-client/README.md) configures the official AWS SDK for path-style ObjectStore endpoints and streams file transfers. It is local source code, not a published crate.
 
 ## Disclaimer
 

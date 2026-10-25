@@ -41,7 +41,9 @@ final class DiskStore implements ObjectStorage {
     private final NavigableMap<String, Metadata> index = new TreeMap<>();
     private final NavigableMap<String, Bucket> buckets = new TreeMap<>();
     private final NavigableMap<String, List<VersionRecord>> histories = new TreeMap<>();
+    private final Map<String, Integer> publishingByBucket = new HashMap<>();
     private long used;
+    private long reservedBytes;
     private long objectCount, legacyCount;
 
     record Record(Metadata metadata, int headerLength) {}
@@ -174,6 +176,7 @@ final class DiskStore implements ObjectStorage {
 
     @Override public synchronized void deleteBucket(String name) throws IOException {
         bucket(name);
+        awaitPublications(name);
         if (index.values().stream().anyMatch(meta -> name.equals(meta.bucket())))
             throw new StoreException(409, "BucketNotEmpty", "Bucket contains objects");
         if (histories.entrySet().stream().anyMatch(entry -> entry.getKey().startsWith(name + "\0") &&
@@ -227,6 +230,7 @@ final class DiskStore implements ObjectStorage {
     }
 
     @Override public synchronized void setVersioning(String name, VersioningState state) throws IOException {
+        awaitPublications(name);
         if (state == VersioningState.NEVER)
             throw new StoreException(400, "InvalidArgument", "Versioning cannot be disabled after it is enabled");
         Bucket old = bucket(name);
@@ -249,6 +253,15 @@ final class DiskStore implements ObjectStorage {
     }
 
     private static String indexKey(String bucket, String key) { return bucket + "\0" + key; }
+    private void awaitPublications(String bucket) throws IOException {
+        while (publishingByBucket.containsKey(bucket)) {
+            try { wait(); }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for object writes", e);
+            }
+        }
+    }
     private Path historyDirectory(String bucket, String key) {
         String id = SigV4.hex(SigV4.hash((bucket + "/" + key).getBytes(StandardCharsets.UTF_8)));
         return versions.resolve(id.substring(0, 2)).resolve(id);
@@ -505,17 +518,36 @@ final class DiskStore implements ObjectStorage {
                     legacy = old.key() == null;
                 }
             }
+            long additional = Math.max(0, metadata.length() - previous);
             synchronized (this) {
-                if (Files.exists(catalog) && !buckets.containsKey(metadata.bucket()))
+                Bucket configured = buckets.get(metadata.bucket());
+                if (configured != null && configured.versioning() != VersioningState.NEVER)
+                    return installVersionedPending(destination, pending, metadata, createOnly,
+                        configured.versioning());
+                if (Files.exists(catalog) && configured == null)
                     throw new StoreException(404, "NoSuchBucket", "Bucket not found");
-                if (used - previous + metadata.length() > maxTotal)
+                if (maxTotal - used - reservedBytes < additional)
                     throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
+                reservedBytes += additional;
+                publishingByBucket.merge(metadata.bucket(), 1, Integer::sum);
+            }
+            boolean moved = false;
+            try {
                 Files.move(pending, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                used = used - previous + metadata.length();
-                if (!existed) objectCount++;
-                if (legacy) legacyCount--;
-                index.put(indexKey(metadata.bucket(), metadata.key()), metadata);
+                moved = true;
                 syncDirectory(destination.getParent());
+            } finally {
+                synchronized (this) {
+                    if (moved) {
+                        used = used - previous + metadata.length();
+                        if (!existed) objectCount++;
+                        if (legacy) legacyCount--;
+                        index.put(indexKey(metadata.bucket(), metadata.key()), metadata);
+                    }
+                    reservedBytes -= additional;
+                    publishingByBucket.compute(metadata.bucket(), (bucket, count) -> count == 1 ? null : count - 1);
+                    notifyAll();
+                }
             }
             return metadata;
         }
@@ -542,7 +574,7 @@ final class DiskStore implements ObjectStorage {
                 }
             }
         }
-        if (maxTotal - (used - replaced) < metadata.length())
+        if (maxTotal - (used - replaced) - reservedBytes < metadata.length())
             throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
         Path target = versionPath(bucket, key, storageId);
         Files.createDirectories(target.getParent());

@@ -4,7 +4,11 @@ A small, synchronous S3-compatible client built with the JDK alone. It uses path
 
 ## Build and test
 
-Requires JDK 21 or newer. No Maven, Gradle, or third-party Java libraries are needed.
+Requires JDK 21 or newer. Building from source needs no Maven or Gradle, and the client has no third-party runtime dependencies.
+
+For Maven or Gradle consumers, release 0.0.8 is published as
+`cloud.lunarsky:objectstore-client:0.0.8` at
+`https://repo.lunarsky.cloud/`. See the [installation examples](https://docs.lunarsky.cloud/objectstore/v0.0.8/client/install).
 
 ```sh
 bash client/scripts/test.sh
@@ -12,6 +16,10 @@ bash client/scripts/build.sh
 ```
 
 Run these commands from the ObjectStore repository root. The second command writes `client/dist/objectstore-client.jar` and `client/dist/javadoc/`.
+
+To assemble a versioned Maven directory from a matching source tag, run
+`bash client/scripts/build-maven-repo.sh VERSION`. It writes the JAR, POM,
+sources, Javadocs, metadata, and checksums under `client/dist/maven-repo/`.
 
 The [AWT image manager](examples/README.md) is a small drag-and-drop app for trying uploads, listing, previews, downloads, and deletes against an existing bucket.
 

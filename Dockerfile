@@ -11,6 +11,7 @@ RUN java --add-modules jdk.httpserver -cp /out:/tmp/hash4j.jar cloud.lunarsky.st
 RUN java --add-modules jdk.httpserver -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.ConcurrencyTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.HttpTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.ClientLimitsTest
+RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.FeatureTest
 RUN java -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.EncryptedVolumeTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.ClusterNodeTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.ClusterTlsTest
@@ -23,7 +24,8 @@ COPY --from=build /tmp/postgresql.jar /app/postgresql.jar
 COPY --from=build /tmp/hash4j.jar /app/hash4j.jar
 COPY lib/LICENSE.hash4j /app/LICENSE.hash4j
 COPY scripts/objectstore /usr/local/bin/objectstore
-RUN chmod 755 /usr/local/bin/objectstore
+COPY scripts/start-server.sh /usr/local/bin/objectstore-server
+RUN chmod 755 /usr/local/bin/objectstore /usr/local/bin/objectstore-server
 USER store
 EXPOSE 9000
-ENTRYPOINT ["java", "-XX:MaxRAMPercentage=70", "-Dsun.net.httpserver.maxReqTime=30", "-Dsun.net.httpserver.maxRspTime=60", "-Dsun.net.httpserver.maxReqHeaders=64", "--add-modules", "jdk.httpserver,java.net.http", "-cp", "/app:/app/postgresql.jar:/app/hash4j.jar", "cloud.lunarsky.store.Main"]
+ENTRYPOINT ["/usr/local/bin/objectstore-server"]

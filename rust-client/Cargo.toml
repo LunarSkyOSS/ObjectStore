@@ -1,0 +1,17 @@
+[package]
+name = "lunarsky-objectstore-client"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Small Rust integration layer for LunarSky ObjectStore"
+
+[dependencies]
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-credential-types = "1"
+aws-sdk-s3 = "1"
+aws-types = "1"
+tokio = { version = "1", features = ["fs", "io-util"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util"] }

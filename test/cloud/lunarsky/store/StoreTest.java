@@ -85,7 +85,7 @@ public final class StoreTest {
         withTrailer.write(body, 65536, 1024);
         withTrailer.write("\r\n0;chunk-signature=2ca2aba2005185cf7159c6277faf83795951dd77a3a99e6e65d5c9f85863f992\r\n".getBytes());
         withTrailer.write("x-amz-checksum-crc32c:sOO8/Q==\r\n".getBytes());
-        withTrailer.write("x-amz-trailer-signature=d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435\r\n\r\n".getBytes());
+        withTrailer.write("x-amz-trailer-signature:d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435\r\n\r\n".getBytes());
         var trailerAuthorization = new SigV4.Verified("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
             "", key, date, scope, "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e");
         try (var stream = new AwsChunkedInputStream(new ByteArrayInputStream(withTrailer.toByteArray()),
@@ -328,14 +328,14 @@ public final class StoreTest {
     private static void testAdditionalKeys(Path root) throws Exception {
         Path file = root.resolve("access-keys");
         Files.writeString(file, "SECONDARYKEY1234:secondary-secret-key-that-is-at-least-32-characters\n");
-        Map<String, String> keys = Main.identities(
+        Map<String, String> keys = ObjectStoreServer.identities(
             Map.of("S3_CREDENTIALS_FILE", file.toString()),
             "TESTACCESSKEY123", "test-secret-key-that-is-at-least-32-characters");
         if (keys.size() != 2 || !keys.containsKey("SECONDARYKEY1234"))
             throw new AssertionError("Additional access key was not loaded");
         Files.writeString(file, "TESTACCESSKEY123:duplicate-root-secret-that-is-at-least-32-characters\n");
         try {
-            Main.identities(Map.of("S3_CREDENTIALS_FILE", file.toString()),
+            ObjectStoreServer.identities(Map.of("S3_CREDENTIALS_FILE", file.toString()),
                 "TESTACCESSKEY123", "test-secret-key-that-is-at-least-32-characters");
             throw new AssertionError("Duplicate root key was accepted");
         } catch (IllegalArgumentException expected) { }

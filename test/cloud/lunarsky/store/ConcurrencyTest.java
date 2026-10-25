@@ -3,14 +3,68 @@ package cloud.lunarsky.store;
 import java.io.ByteArrayInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class ConcurrencyTest {
+    private static void parallelCapacity() throws Exception {
+        Path root = Files.createTempDirectory("store-parallel-capacity-");
+        byte[] body = new byte[4096];
+        Set<String> saved = new HashSet<>();
+        try {
+            try (var store = new DiskStore(root, body.length, 8L * body.length);
+                 var workers = Executors.newFixedThreadPool(16)) {
+                CountDownLatch start = new CountDownLatch(1);
+                List<Future<String>> writes = new ArrayList<>();
+                for (int i = 0; i < 16; i++) {
+                    String key = "parallel-" + i;
+                    writes.add(workers.submit(() -> {
+                        start.await();
+                        try {
+                            store.put("test", key, new ByteArrayInputStream(body), body.length,
+                                SigV4.hex(SigV4.hash(body)), null, true, "application/octet-stream");
+                            return key;
+                        } catch (StoreException error) {
+                            if (error.status != 507) throw error;
+                            return null;
+                        }
+                    }));
+                }
+                start.countDown();
+                for (Future<String> write : writes) {
+                    String key = write.get();
+                    if (key != null) saved.add(key);
+                }
+                if (saved.size() != 8 || store.usedBytes() != 8L * body.length ||
+                    store.list("test", "", "", 100, null).objects().size() != 8)
+                    throw new AssertionError("Concurrent writes exceeded capacity or lost an acknowledgement");
+            }
+            try (var restarted = new DiskStore(root, body.length, 8L * body.length)) {
+                if (restarted.usedBytes() != 8L * body.length ||
+                    restarted.list("test", "", "", 100, null).objects().size() != 8)
+                    throw new AssertionError("Concurrent writes were not recovered after restart");
+                for (String key : saved) {
+                    try (var object = restarted.open("test", key)) {
+                        if (!Arrays.equals(object.stream().readAllBytes(), body))
+                            throw new AssertionError("Recovered object differs from acknowledged write");
+                    }
+                }
+            }
+        } finally {
+            try (var paths = Files.walk(root)) {
+                for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.delete(path);
+            }
+        }
+    }
+
     private static ObjectStorage.Metadata put(DiskStore store, byte[] body) throws Exception {
         return store.put("test", "shared", new ByteArrayInputStream(body), body.length,
             SigV4.hex(SigV4.hash(body)), null, false, "application/octet-stream");
@@ -78,11 +132,12 @@ public final class ConcurrencyTest {
             } catch (StoreException expected) {
                 if (expected.status != 404) throw expected;
             }
-            System.out.println("Concurrent storage tests passed: atomic overwrite, read and listing after acknowledgement, delete");
         } finally {
             try (var paths = Files.walk(root)) {
                 for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.delete(path);
             }
         }
+        parallelCapacity();
+        System.out.println("Concurrent storage tests passed: atomic overwrite, read and listing after acknowledgement, delete, parallel quota and restart");
     }
 }

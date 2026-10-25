@@ -17,7 +17,7 @@ The script compiles the source and test programs into `out/classes`, then runs:
 | Test | Checks |
 | --- | --- |
 | `StoreTest` | Signature V4 and signed-stream vectors, CRC64NVME and XXHash reference vectors, local writes and reads, quotas, restart persistence for objects, checksums, ACLs, attributes, buckets, and versions, multipart recovery, legacy reads, locking, and corruption rejection. |
-| `ConcurrencyTest` | Atomic local overwrites and consistent reads, listings, and deletes during concurrent access. |
+| `ConcurrencyTest` | Atomic local overwrites, consistent reads, listings and deletes, plus concurrent quota enforcement and restart recovery. |
 | `HttpTest` | Signed capability discovery, presigned URLs, streaming uploads and trailers, object and bucket operations, ACL grants with a second access key and public reads, copies, checksum persistence and rejection, ranges, listing, metadata, tags, multipart uploads, versioning, and signed virtual-hosted requests in single-node mode. |
 | `ClientLimitsTest` | Disabled defaults, trusted-proxy address validation, ignored untrusted headers, per-IP request refusal, and paced response bytes. |
 | `EncryptedVolumeTest` | Marker acceptance and refusal when the configured encrypted directory is missing, mismatched, or a symlink. |
@@ -69,6 +69,6 @@ The [manual two-machine drill](tests/two-host/README.md) uses machine A and mach
 
 - Container stops are not physical power cuts or disk failures. The automated suite does not reboot a host or test every possible crash point.
 - The Compose nodes share one machine. Passing the local-only quorum override does not demonstrate durability across independent hosts, racks, or sites.
-- The suite does not test automatic metadata failover, an off-site backup restore, prolonged load, or full AWS S3 compatibility.
+- The suite does not test automatic metadata failover, an off-site backup restore, prolonged load, or full AWS S3 compatibility. `scripts/test.sh` checks scoped keys, CORS, and metrics. A separate local cold-snapshot drill restored one object into fresh single-node and cluster Compose projects and confirmed its bytes; the single-node restore also refused a nonempty destination. This does not test a multi-host restore. The Rust client passed live local upload/download and presigned GET/PUT smoke tests, but is not covered by the Java test script.
 
 See [Limits and safety](README.md#limits-and-safety) before evaluating any multi-server deployment.
