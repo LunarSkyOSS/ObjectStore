@@ -26,6 +26,7 @@ public final class Main {
     private final KeyScopes keyScopes;
     private final RequestMetrics metrics;
     private final int maxInFlight;
+    private volatile AdminConsole adminConsole;
 
     Main(DiskStore store, SigV4 authentication, String bucket) throws IOException {
         this(store, new MultipartStore(store), authentication, bucket);
@@ -99,15 +100,39 @@ public final class Main {
         store.ensureBucket(bucket);
     }
 
+    void setAdminConsole(AdminConsole adminConsole) {
+        this.adminConsole = adminConsole;
+        if (adminConsole != null) adminConsole.setMetrics(metrics);
+    }
+
     void handle(HttpExchange exchange) throws IOException {
         long started = System.nanoTime();
         boolean admitted = false;
+        boolean dataStarted = false;
+        TrafficMeter traffic = null;
         ClientLimits.Client client = null;
         String requestId = UUID.randomUUID().toString();
         exchange.getResponseHeaders().set("x-amz-request-id", requestId);
         exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
-        cors.decorate(exchange);
         try {
+            String path = exchange.getRequestURI().getRawPath();
+            if (!(path.equals(AdminConsole.PATH) || path.startsWith(AdminConsole.PATH + "/") ||
+                path.equals("/health") || path.equals("/ready") || path.equals("/metrics"))) {
+                traffic = TrafficMeter.attach(exchange);
+                metrics.dataStarted();
+                dataStarted = true;
+            }
+            if (path.equals(AdminConsole.PATH) || path.startsWith(AdminConsole.PATH + "/")) {
+                admitted = slots.tryAcquire();
+                if (!admitted) throw new StoreException(503, "SlowDown", "Too many concurrent requests");
+                if (adminConsole == null) {
+                    exchange.sendResponseHeaders(404, -1);
+                } else {
+                    adminConsole.handle(exchange);
+                }
+                return;
+            }
+            cors.decorate(exchange);
             client = clientLimits.enter(exchange);
             admitted = slots.tryAcquire();
             if (!admitted) throw new StoreException(503, "SlowDown", "Too many concurrent requests");
@@ -124,7 +149,11 @@ public final class Main {
             finally {
                 if (admitted) slots.release();
                 clientLimits.leave(client);
-                metrics.record(exchange.getResponseCode(), System.nanoTime() - started);
+                long elapsed = System.nanoTime() - started;
+                metrics.record(exchange.getResponseCode(), elapsed);
+                if (dataStarted)
+                    metrics.dataFinished(exchange.getResponseCode(), elapsed,
+                        traffic.inbound(), traffic.outbound());
             }
         }
     }

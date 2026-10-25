@@ -64,6 +64,8 @@ curl http://127.0.0.1:9000/health
 
 Port 9000 binds to localhost. Data stays in the `object-data` Docker volume. `docker compose down -v` deletes that volume.
 
+The optional [local admin console](OPERATIONS.md#local-admin-console) has bucket and live performance views, its own password, and is disabled by default.
+
 The standalone defaults are 128 MiB per object and 2 GiB total. Set `MAX_OBJECT_BYTES` and `MAX_TOTAL_BYTES` in `.env` to change them. Incomplete multipart uploads consume space until aborted.
 
 ## Operations

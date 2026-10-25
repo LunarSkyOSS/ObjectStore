@@ -1,0 +1,8 @@
+services:
+  objectstore:
+    environment:
+      ADMIN_UI_ENABLED: "true"
+      ADMIN_UI_PASSWORD_FILE: /run/secrets/objectstore_admin
+      ADMIN_UI_ORIGIN: ${ADMIN_UI_ORIGIN:-}
+    volumes:
+      - ./secrets/admin-password:/run/secrets/objectstore_admin:ro

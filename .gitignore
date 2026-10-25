@@ -4,6 +4,7 @@ rust-client/target/
 .env.cluster
 *.local.env
 data/
+secrets/
 *.log
 __pycache__/
 *.pyc

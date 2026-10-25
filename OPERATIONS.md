@@ -63,7 +63,24 @@ Run `sh scripts/test.sh` with JDK 21 to test from source. See [TESTS.md](TESTS.m
 
 The Docker image no longer has a fixed 30-second request or 60-second response deadline. `OBJECTSTORE_REQUEST_TIMEOUT_SECONDS` and `OBJECTSTORE_RESPONSE_TIMEOUT_SECONDS` default to `0` (no total transfer deadline); positive values are capped at one day. A reverse proxy may have its own upload size, buffering, idle timeout, and response timeout. Configure those for expected video sizes and slow clients. `MAX_OBJECT_BYTES` defaults to 128 MiB and can be raised up to 1 GiB; `MAX_TOTAL_BYTES` defaults to 2 GiB. For a 250 MB video workload, a starting configuration is `MAX_OBJECT_BYTES=536870912` (512 MiB) and a `MAX_TOTAL_BYTES` based on the actual free disk and retention plan. The in-flight cap remains 16 by default. Measure the target machine before raising it; 256 concurrent uploads can exhaust memory or disk bandwidth.
 
-Set `METRICS_BEARER_TOKEN` to a random value of at least 32 characters to enable `GET /metrics` in Prometheus text format. Scrape with `Authorization: Bearer <token>` over a private network or HTTPS. The endpoint reports counts by response class, total request time, and in-flight requests without bucket or user labels. Keep the token private. Metrics are disabled when the variable is empty.
+Set `METRICS_BEARER_TOKEN` to a random value of at least 32 characters to enable `GET /metrics` in Prometheus text format. Scrape with `Authorization: Bearer <token>` over a private network or HTTPS. The endpoint reports counts by response class, total request time, in-flight requests, and S3 request and body-byte totals without bucket or user labels. Keep the token private. The Prometheus endpoint is disabled when the variable is empty.
+
+### Local admin console
+
+The admin console is a read-only status, bucket, and performance view at `http://127.0.0.1:9000/_objectstore/admin/`. It lists buckets, navigates object prefixes, and shows object metadata and bucket access settings. The object-size chart and counts cover only the current page of a listing. The performance view samples every three seconds while visible and graphs S3 request rate, inbound and outbound body bytes, process CPU, and memory. It also shows GC collections. Admin requests and health checks are excluded from those S3 rates, and chart history lives only in the browser tab. RSS is read from Linux when available; otherwise the memory card shows JVM heap plus non-heap usage. This view does not require the separate Prometheus token. It is disabled by default and uses a separate password, not an S3 access key. Its Biscuit widgets are bundled with the image under the MIT license in `admin-ui/LICENSE.Biscuit`. To enable it for the local Compose stack:
+
+```sh
+mkdir -p secrets
+chmod 700 secrets
+umask 077
+openssl rand -base64 32 > secrets/admin-password
+chmod 644 secrets/admin-password
+docker compose -f compose.yaml -f compose.admin.yaml up -d --build
+```
+
+Read the generated password from `secrets/admin-password` on the host to sign in. The directory is private to your host account, while the file is readable by the container's unprivileged user through a read-only mount. The file is ignored by Git. The password must be at least 16 bytes. Sessions expire after 30 minutes, and five failed logins from one peer pause further attempts for five minutes. A restart clears all sessions. Do not reuse the S3 secret.
+
+The console accepts only loopback Host values by default, including if the S3 port is accidentally published on a wider interface. For access through a reverse proxy, set `ADMIN_UI_ORIGIN` to the exact external HTTPS origin, preserve its Host header, and terminate TLS at the proxy. HTTP access through a remote origin is not supported. The password is still required behind the loopback binding or proxy; neither is an authentication mechanism. The console does not grant access to S3 operations.
 
 For a bounded local write baseline, run `python3 scripts/benchmark-writes.py --requests 100 --concurrency 8 --size 4096` with `S3_ACCESS_KEY` and `S3_SECRET_KEY` in the environment. It writes under a unique `benchmark/` prefix and deletes successful objects afterward. Results depend on CPU, disks, network, connection reuse, and durability settings; a laptop number does not predict another server. Run a mixed upload/download workload before changing concurrency or public limits.
 

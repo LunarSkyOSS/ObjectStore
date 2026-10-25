@@ -55,6 +55,7 @@ final class ObjectStoreServer {
             new RequestMetrics(env.get("METRICS_BEARER_TOKEN")),
             IdentityPolicies.fromEnvironment(env, access, allIdentities),
             publicEndpoint(env));
+        app.setAdminConsole(AdminConsole.fromEnvironment(env, store));
         int port = Integer.parseInt(env.getOrDefault("PORT", "9000"));
         var server = HttpServer.create(mode.equals("cluster")
             ? new InetSocketAddress(env.getOrDefault("BIND_ADDRESS", "127.0.0.1"), port)

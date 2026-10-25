@@ -115,10 +115,17 @@ public final class FeatureTest {
             status(200, client.send(HttpTest.signedUriAs(URI.create(base + "/photos/users/one/allowed"),
                 "PUT", content, Map.of(), LIMITED, LIMITED_SECRET), HttpResponse.BodyHandlers.ofString()));
             URI ownReadable = URI.create(base + "/photos/users/one/self_readable");
+            var trafficBefore = metrics.dataSnapshot();
             status(200, client.send(HttpTest.signedUriAs(ownReadable,
                 "PUT", content, Map.of(), LIMITED, LIMITED_SECRET), HttpResponse.BodyHandlers.ofString()));
             status(200, client.send(HttpTest.signedUriAs(ownReadable,
                 "GET", new byte[0], Map.of(), LIMITED, LIMITED_SECRET), HttpResponse.BodyHandlers.ofString()));
+            var trafficAfter = metrics.dataSnapshot();
+            if (trafficAfter.requests() - trafficBefore.requests() != 2 ||
+                trafficAfter.inboundBytes() - trafficBefore.inboundBytes() < content.length ||
+                trafficAfter.outboundBytes() - trafficBefore.outboundBytes() < content.length ||
+                trafficAfter.inFlight() != 0)
+                throw new AssertionError("S3 traffic meter missed upload or download body bytes");
             status(403, client.send(HttpTest.signedUriAs(URI.create(base + "/photos/users/one/allowed"),
                 "GET", new byte[0], Map.of(), LIMITED, LIMITED_SECRET), HttpResponse.BodyHandlers.ofString()));
             status(403, client.send(HttpTest.signedUriAs(URI.create(base + "/photos/users/one/blocked"),
