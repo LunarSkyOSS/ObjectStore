@@ -91,6 +91,12 @@ final class ObjectHandler {
         }
         boolean multipartRequest = S3Request.multipartRequest(method, query);
         boolean copy = exchange.getRequestHeaders().containsKey("x-amz-copy-source");
+        if (query.containsKey("x-amz-acl")) {
+            if (!method.equals("PUT") || copy || !"private".equals(query.get("x-amz-acl")))
+                throw new StoreException(400, "InvalidArgument", "Unsupported ACL query value");
+            if (exchange.getRequestHeaders().containsKey("x-amz-acl"))
+                throw new StoreException(400, "InvalidRequest", "Supply ACL once");
+        }
         boolean versionRequest = (method.equals("GET") || method.equals("HEAD") || method.equals("DELETE")) &&
             query.containsKey("versionId") && (query.size() == 1 || query.size() == 2 && query.containsKey("x-id"));
         if (versionRequest && query.containsKey("x-id") &&
@@ -99,6 +105,7 @@ final class ObjectHandler {
         boolean directUploadQuery = method.equals("PUT") && !copy &&
             (query.get("x-id") == null || query.get("x-id").equals("PutObject")) &&
             query.keySet().stream().allMatch(name -> name.equals("x-id") ||
+                name.equals("x-amz-acl") ||
                 name.equals("x-amz-sdk-checksum-algorithm") ||
                 name.startsWith("x-amz-checksum-") && name.equals(name.toLowerCase(Locale.ROOT)));
         if (!multipartRequest && !versionRequest && !query.isEmpty() && !directUploadQuery && !(query.size() == 1 &&

@@ -121,6 +121,32 @@ public final class HttpTest {
         URI sdkGet = presignedUriAs(sdkObject, "GET", 60, ACCESS, SECRET, null, true);
         status(200, client.send(HttpRequest.newBuilder(sdkGet).GET().build(),
             HttpResponse.BodyHandlers.ofByteArray()));
+        URI privateObject = URI.create(base + "/objects/sdk-v3-private-acl");
+        URI privatePut = presignedUriAs(privateObject, "PUT", 60, ACCESS, SECRET, null,
+            true, "x-amz-acl=private&x-id=PutObject");
+        status(200, client.send(HttpRequest.newBuilder(privatePut)
+            .PUT(HttpRequest.BodyPublishers.ofByteArray(body)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        var privateRead = client.send(HttpRequest.newBuilder(presignedUri(privateObject, "GET", 60))
+            .GET().build(), HttpResponse.BodyHandlers.ofByteArray());
+        status(200, privateRead);
+        if (!java.util.Arrays.equals(body, privateRead.body()))
+            throw new AssertionError("Private ACL query upload mismatch");
+        status(403, client.send(HttpRequest.newBuilder(privateObject).GET().build(),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(403, client.send(HttpRequest.newBuilder(URI.create(privatePut.toString().replace(
+            "x-amz-acl=private", "x-amz-acl=public-read")))
+            .PUT(HttpRequest.BodyPublishers.ofByteArray(body)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(400, client.send(HttpRequest.newBuilder(presignedUriAs(privateObject, "PUT", 60,
+            ACCESS, SECRET, null, true, "x-amz-acl=public-read&x-id=PutObject"))
+            .PUT(HttpRequest.BodyPublishers.ofByteArray(body)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(403, client.send(HttpRequest.newBuilder(privatePut).header("x-amz-acl", "private")
+            .PUT(HttpRequest.BodyPublishers.ofByteArray(body)).build(),
+            HttpResponse.BodyHandlers.ofByteArray()));
+        status(204, client.send(HttpRequest.newBuilder(presignedUri(privateObject, "DELETE", 60))
+            .DELETE().build(), HttpResponse.BodyHandlers.ofByteArray()));
         status(403, client.send(HttpRequest.newBuilder(URI.create(sdkGet.toString().replace(
             "X-Amz-Content-Sha256=UNSIGNED-PAYLOAD", "X-Amz-Content-Sha256=changed")))
             .GET().build(), HttpResponse.BodyHandlers.ofByteArray()));
