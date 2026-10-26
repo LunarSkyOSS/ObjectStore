@@ -31,5 +31,5 @@ COPY scripts/objectstore /usr/local/bin/objectstore
 COPY scripts/start-server.sh /usr/local/bin/objectstore-server
 RUN chmod 755 /usr/local/bin/objectstore /usr/local/bin/objectstore-server
 USER store
-EXPOSE 9000
+EXPOSE 9000 9001
 ENTRYPOINT ["/usr/local/bin/objectstore-server"]

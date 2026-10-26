@@ -4,5 +4,9 @@ services:
       ADMIN_UI_ENABLED: "true"
       ADMIN_UI_PASSWORD_FILE: /run/secrets/objectstore_admin
       ADMIN_UI_ORIGIN: ${ADMIN_UI_ORIGIN:-}
+      ADMIN_UI_PRIVATE_ORIGIN: ${ADMIN_UI_PRIVATE_ORIGIN:-}
+      ADMIN_UI_BIND_ADDRESS: 0.0.0.0
+    ports:
+      - "${ADMIN_UI_BIND_IP:-127.0.0.1}:${ADMIN_UI_HOST_PORT:-9001}:9001"
     volumes:
       - ./secrets/admin-password:/run/secrets/objectstore_admin:ro

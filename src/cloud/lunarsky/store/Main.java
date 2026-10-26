@@ -21,6 +21,7 @@ public final class Main {
     private final ObjectHandler objectHandler;
     private final ClientLimits clientLimits;
     private final Semaphore slots;
+    private final Semaphore adminSlots = new Semaphore(8);
     private final String virtualHostSuffix;
     private final BrowserCors cors;
     private final KeyScopes keyScopes;
@@ -123,13 +124,7 @@ public final class Main {
                 dataStarted = true;
             }
             if (path.equals(AdminConsole.PATH) || path.startsWith(AdminConsole.PATH + "/")) {
-                admitted = slots.tryAcquire();
-                if (!admitted) throw new StoreException(503, "SlowDown", "Too many concurrent requests");
-                if (adminConsole == null) {
-                    exchange.sendResponseHeaders(404, -1);
-                } else {
-                    adminConsole.handle(exchange);
-                }
+                exchange.sendResponseHeaders(404, -1);
                 return;
             }
             cors.decorate(exchange);
@@ -155,6 +150,32 @@ public final class Main {
                     metrics.dataFinished(exchange.getResponseCode(), elapsed,
                         traffic.inbound(), traffic.outbound());
             }
+        }
+    }
+
+    void handleAdmin(HttpExchange exchange) throws IOException {
+        boolean admitted = false;
+        try {
+            String path = exchange.getRequestURI().getRawPath();
+            if (adminConsole == null ||
+                !(path.equals(AdminConsole.PATH) || path.startsWith(AdminConsole.PATH + "/"))) {
+                exchange.sendResponseHeaders(404, -1);
+                return;
+            }
+            admitted = adminSlots.tryAcquire();
+            if (!admitted) {
+                exchange.sendResponseHeaders(503, -1);
+                return;
+            }
+            adminConsole.handle(exchange);
+        } catch (StoreException error) {
+            exchange.sendResponseHeaders(error.status, -1);
+        } catch (Exception error) {
+            System.err.println("ObjectStore admin request failed: " + error.getClass().getSimpleName());
+            exchange.sendResponseHeaders(500, -1);
+        } finally {
+            exchange.close();
+            if (admitted) adminSlots.release();
         }
     }
 

@@ -193,17 +193,27 @@ final class AdminConsole {
         byte[] hash = SigV4.hash(trimmed);
         java.util.Arrays.fill(trimmed, (byte) 0);
         java.util.Arrays.fill(password, (byte) 0);
-        String configured = env.get("ADMIN_UI_ORIGIN");
+        String privateOrigin = env.get("ADMIN_UI_PRIVATE_ORIGIN");
+        String publicOrigin = env.get("ADMIN_UI_ORIGIN");
+        if (privateOrigin != null && !privateOrigin.isBlank() &&
+            publicOrigin != null && !publicOrigin.isBlank())
+            throw new IllegalArgumentException("Configure only one admin UI origin");
+        String configured = privateOrigin != null && !privateOrigin.isBlank() ? privateOrigin : publicOrigin;
         URI origin = null;
         if (configured != null && !configured.isBlank()) {
             try { origin = URI.create(configured); }
             catch (IllegalArgumentException error) {
                 throw new IllegalArgumentException("Invalid ADMIN_UI_ORIGIN", error);
             }
-            if (!"https".equals(origin.getScheme()) || origin.getHost() == null ||
+            boolean privateHttp = privateOrigin != null && !privateOrigin.isBlank();
+            if (!(privateHttp ? "http".equals(origin.getScheme()) &&
+                    privateIpv4(origin.getHost()) && origin.getPort() > 0 && origin.getPort() <= 65535 :
+                    "https".equals(origin.getScheme()) && origin.getHost() != null) ||
                 origin.getUserInfo() != null || origin.getRawQuery() != null || origin.getRawFragment() != null ||
                 !(origin.getRawPath().isEmpty() || origin.getRawPath().equals("/")))
-                throw new IllegalArgumentException("ADMIN_UI_ORIGIN must be an HTTPS origin");
+                throw new IllegalArgumentException(privateHttp ?
+                    "ADMIN_UI_PRIVATE_ORIGIN must be an HTTP origin with a private IPv4 address and port" :
+                    "ADMIN_UI_ORIGIN must be an HTTPS origin");
             origin = URI.create(origin.toString().replaceFirst("/$", ""));
         }
         return new AdminConsole(store, hash, origin,
@@ -218,7 +228,7 @@ final class AdminConsole {
         if (origin == null) {
             send(exchange, 403, page("<h1>Admin console unavailable</h1>" +
                 "<p>Open the local console at <code>http://127.0.0.1:&lt;port&gt;" + PATH +
-                "/login</code>, or use the configured HTTPS origin.</p>"), "text/html; charset=utf-8");
+                "/login</code>, or use the configured origin.</p>"), "text/html; charset=utf-8");
             return;
         }
         String path = exchange.getRequestURI().getRawPath();
@@ -506,7 +516,7 @@ final class AdminConsole {
     private String sessionCookie(HttpExchange exchange) {
         String header = exchange.getRequestHeaders().getFirst("Cookie");
         if (header == null || header.length() > 8192) return "";
-        String name = publicOrigin == null ? "objectstore_admin=" : "__Host-objectstore_admin=";
+        String name = secureOrigin() ? "__Host-objectstore_admin=" : "objectstore_admin=";
         for (String field : header.split(";")) {
             String value = field.trim();
             if (value.startsWith(name) && value.substring(name.length()).matches("[A-Za-z0-9_-]{43}"))
@@ -516,10 +526,28 @@ final class AdminConsole {
     }
 
     private String cookie(String token, int seconds) {
-        String name = publicOrigin == null ? "objectstore_admin" : "__Host-objectstore_admin";
-        String path = publicOrigin == null ? PATH : "/";
+        String name = secureOrigin() ? "__Host-objectstore_admin" : "objectstore_admin";
+        String path = secureOrigin() ? "/" : PATH;
         return name + "=" + token + "; Path=" + path + "; HttpOnly; SameSite=Strict; Max-Age=" + seconds +
-            (publicOrigin == null ? "" : "; Secure");
+            (secureOrigin() ? "; Secure" : "");
+    }
+
+    private boolean secureOrigin() {
+        return publicOrigin != null && "https".equals(publicOrigin.getScheme());
+    }
+
+    private static boolean privateIpv4(String host) {
+        if (host == null || !host.matches("[0-9]+(?:\\.[0-9]+){3}")) return false;
+        String[] fields = host.split("\\.");
+        int[] octets = new int[4];
+        for (int i = 0; i < octets.length; i++) {
+            if (fields[i].length() > 3 || (fields[i].length() > 1 && fields[i].startsWith("0"))) return false;
+            octets[i] = Integer.parseInt(fields[i]);
+            if (octets[i] > 255) return false;
+        }
+        return octets[0] == 10 ||
+            (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) ||
+            (octets[0] == 192 && octets[1] == 168);
     }
 
     private String requestOrigin(HttpExchange exchange) {

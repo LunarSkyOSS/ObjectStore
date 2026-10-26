@@ -55,23 +55,36 @@ final class ObjectStoreServer {
             new RequestMetrics(env.get("METRICS_BEARER_TOKEN")),
             IdentityPolicies.fromEnvironment(env, access, allIdentities),
             publicEndpoint(env));
-        app.setAdminConsole(AdminConsole.fromEnvironment(env, store));
+        AdminConsole adminConsole = AdminConsole.fromEnvironment(env, store);
+        app.setAdminConsole(adminConsole);
         int port = Integer.parseInt(env.getOrDefault("PORT", "9000"));
+        int adminPort = adminConsole == null ? 0 : positiveInt(env, "ADMIN_UI_PORT", 9001, 65535);
+        if (adminConsole != null && port == adminPort)
+            throw new IllegalArgumentException("ADMIN_UI_PORT must differ from PORT");
         var server = HttpServer.create(mode.equals("cluster")
             ? new InetSocketAddress(env.getOrDefault("BIND_ADDRESS", "127.0.0.1"), port)
             : new InetSocketAddress(port), positiveInt(env, "HTTP_BACKLOG", 64, 4096));
+        HttpServer adminServer = adminConsole == null ? null : HttpServer.create(
+            new InetSocketAddress(env.getOrDefault("ADMIN_UI_BIND_ADDRESS", "127.0.0.1"), adminPort), 16);
         var executor = Executors.newVirtualThreadPerTaskExecutor();
         server.setExecutor(executor);
         server.createContext("/", app::handle);
+        if (adminServer != null) {
+            adminServer.setExecutor(executor);
+            adminServer.createContext("/", app::handleAdmin);
+        }
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             server.stop(5);
+            if (adminServer != null) adminServer.stop(5);
             executor.close();
             try { store.close(); }
             catch (IOException error) { System.err.println("Could not release ObjectStore data lock: " + error.getMessage()); }
         }));
         server.start();
+        if (adminServer != null) adminServer.start();
         if (store instanceof DiskStore disk) printStartup(disk, multipart, bucket, region, port);
         else System.out.println("ObjectStore local cluster prototype v" + Version.VALUE + " listening on :" + port);
+        if (adminServer != null) System.out.println("ObjectStore admin listening on :" + adminPort);
     }
 
     static Map<String, String> identities(Map<String, String> env, String access, String secret)

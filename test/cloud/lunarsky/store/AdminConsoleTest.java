@@ -50,6 +50,19 @@ public final class AdminConsoleTest {
             HttpResponse.BodyHandlers.ofString()).body());
     }
 
+    private static String rawRequest(int port, String host, String method, String path, String body) throws Exception {
+        byte[] content = body.getBytes(StandardCharsets.UTF_8);
+        try (Socket socket = new Socket("127.0.0.1", port)) {
+            socket.getOutputStream().write((method + " " + AdminConsole.PATH + path + " HTTP/1.1\r\n" +
+                "Host: " + host + "\r\nConnection: close\r\n" +
+                (method.equals("POST") ? "Content-Type: application/x-www-form-urlencoded\r\n" +
+                    "Content-Length: " + content.length + "\r\n" : "") +
+                "\r\n").getBytes(StandardCharsets.US_ASCII));
+            if (content.length > 0) socket.getOutputStream().write(content);
+            return new String(socket.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         Path root = Files.createTempDirectory("admin-console-test-");
         Path passwordFile = root.resolve("password");
@@ -61,6 +74,7 @@ public final class AdminConsoleTest {
             SigV4.hex(SigV4.hash(image)), null, true, "text/plain");
         var executor = Executors.newVirtualThreadPerTaskExecutor();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 16);
+        HttpServer s3Server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 16);
         try {
             if (AdminConsole.fromEnvironment(Map.of(), store) != null)
                 throw new AssertionError("Admin console enabled without configuration");
@@ -74,6 +88,15 @@ public final class AdminConsoleTest {
                     "ADMIN_UI_ORIGIN", "http://public.example"), store);
                 throw new AssertionError("Admin console accepted a remote HTTP origin");
             } catch (IllegalArgumentException expected) { }
+            for (String invalid : new String[] { "http://public.example:9001", "http://8.8.8.8:9001",
+                "http://10.30.0.120", "https://10.30.0.120:9001" }) {
+                try {
+                    AdminConsole.fromEnvironment(Map.of("ADMIN_UI_ENABLED", "true",
+                        "ADMIN_UI_PASSWORD_FILE", passwordFile.toString(),
+                        "ADMIN_UI_PRIVATE_ORIGIN", invalid), store);
+                    throw new AssertionError("Admin console accepted invalid private origin: " + invalid);
+                } catch (IllegalArgumentException expected) { }
+            }
             AdminConsole console = AdminConsole.fromEnvironment(Map.of(
                 "ADMIN_UI_ENABLED", "true", "ADMIN_UI_PASSWORD_FILE", passwordFile.toString()), store);
             var app = new Main(store, new MultipartStore(store),
@@ -81,10 +104,18 @@ public final class AdminConsoleTest {
                     "us-east-1", Clock.systemUTC()), "objects");
             app.setAdminConsole(console);
             server.setExecutor(executor);
-            server.createContext("/", app::handle);
+            server.createContext("/", app::handleAdmin);
             server.start();
+            s3Server.setExecutor(executor);
+            s3Server.createContext("/", app::handle);
+            s3Server.start();
             String base = "http://127.0.0.1:" + server.getAddress().getPort();
+            String s3Base = "http://127.0.0.1:" + s3Server.getAddress().getPort();
             HttpClient client = HttpClient.newHttpClient();
+            status(404, client.send(request(s3Base, "/login").GET().build(),
+                HttpResponse.BodyHandlers.discarding()));
+            status(404, client.send(HttpRequest.newBuilder(URI.create(base + "/health")).GET().build(),
+                HttpResponse.BodyHandlers.discarding()));
             try (Socket socket = new Socket("127.0.0.1", server.getAddress().getPort())) {
                 socket.getOutputStream().write(("GET " + AdminConsole.PATH + "/login HTTP/1.1\r\n" +
                     "Host: public.example\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
@@ -206,9 +237,26 @@ public final class AdminConsoleTest {
                 status(401, post(client, base, "/login", "incorrect", loginToken(client, base), null, null));
             }
             status(429, post(client, base, "/login", PASSWORD, loginToken(client, base), null, null));
+            app.setAdminConsole(AdminConsole.fromEnvironment(Map.of(
+                "ADMIN_UI_ENABLED", "true", "ADMIN_UI_PASSWORD_FILE", passwordFile.toString(),
+                "ADMIN_UI_PRIVATE_ORIGIN", "http://10.30.0.120:9001"), store));
+            int port = server.getAddress().getPort();
+            String privatePage = rawRequest(port, "10.30.0.120:9001", "GET", "/login", "");
+            if (!privatePage.startsWith("HTTP/1.1 200") || !privatePage.contains("Admin password"))
+                throw new AssertionError("Configured private VPN origin did not open the admin console");
+            if (!rawRequest(port, "public.example", "GET", "/login", "").startsWith("HTTP/1.1 403"))
+                throw new AssertionError("Unconfigured Host reached the private admin console");
+            String form = "password=" + java.net.URLEncoder.encode(PASSWORD, StandardCharsets.UTF_8) +
+                "&csrf=" + csrf(privatePage);
+            String privateLogin = rawRequest(port, "10.30.0.120:9001", "POST", "/login", form);
+            if (!privateLogin.startsWith("HTTP/1.1 303") ||
+                !privateLogin.contains("Set-cookie: objectstore_admin=") ||
+                privateLogin.contains("; Secure"))
+                throw new AssertionError("Private VPN login or cookie is invalid");
             System.out.println("Admin console tests passed");
         } finally {
             server.stop(0);
+            s3Server.stop(0);
             executor.close();
             store.close();
             try (var paths = Files.walk(root)) {
