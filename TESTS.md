@@ -17,18 +17,31 @@ The script compiles the source and test programs into `out/classes`, then runs:
 | Test | Checks |
 | --- | --- |
 | `StoreTest` | Signature V4 and signed-stream vectors, CRC64NVME and XXHash reference vectors, local writes and reads, quotas, restart persistence for objects, checksums, ACLs, attributes, buckets, and versions, multipart recovery, legacy reads, locking, and corruption rejection. |
+| `DiskBucketNamesTest` | Renaming a populated bucket while retaining versions, policies, and multipart uploads across restarts; default-bucket startup, deletion recovery, and old-name rejection. |
+| `ConditionalEditTest` | Atomic editor saves, concurrent uploads, changed ACLs/tags, versioning changes, and renamed buckets. |
+| `ClusterRepairCliTest` | Repair CLI entrypoint and argument validation. |
+| `RequestCoordinationTest` | Authentication before rename locking, bounded rename waits, isolated request diagnostics, and key revocation during a request. |
 | `ConcurrencyTest` | Atomic local overwrites, consistent reads, listings and deletes, plus concurrent quota enforcement and restart recovery. |
 | `HttpTest` | Signed capability discovery, presigned URLs, streaming uploads and trailers, object and bucket operations, ACL grants with a second access key and public reads, copies, checksum persistence and rejection, ranges, listing, metadata, tags, multipart uploads, versioning, and signed virtual-hosted requests in single-node mode. |
 | `ClientLimitsTest` | Disabled defaults, trusted-proxy address validation, ignored untrusted headers, per-IP request refusal, and paced response bytes. |
+| `AdminConsoleTest` | Admin sign-in, CSRF and origin checks, bucket and object changes, public-access confirmations, live metrics, encrypted managed-key persistence, scoped reads and listings, and key revocation. |
+| `AdminOperationsTest` | Persisted admin events, effective access checks, stale editor conflicts, and paged copy, tag, inventory, and delete jobs; private copy ACLs, checksum verification, and tag validation. |
 | `EncryptedVolumeTest` | Marker acceptance and refusal when the configured encrypted directory is missing, mismatched, or a symlink. |
+| `NodeHttpTest` | Total node response deadlines, stalled-body cancellation, response-size limits, and interruption. |
 | `ClusterNodeTest` | Node identity and locking, authenticated segment transfers, checksum rejection, repair authorization, inventory and guarded deletion, and restart cleanup. |
 | `ClusterTlsTest` | HTTPS node identity and segment roundtrip with a trusted certificate, plus rejection of untrusted and wrong-host certificates. |
 | `CliTest` | Version, status, verification, and a nonzero result for corrupt data. |
 | `ClientTest` and `MultipartClientTest` | Java client request signing, capability discovery, error handling, and multipart operations. |
 
+The script also checks installer safety with a fake Docker command: unsupported storage setups must be refused before changing credentials or containers.
+
 The script exits nonzero on failure. The test programs use temporary local directories and loopback HTTP or HTTPS ports; they do not use an existing ObjectStore volume. `ClusterTlsTest` uses the JDK's `keytool` to create disposable test certificates.
 
+The local installer was also checked with a disposable Compose project and separate ports: it generated credentials, started a healthy container, served the S3 health and admin login endpoints, and reran without replacing the data volume. That smoke test does not exercise a remote VPN or production reverse proxy.
+
 The encrypted Compose overlays can be checked with `docker compose config` without starting the stack. This verifies their bind mounts and startup settings, not that a host filesystem is actually encrypted. `scripts/prepare-encrypted-storage.sh` must also verify an active dm-crypt-backed mount. A complete deployment drill must unlock it, prepare directories, start with the overlay, write data, restart, restore from backup, and confirm that the stack refuses to start while the mount is unavailable. Do not point that drill at existing data.
+
+Run `node test/admin-workspace.test.cjs` with Node.js to check that a late access-check response cannot replace a newer page after navigation. This test uses a small DOM harness and does not require a browser.
 
 ## Disposable metadata routing test
 
@@ -60,6 +73,10 @@ If port 9001 is occupied, set `CLUSTER_HOST_PORT` to the same free port in both 
 The Docker suite checks signed capability discovery and S3 operations, bucket creation and deletion, metadata and tags, public-read ACLs and anonymous access, copies, upload checksums, multi-segment objects, concurrent overwrites, multipart staging and listings, versioned reads and delete markers, versioned multipart completion, completion after a gateway restart and node loss, reads and writes with a node stopped, refusal to write without a storage quorum, restart recovery, corrupt-replica repair including staged parts, metadata unavailability, read-only metadata readiness rejection, and placement on a newly joined node. It then checks rebalance to the fourth node, automatic repair, garbage collection dry run and delayed deletion, and a metadata backup restored to a separate PostgreSQL instance while the original database is stopped. A two-host JDBC URL selects that restored writable database. Historical regular and multipart versions are checked after repair and cleanup. It also checks that containers labeled as one physical host cannot satisfy the normal host quorum. Its local-only override permits the remaining phases to use containers as separate test domains.
 
 `ClusterMigrationTest` is a separate legacy-format fixture and is **not** run by either test script. Do not run its `create` phase against a populated metadata database. The migration procedure is in the [README](README.md#migrating-a-local-cluster).
+
+`ClusterBucketRenameTest` is another standalone test for a fresh, disposable PostgreSQL database. It checks the transaction, metadata tables, duplicate-name rollback, restart, and refusal to recreate a renamed default bucket. Never point it at an existing metadata database.
+
+`ClusterMaintenanceTest` also requires a fresh, disposable PostgreSQL database and the PostgreSQL JDBC driver. It creates three temporary local storage nodes and checks rename contention, multipart totals across buckets, replica repair and reporting, and conflicting edits through two independent gateways.
 
 ## Two-machine durability drill
 

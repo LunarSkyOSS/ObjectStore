@@ -1,347 +1,321 @@
 package cloud.lunarsky.store;
 
 import com.sun.net.httpserver.HttpExchange;
+import cloud.lunarsky.store.AdminAuthentication.Session;
+import static cloud.lunarsky.store.AdminHttp.*;
 import java.io.IOException;
-import java.net.URI;
-import java.net.URLDecoder;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
-import java.security.SecureRandom;
-import java.time.Duration;
-import java.util.Base64;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.List;
+import java.util.Set;
 
 final class AdminConsole {
     static final String PATH = "/_objectstore/admin";
-    private static final String STYLE = """
-        :root { color-scheme: dark; }
-        body { background: #14121d; color: #f4f0fa; font: 16px system-ui; margin: 0;
-               padding: clamp(20px, 4vw, 48px); }
-        main { max-width: 1080px; margin: 0 auto; }
-        .login { min-height: calc(100dvh - 2 * clamp(20px, 4vw, 48px));
-                 display: grid; place-items: center; }
-        .login-card { width: min(100%, 400px); box-sizing: border-box; padding: 34px;
-                      border: 1px solid #514663; border-radius: 18px; background: #211c2b;
-                      box-shadow: 0 24px 80px #08060d88; }
-        .mark { display: grid; place-items: center; width: 48px; height: 48px; flex: none; }
-        .mark img { width: 56px; height: 56px; max-width: none; }
-        .login-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-        .login-brand strong { font-size: 1.1rem; }
-        .login-card h1 { font-size: 1.75rem; }
-        .login-card .muted { margin-bottom: 28px; line-height: 1.5; }
-        h1 { margin: 0; font-size: 2rem; }
-        header { display: flex; justify-content: space-between; align-items: center; gap: 16px;
-                 border-bottom: 1px solid #3e344e; padding-bottom: 22px; }
-        .header-title { display: flex; align-items: center; gap: 14px; }
-        .header-title h1 { font-size: 1.35rem; }
-        .header-title small { margin-top: 3px; }
-        .intro { display: flex; align-items: center; justify-content: space-between;
-                 gap: 16px; margin: 34px 0 18px; }
-        .intro h2, .buckets h2 { margin: 0 0 6px; font-size: 1.3rem; }
-        .intro p, .buckets p { margin: 0; color: #aaa2bb; }
-        .muted, small { color: #aaa2bb; }
-        .error { color: #ffafa9; }
-        form { margin-top: 24px; }
-        label { display: block; margin-bottom: 8px; }
-        input, button { font: inherit; border: 1px solid #514663; border-radius: 8px;
-                        padding: 12px 14px; }
-        input { display: block; width: min(100%, 360px); box-sizing: border-box;
-                background: #211c2b; color: #fff; }
-        input[type=hidden] { display: none; }
-        .login input[type=password], .login button { width: 100%; }
-        button { background: #b39add; color: #20172c; cursor: pointer; }
-        form button { margin-top: 12px; }
-        header form { margin: 0; }
-        header button { background: #282232; color: #eee; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-                gap: 14px; }
-        biscuit-cardview { display: block; --biscuit-cardview-background: #211c2b;
-                           --biscuit-cardview-border: 1px solid #463a58;
-                           --biscuit-cardview-radius: 14px;
-                           --biscuit-cardview-padding: 22px;
-                           --biscuit-cardview-color: #f4f0fa; }
-        biscuit-cardview:not(:defined) { background: #211c2b; border: 1px solid #463a58;
-                                        border-radius: 14px; padding: 22px; }
-        biscuit-cardview small { display: block; margin-bottom: 12px; }
-        biscuit-cardview strong { display: block; font-size: 1.2rem; overflow-wrap: anywhere; }
-        biscuit-badgeview:not(:defined) { display: inline-block; padding: 6px 10px;
-            border-radius: 999px; background: #342844; color: #d9c6f5; font-size: .8rem; }
-        .buckets { margin-top: 34px; }
-        .table-wrap { overflow: auto; margin-top: 18px; border: 1px solid #463a58;
-                      border-radius: 14px; background: #211c2b; }
-        table { width: 100%; border-collapse: collapse; text-align: left; }
-        th, td { padding: 15px 18px; border-bottom: 1px solid #3b314b; white-space: nowrap; }
-        tr:last-child td { border-bottom: 0; }
-        th { color: #aaa2bb; font-size: .75rem; text-transform: uppercase; letter-spacing: .1em; }
-        td { font-size: .93rem; }
-        .empty { padding: 28px; color: #aaa2bb; }
-        a { color: #c6a8f3; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        .crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-                  color: #aaa2bb; font-size: .9rem; margin: 30px 0 12px; }
-        .crumbs span { overflow-wrap: anywhere; }
-        .toolbar { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between;
-                   gap: 16px; margin: 22px 0; }
-        .toolbar form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 0; }
-        .toolbar label { margin: 0; color: #aaa2bb; font-size: .85rem; }
-        .toolbar input { min-width: min(280px, 100%); }
-        .toolbar button { margin: 0; }
-        .toolbar .field { display: grid; gap: 6px; }
-        .button-link { display: inline-flex; align-items: center; justify-content: center;
-                       border: 1px solid #514663; border-radius: 8px; padding: 12px 14px;
-                       color: #f4f0fa; background: #282232; }
-        .button-link:hover { background: #342a42; text-decoration: none; }
-        .name-cell { max-width: 420px; white-space: normal; overflow-wrap: anywhere; }
-        .kind { color: #aaa2bb; font-size: .8rem; }
-        .pagination { display: flex; gap: 12px; align-items: center; margin-top: 18px; }
-        .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                       gap: 14px; margin-top: 22px; }
-        .detail-card { border: 1px solid #463a58; border-radius: 14px; background: #211c2b;
-                       padding: 22px; min-width: 0; }
-        .detail-card h3 { margin: 0 0 16px; font-size: 1rem; }
-        .fact { display: flex; align-items: baseline; justify-content: space-between;
-                gap: 16px; padding: 9px 0; border-top: 1px solid #3b314b; }
-        .fact span { color: #aaa2bb; }
-        .fact strong { text-align: right; overflow-wrap: anywhere; }
-        .insight { margin-top: 26px; }
-        .console-nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 0;
-                       border-bottom: 1px solid #3e344e; }
-        .console-nav a { padding: 8px 12px; border-radius: 8px; color: #cfc5df; }
-        .console-nav a:hover { background: #282232; text-decoration: none; }
-        .perf-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
-                     gap: 14px; margin-top: 24px; }
-        .perf-grid biscuit-cardview strong { font-variant-numeric: tabular-nums; }
-        .perf-charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-                       gap: 16px; margin-top: 24px; }
-        .perf-charts[hidden] { display: none; }
-        .perf-status { color: #aaa2bb; margin-top: 12px; min-height: 24px; }
-        .perf-note { color: #aaa2bb; font-size: .9rem; line-height: 1.5; }
-        biscuit-chartview { --biscuit-chart-surface: #211c2b;
-                            --biscuit-chart-color: #f4f0fa;
-                            --biscuit-chart-muted: #aaa2bb;
-                            --biscuit-chart-border: #463a58;
-                            --biscuit-chart-accent: #b39add; }
-        details { margin-top: 22px; padding: 18px 22px; border: 1px solid #463a58;
-                  border-radius: 14px; background: #211c2b; }
-        summary { cursor: pointer; font-weight: 600; }
-        pre { overflow-wrap: anywhere; white-space: pre-wrap; }
-        @media (max-width: 820px) { .perf-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-        @media (max-width: 520px) {
-            .login-card { padding: 26px; }
-            .intro { align-items: start; }
-            .grid > :last-child:nth-child(odd) { grid-column: 1 / -1; }
-            .grid biscuit-cardview { --biscuit-cardview-padding: 16px; }
-            .perf-grid biscuit-cardview { --biscuit-cardview-padding: 16px; }
-            .perf-grid biscuit-cardview small { margin-bottom: 8px; }
-            .perf-charts { grid-template-columns: minmax(0, 1fr); }
-        }
-        """;
-    private static final long SESSION_MILLIS = Duration.ofMinutes(30).toMillis();
-    private static final long ATTEMPT_WINDOW_MILLIS = Duration.ofMinutes(5).toMillis();
-    private static final int MAX_SESSIONS = 128;
-    private static final int MAX_CLIENTS = 1024;
+    @FunctionalInterface
+    private interface Route {
+        void handle(AdminConsole console, HttpExchange exchange, String origin) throws IOException;
+    }
+
+    private static final Map<String, Route> ROUTES = Map.ofEntries(
+        Map.entry(PATH, AdminConsole::root),
+        Map.entry(PATH + "/", AdminConsole::root),
+        Map.entry(PATH + "/login", AdminConsole::loginRoute),
+        Map.entry(PATH + "/branding.json", AdminConsole::branding),
+        Map.entry(PATH + "/branding-icon", AdminConsole::brandingIcon),
+        Map.entry(PATH + "/branding-icon/upload", AdminConsole::uploadBranding),
+        Map.entry(PATH + "/performance.json", AdminConsole::performanceJson),
+        Map.entry(PATH + "/diagnostics/probe.bin", AdminConsole::probe),
+        Map.entry(PATH + "/performance.events", AdminConsole::performanceEvents),
+        Map.entry(PATH + "/logout", AdminConsole::logout),
+        Map.entry(PATH + "/overview", AdminConsole::overview),
+        Map.entry(PATH + "/performance", AdminConsole::performancePage),
+        Map.entry(PATH + "/health", AdminConsole::statusPage),
+        Map.entry(PATH + "/diagnostics", AdminConsole::statusPage),
+        Map.entry(PATH + "/audit", AdminConsole::auditPage),
+        Map.entry(PATH + "/jobs", AdminConsole::jobsPage),
+        Map.entry(PATH + "/cluster", AdminConsole::clusterPage),
+        Map.entry(PATH + "/jobs.json", AdminConsole::jobReport),
+        Map.entry(PATH + "/jobs.csv", AdminConsole::jobReport),
+        Map.entry(PATH + "/credentials", AdminConsole::credentialsPage),
+        Map.entry(PATH + "/download", AdminConsole::download),
+        Map.entry(PATH + "/upload", AdminConsole::upload),
+        Map.entry(PATH + "/buckets", AdminConsole::browse),
+        Map.entry(PATH + "/bucket", AdminConsole::browse),
+        Map.entry(PATH + "/versions", AdminConsole::browse),
+        Map.entry(PATH + "/object", AdminConsole::browse),
+        Map.entry(PATH + "/settings", AdminConsole::settings));
+
     private final ObjectStorage store;
-    private final byte[] passwordHash;
-    private final URI publicOrigin;
-    private final String biscuitScript;
-    private final String performanceScript;
-    private final byte[] logo;
+    private final AdminAuthentication authentication;
+    private final AdminAssets assets;
+    private final AdminBranding branding;
+    private final AdminAuditTrail audit;
+    private final AdminBulkJobs jobs;
+    private volatile StoreOperations operations = new StoreOperations();
+    @FunctionalInterface interface AccessCheck {
+        AdminAccessCheck.Result check(String principal, String operation, String bucket, String key)
+            throws IOException;
+    }
+    private volatile AccessCheck accessCheck;
     private volatile RequestMetrics metrics;
-    private final SecureRandom random = new SecureRandom();
-    private final LinkedHashMap<String, Session> sessions = new LinkedHashMap<>();
-    private final LinkedHashMap<String, Long> loginTokens = new LinkedHashMap<>();
-    private final LinkedHashMap<String, Attempt> attempts = new LinkedHashMap<>();
-
-    private record Attempt(long started, int failures) { }
-    private record Session(long expires, String csrf) { }
-
-    private AdminConsole(ObjectStorage store, byte[] passwordHash, URI publicOrigin,
-                         String biscuitScript, String performanceScript, byte[] logo) {
+    private volatile RequestDiagnostics diagnostics;
+    private volatile DiskStore diskStore;
+    private volatile BucketActivity bucketActivity;
+    private volatile Set<String> identities = Set.of();
+    private volatile ManagedCredentials managedCredentials;
+    private volatile Runnable refreshCredentials;
+    private AdminConsole(ObjectStorage store, AdminAuthentication authentication,
+                         AdminAssets assets,
+                         AdminBranding branding, AdminAuditTrail audit) {
         this.store = store;
-        this.passwordHash = passwordHash;
-        this.publicOrigin = publicOrigin;
-        this.biscuitScript = biscuitScript;
-        this.performanceScript = performanceScript;
-        this.logo = logo;
+        this.authentication = authentication;
+        this.assets = assets;
+        this.branding = branding;
+        this.audit = audit;
+        this.jobs = new AdminBulkJobs(store, completed ->
+            auditOutcome("bulk-" + completed.spec().operation(),
+                completed.spec().bucket() + "/" + completed.spec().prefix(),
+                "background", completed.state() + ":" + completed.succeeded() + ":" + completed.failed()));
+    }
+
+    void setOperations(StoreOperations operations) {
+        this.operations = operations;
+        jobs.setOperations(operations);
     }
 
     void setMetrics(RequestMetrics metrics) { this.metrics = metrics; }
+    void setDiagnostics(RequestDiagnostics diagnostics) { this.diagnostics = diagnostics; }
+    void setDiskStore(DiskStore diskStore) { this.diskStore = diskStore; }
+    void setBucketActivity(BucketActivity bucketActivity) { this.bucketActivity = bucketActivity; }
+    void setIdentities(Set<String> identities) { this.identities = Set.copyOf(identities); }
+    void setManagedCredentials(ManagedCredentials managed, Runnable refresh) {
+        this.managedCredentials = managed;
+        this.refreshCredentials = refresh;
+    }
+    void setAccessCheck(AccessCheck check) { this.accessCheck = check; }
 
     static AdminConsole fromEnvironment(Map<String, String> env, ObjectStorage store) throws IOException {
         String enabled = env.getOrDefault("ADMIN_UI_ENABLED", "false");
         if (enabled.equals("false")) return null;
         if (!enabled.equals("true")) throw new IllegalArgumentException("Invalid ADMIN_UI_ENABLED");
-        String file = env.get("ADMIN_UI_PASSWORD_FILE");
-        if (file == null || file.isBlank())
-            throw new IllegalArgumentException("ADMIN_UI_PASSWORD_FILE is required when the admin UI is enabled");
-        byte[] password = Files.readAllBytes(Path.of(file));
-        int length = password.length;
-        if (length > 0 && password[length - 1] == '\n') length--;
-        if (length > 0 && password[length - 1] == '\r') length--;
-        if (length < 16 || length > 1024)
-            throw new IllegalArgumentException("Admin password must contain 16 to 1024 bytes");
-        for (int i = 0; i < length; i++) {
-            if (password[i] == '\n' || password[i] == '\r' || password[i] == 0)
-                throw new IllegalArgumentException("Admin password must be a single line");
-        }
-        byte[] trimmed = java.util.Arrays.copyOf(password, length);
-        byte[] hash = SigV4.hash(trimmed);
-        java.util.Arrays.fill(trimmed, (byte) 0);
-        java.util.Arrays.fill(password, (byte) 0);
-        String privateOrigin = env.get("ADMIN_UI_PRIVATE_ORIGIN");
-        String publicOrigin = env.get("ADMIN_UI_ORIGIN");
-        if (privateOrigin != null && !privateOrigin.isBlank() &&
-            publicOrigin != null && !publicOrigin.isBlank())
-            throw new IllegalArgumentException("Configure only one admin UI origin");
-        String configured = privateOrigin != null && !privateOrigin.isBlank() ? privateOrigin : publicOrigin;
-        URI origin = null;
-        if (configured != null && !configured.isBlank()) {
-            try { origin = URI.create(configured); }
-            catch (IllegalArgumentException error) {
-                throw new IllegalArgumentException("Invalid ADMIN_UI_ORIGIN", error);
-            }
-            boolean privateHttp = privateOrigin != null && !privateOrigin.isBlank();
-            if (!(privateHttp ? "http".equals(origin.getScheme()) &&
-                    privateIpv4(origin.getHost()) && origin.getPort() > 0 && origin.getPort() <= 65535 :
-                    "https".equals(origin.getScheme()) && origin.getHost() != null) ||
-                origin.getUserInfo() != null || origin.getRawQuery() != null || origin.getRawFragment() != null ||
-                !(origin.getRawPath().isEmpty() || origin.getRawPath().equals("/")))
-                throw new IllegalArgumentException(privateHttp ?
-                    "ADMIN_UI_PRIVATE_ORIGIN must be an HTTP origin with a private IPv4 address and port" :
-                    "ADMIN_UI_ORIGIN must be an HTTPS origin");
-            origin = URI.create(origin.toString().replaceFirst("/$", ""));
-        }
-        return new AdminConsole(store, hash, origin,
-            Files.readString(Path.of("admin-ui/biscuit.js")),
-            Files.readString(Path.of("admin-ui/performance.js")),
-            Files.readAllBytes(Path.of("admin-ui/objectstore-logo.png")));
+        AdminAuthentication authentication = AdminAuthentication.fromEnvironment(env);
+        Path stateDirectory = Path.of(env.getOrDefault("ADMIN_UI_STATE_DIR",
+            env.getOrDefault("DATA_DIR", "/data")));
+        Path brandingFile = Path.of(env.getOrDefault("ADMIN_UI_BRANDING_FILE",
+            stateDirectory.resolve("admin-branding.txt").toString()));
+        return new AdminConsole(store, authentication,
+            new AdminAssets(), new AdminBranding(brandingFile),
+            new AdminAuditTrail(stateDirectory));
     }
 
     void handle(HttpExchange exchange) throws IOException {
         securityHeaders(exchange);
-        String origin = requestOrigin(exchange);
+        String origin = authentication.requestOrigin(exchange);
         if (origin == null) {
             send(exchange, 403, page("<h1>Admin console unavailable</h1>" +
                 "<p>Open the local console at <code>http://127.0.0.1:&lt;port&gt;" + PATH +
                 "/login</code>, or use the configured origin.</p>"), "text/html; charset=utf-8");
             return;
         }
+        if (assets.handle(exchange, authentication.session(exchange) != null)) return;
         String path = exchange.getRequestURI().getRawPath();
+        if (path.startsWith(PATH + "/action/")) {
+            action(exchange, origin);
+            return;
+        }
+        Route route = ROUTES.get(path);
+        if (route == null) send(exchange, 404, "Not found", "text/plain; charset=utf-8");
+        else route.handle(this, exchange, origin);
+    }
+
+    private Session requireSession(HttpExchange exchange, String method) throws IOException {
+        if (!exchange.getRequestMethod().equals(method)) {
+            methodNotAllowed(exchange, method);
+            return null;
+        }
+        Session session = authentication.session(exchange);
+        if (session == null) redirect(exchange, PATH + "/login");
+        return session;
+    }
+
+    private void root(HttpExchange exchange, String origin) throws IOException {
         String method = exchange.getRequestMethod();
-        if (path.equals(PATH) || path.equals(PATH + "/")) {
-            if (!method.equals("GET")) {
-                methodNotAllowed(exchange, "GET");
-                return;
-            }
-            if (session(exchange) != null) redirect(exchange, PATH + "/overview");
-            else redirect(exchange, PATH + "/login");
+        if (!method.equals("GET")) {
+            methodNotAllowed(exchange, "GET");
             return;
         }
-        if (path.equals(PATH + "/login")) {
-            if (method.equals("GET")) {
-                send(exchange, 200, loginPage("", issueLoginToken()), "text/html; charset=utf-8");
-                return;
-            }
-            if (method.equals("POST")) {
-                login(exchange);
-                return;
-            }
-            methodNotAllowed(exchange, "GET, POST");
+        if (authentication.session(exchange) != null) redirect(exchange, PATH + "/overview");
+        else redirect(exchange, PATH + "/login");
+    }
+
+    private void loginRoute(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (method.equals("GET")) {
+            send(exchange, 200, loginPage("", authentication.issueLoginToken()), "text/html; charset=utf-8");
             return;
         }
-        if (path.equals(PATH + "/style.css")) {
-            if (!method.equals("GET")) {
-                methodNotAllowed(exchange, "GET");
-                return;
-            }
-            send(exchange, 200, STYLE, "text/css; charset=utf-8");
+        if (method.equals("POST")) {
+            login(exchange);
             return;
         }
-        if (path.equals(PATH + "/logo.png")) {
-            if (!method.equals("GET")) {
-                methodNotAllowed(exchange, "GET");
-                return;
-            }
-            exchange.getResponseHeaders().set("Content-Type", "image/png");
-            exchange.sendResponseHeaders(200, logo.length);
-            exchange.getResponseBody().write(logo);
+        methodNotAllowed(exchange, "GET, POST");
+    }
+
+    private void branding(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!method.equals("GET")) {
+            methodNotAllowed(exchange, "GET");
             return;
         }
-        if (path.equals(PATH + "/biscuit.js")) {
-            if (!method.equals("GET")) {
-                methodNotAllowed(exchange, "GET");
-                return;
-            }
-            if (session(exchange) == null) {
-                redirect(exchange, PATH + "/login");
-                return;
-            }
-            send(exchange, 200, biscuitScript, "text/javascript; charset=utf-8");
+        send(exchange, 200, branding.json(), "application/json; charset=utf-8");
+    }
+
+    private void brandingIcon(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!method.equals("GET")) {
+            methodNotAllowed(exchange, "GET");
             return;
         }
-        if (path.equals(PATH + "/performance.js")) {
-            if (!method.equals("GET")) {
-                methodNotAllowed(exchange, "GET");
-                return;
-            }
-            if (session(exchange) == null) {
-                redirect(exchange, PATH + "/login");
-                return;
-            }
-            send(exchange, 200, performanceScript, "text/javascript; charset=utf-8");
+        AdminBranding.State current = branding.state();
+        if (current.icon().length == 0) {
+            redirect(exchange, PATH + "/logo.png");
             return;
         }
-        if (path.equals(PATH + "/performance.json")) {
-            if (!method.equals("GET")) {
-                methodNotAllowed(exchange, "GET");
-                return;
-            }
-            if (session(exchange) == null) {
-                redirect(exchange, PATH + "/login");
-                return;
-            }
-            if (metrics == null) {
-                send(exchange, 503, "Metrics unavailable", "text/plain; charset=utf-8");
-                return;
-            }
-            send(exchange, 200, AdminPerformance.snapshot(metrics), "application/json; charset=utf-8");
+        exchange.getResponseHeaders().set("Content-Type", current.mime());
+        exchange.sendResponseHeaders(200, current.icon().length);
+        exchange.getResponseBody().write(current.icon());
+    }
+
+    private void uploadBranding(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!method.equals("POST")) {
+            methodNotAllowed(exchange, "POST");
             return;
         }
-        if (path.equals(PATH + "/logout")) {
-            if (!method.equals("POST")) {
-                methodNotAllowed(exchange, "POST");
-                return;
-            }
-            Session session = session(exchange);
-            Map<String, String> form = readForm(exchange);
-            if (session == null || !MessageDigest.isEqual(session.csrf().getBytes(StandardCharsets.US_ASCII),
-                form.getOrDefault("csrf", "").getBytes(StandardCharsets.US_ASCII))) {
-                send(exchange, 403, "Invalid sign-out request", "text/plain; charset=utf-8");
-                return;
-            }
-            String token = sessionCookie(exchange);
-            synchronized (this) {
-                sessions.remove(token);
-            }
-            exchange.getResponseHeaders().add("Set-Cookie", cookie("", 0));
+        Session current = authentication.session(exchange);
+        if (current == null) {
+            send(exchange, 401, "Sign in required", "text/plain; charset=utf-8");
+            return;
+        }
+        String csrf = exchange.getRequestHeaders().getFirst("X-CSRF-Token");
+        if (csrf == null || !MessageDigest.isEqual(current.csrf().getBytes(StandardCharsets.US_ASCII),
+                csrf.getBytes(StandardCharsets.US_ASCII)) ||
+            !AdminAuthentication.adminOriginAllowed(exchange, origin)) {
+            send(exchange, 403, "Invalid admin request", "text/plain; charset=utf-8");
+            return;
+        }
+        byte[] image = exchange.getRequestBody().readNBytes(AdminBranding.MAX_ICON_BYTES + 1);
+        try {
+            auditStart("branding-icon", "admin", exchange);
+            branding.setIcon(image);
+            auditOutcome("branding-icon", "admin",
+                exchange.getRemoteAddress().getAddress().getHostAddress(), "succeeded");
+            send(exchange, 200, branding.json(), "application/json; charset=utf-8");
+        } catch (StoreException invalid) {
+            auditOutcome("branding-icon", "admin",
+                exchange.getRemoteAddress().getAddress().getHostAddress(), invalid.code);
+            send(exchange, invalid.status, invalid.getMessage(), "text/plain; charset=utf-8");
+        } catch (IOException error) {
+            auditOutcome("branding-icon", "admin",
+                exchange.getRemoteAddress().getAddress().getHostAddress(), "IOError");
+            send(exchange, 503, "Icon could not be saved", "text/plain; charset=utf-8");
+        }
+    }
+
+    private void performanceJson(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!method.equals("GET")) {
+            methodNotAllowed(exchange, "GET");
+            return;
+        }
+        if (authentication.session(exchange) == null) {
             redirect(exchange, PATH + "/login");
             return;
         }
-        if (path.equals(PATH + "/overview")) {
-            if (!method.equals("GET")) {
-                methodNotAllowed(exchange, "GET");
-                return;
+        if (metrics == null) {
+            send(exchange, 503, "Metrics unavailable", "text/plain; charset=utf-8");
+            return;
+        }
+        send(exchange, 200, AdminPerformance.snapshot(metrics), "application/json; charset=utf-8");
+    }
+
+    private void probe(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!method.equals("GET")) {
+            methodNotAllowed(exchange, "GET");
+            return;
+        }
+        if (authentication.session(exchange) == null) {
+            redirect(exchange, PATH + "/login");
+            return;
+        }
+        byte[] block = new byte[16 * 1024];
+        int remaining = 1024 * 1024;
+        exchange.getResponseHeaders().set("Content-Type", "application/octet-stream");
+        exchange.sendResponseHeaders(200, remaining);
+        try (OutputStream output = exchange.getResponseBody()) {
+            while (remaining > 0) {
+                int length = Math.min(block.length, remaining);
+                output.write(block, 0, length);
+                remaining -= length;
             }
-            Session session = session(exchange);
-            if (session == null) {
-                redirect(exchange, PATH + "/login");
-                return;
+        }
+    }
+
+    private void performanceEvents(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!method.equals("GET")) {
+            methodNotAllowed(exchange, "GET");
+            return;
+        }
+        if (authentication.session(exchange) == null) {
+            redirect(exchange, PATH + "/login");
+            return;
+        }
+        if (metrics == null) {
+            send(exchange, 503, "Metrics unavailable", "text/plain; charset=utf-8");
+            return;
+        }
+        exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
+        exchange.getResponseHeaders().set("X-Accel-Buffering", "no");
+        exchange.sendResponseHeaders(200, 0);
+        try (OutputStream output = exchange.getResponseBody()) {
+            for (int sample = 0; sample < 1800 && authentication.session(exchange) != null; sample++) {
+                output.write(("data: " + AdminPerformance.snapshot(metrics) + "\n\n")
+                    .getBytes(StandardCharsets.UTF_8));
+                output.flush();
+                Thread.sleep(1000);
             }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (IOException disconnected) { return; }
+    }
+
+    private void logout(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!method.equals("POST")) {
+            methodNotAllowed(exchange, "POST");
+            return;
+        }
+        Session session = authentication.session(exchange);
+        Map<String, String> form = readForm(exchange);
+        if (session == null || !MessageDigest.isEqual(session.csrf().getBytes(StandardCharsets.US_ASCII),
+            form.getOrDefault("csrf", "").getBytes(StandardCharsets.US_ASCII))) {
+            send(exchange, 403, "Invalid sign-out request", "text/plain; charset=utf-8");
+            return;
+        }
+        authentication.signOut(exchange);
+        exchange.getResponseHeaders().add("Set-Cookie", authentication.cookie("", 0));
+        redirect(exchange, PATH + "/login");
+    }
+
+    private void overview(HttpExchange exchange, String origin) throws IOException {
+        Session session = requireSession(exchange, "GET");
+        if (session == null) return;
+        operations.read(() -> {
             ObjectStorage.Limits limits = store.limits();
             String mode = store instanceof ClusterStore ? "Cluster" : "Disk";
             String status = store.ready() ? "Ready" : "Unavailable";
@@ -354,40 +328,336 @@ final class AdminConsole {
                 buckets = List.of();
                 bucketListAvailable = false;
             }
-            send(exchange, 200, overviewPage(mode, status, limits.maxObjectBytes(), limits.maxTotalBytes(),
+            send(exchange, 200, AdminStatusPages.overviewPage(mode, status, limits.maxObjectBytes(), limits.maxTotalBytes(),
                 buckets, bucketListAvailable, session.csrf()),
                 "text/html; charset=utf-8");
+        });
+    }
+
+    private void performancePage(HttpExchange exchange, String origin) throws IOException {
+        Session session = requireSession(exchange, "GET");
+        if (session == null) return;
+        send(exchange, 200, AdminStatusPages.performancePage(session.csrf()), "text/html; charset=utf-8");
+    }
+
+    private void statusPage(HttpExchange exchange, String origin) throws IOException {
+        String path = exchange.getRequestURI().getRawPath();
+        Session session = requireSession(exchange, "GET");
+        if (session == null) return;
+        operations.read(() -> {
+            send(exchange, 200, path.endsWith("/health") ? AdminStatusPages.healthPage(diskStore, store, session.csrf()) :
+                AdminStatusPages.diagnosticsPage(diagnostics, session.csrf()), "text/html; charset=utf-8");
+        });
+    }
+
+    private void auditPage(HttpExchange exchange, String origin) throws IOException {
+        Session session = requireSession(exchange, "GET");
+        if (session == null) return;
+        operations.read(() -> {
+            send(exchange, 200, AdminOperationsPages.auditPage(identities, diagnostics, audit, session.csrf(), null, Map.of()), "text/html; charset=utf-8");
+        });
+    }
+
+    private void jobsPage(HttpExchange exchange, String origin) throws IOException {
+        Session session = requireSession(exchange, "GET");
+        if (session == null) return;
+        send(exchange, 200, AdminOperationsPages.jobsPage(jobs, session.csrf()), "text/html; charset=utf-8");
+    }
+
+    private void clusterPage(HttpExchange exchange, String origin) throws IOException {
+        Session session = requireSession(exchange, "GET");
+        if (session == null) return;
+        operations.read(() -> {
+            send(exchange, 200, AdminOperationsPages.clusterPage(store, session.csrf()), "text/html; charset=utf-8");
+        });
+    }
+
+    private void jobReport(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        String path = exchange.getRequestURI().getRawPath();
+        if (!method.equals("GET")) {
+            methodNotAllowed(exchange, "GET");
             return;
         }
-        if (path.equals(PATH + "/performance")) {
-            if (!method.equals("GET")) {
-                methodNotAllowed(exchange, "GET");
-                return;
-            }
-            Session session = session(exchange);
-            if (session == null) {
-                redirect(exchange, PATH + "/login");
-                return;
-            }
-            send(exchange, 200, performancePage(session.csrf()), "text/html; charset=utf-8");
+        if (authentication.session(exchange) == null) {
+            send(exchange, 401, "Sign in required", "text/plain; charset=utf-8");
             return;
         }
-        if (path.equals(PATH + "/buckets") || path.equals(PATH + "/bucket") ||
-            path.equals(PATH + "/object")) {
-            if (!method.equals("GET")) {
-                methodNotAllowed(exchange, "GET");
-                return;
+        String query = exchange.getRequestURI().getRawQuery();
+        String id = query != null && query.matches("id=[A-Za-z0-9_-]{16}") ? query.substring(3) : "";
+        try {
+            if (path.endsWith(".json")) {
+                AdminBulkJobs.Snapshot job = jobs.get(id);
+                send(exchange, 200, AdminOperationsPages.jobJson(job), "application/json; charset=utf-8");
+            } else {
+                exchange.getResponseHeaders().set("Content-Disposition", "attachment; filename=objectstore-job.csv");
+                send(exchange, 200, jobs.report(id), "text/csv; charset=utf-8");
             }
-            Session session = session(exchange);
-            if (session == null) {
-                redirect(exchange, PATH + "/login");
-                return;
+        } catch (StoreException error) {
+            send(exchange, error.status, "Job not found", "text/plain; charset=utf-8");
+        }
+    }
+
+    private void credentialsPage(HttpExchange exchange, String origin) throws IOException {
+        Session session = requireSession(exchange, "GET");
+        if (session == null) return;
+        operations.read(() -> {
+            send(exchange, 200, AdminSettingsPages.credentialsPage(managedCredentials, store, session.csrf(), null), "text/html; charset=utf-8");
+        });
+    }
+
+    private void download(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!method.equals("GET")) {
+            methodNotAllowed(exchange, "GET");
+            return;
+        }
+        if (authentication.session(exchange) == null) {
+            redirect(exchange, PATH + "/login");
+            return;
+        }
+        operations.read(() -> {
+            try { AdminFileTransfer.download(store, exchange); }
+            catch (StoreException error) {
+                if (exchange.getResponseCode() <= 0)
+                    send(exchange, error.status, error.getMessage(), "text/plain; charset=utf-8");
+            } catch (IOException error) {
+                if (exchange.getResponseCode() <= 0)
+                    send(exchange, 503, "Download failed; storage is unavailable", "text/plain; charset=utf-8");
             }
+        });
+    }
+
+    private void upload(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!method.equals("POST")) {
+            methodNotAllowed(exchange, "POST");
+            return;
+        }
+        Session session = authentication.session(exchange);
+        if (session == null) {
+            send(exchange, 401, "Sign in again before uploading", "text/plain; charset=utf-8");
+            return;
+        }
+        String token = exchange.getRequestHeaders().getFirst("X-ObjectStore-CSRF");
+        if (token == null || !MessageDigest.isEqual(session.csrf().getBytes(StandardCharsets.US_ASCII),
+                token.getBytes(StandardCharsets.US_ASCII)) ||
+            !AdminAuthentication.adminOriginAllowed(exchange, origin)) {
+            send(exchange, 403, "Invalid upload request", "text/plain; charset=utf-8");
+            return;
+        }
+        operations.read(() -> {
+            try {
+                auditStart("upload-object", "object", exchange);
+                String destination = AdminFileTransfer.upload(store, exchange);
+                auditOutcome("upload-object", destination,
+                    exchange.getRemoteAddress().getAddress().getHostAddress(), "succeeded");
+                exchange.getResponseHeaders().set("Location", destination);
+                send(exchange, 201, "Uploaded", "text/plain; charset=utf-8");
+            } catch (StoreException error) {
+                auditOutcome("upload-object", "object",
+                    exchange.getRemoteAddress().getAddress().getHostAddress(), error.code);
+                send(exchange, error.status, error.getMessage(), "text/plain; charset=utf-8");
+            } catch (IOException error) {
+                auditOutcome("upload-object", "object",
+                    exchange.getRemoteAddress().getAddress().getHostAddress(), "IOError");
+                send(exchange, 503, "Upload failed; storage is unavailable", "text/plain; charset=utf-8");
+            }
+        });
+    }
+
+    private void action(HttpExchange exchange, String origin) throws IOException {
+        String path = exchange.getRequestURI().getRawPath();
+        Session session = requireSession(exchange, "POST");
+        if (session == null) return;
+        Map<String, String> form = readForm(exchange);
+        if (!MessageDigest.isEqual(session.csrf().getBytes(StandardCharsets.US_ASCII),
+            form.getOrDefault("csrf", "").getBytes(StandardCharsets.US_ASCII))) {
+            send(exchange, 403, "Invalid admin request", "text/plain; charset=utf-8");
+            return;
+        }
+        if (!AdminAuthentication.adminOriginAllowed(exchange, origin)) {
+            send(exchange, 403, "Invalid origin", "text/plain; charset=utf-8");
+            return;
+        }
+        String action = path.substring((PATH + "/action/").length());
+        StoreOperations.Action apply = () -> applyAction(exchange, session, action, form);
+        try {
+            if (action.equals("rename-bucket") || action.equals("delete-bucket")) {
+                operations.write(apply);
+            } else {
+                operations.read(apply);
+            }
+        } catch (StoreException busy) {
+            send(exchange, busy.status, actionErrorPage(action, form, session.csrf(), busy),
+                "text/html; charset=utf-8");
+        }
+    }
+
+    private void applyAction(HttpExchange exchange, Session session, String action,
+                             Map<String, String> form) throws IOException {
+        String peer = exchange.getRemoteAddress().getAddress().getHostAddress();
+        String target = auditTarget(form);
+        try {
+            if ((action.equals("rename-bucket") || action.equals("delete-bucket")) && jobs.hasActiveJob())
+                throw new StoreException(409, "OperationAborted", "Wait for or cancel the active bulk job before renaming or deleting a bucket");
+            auditStart(action, target, exchange);
+            switch (action) {
+                case "access-check" -> checkAccess(exchange, session, action, form);
+                case "bulk-start" -> startBulkJob(exchange, session, action, form);
+                case "bulk-cancel" -> cancelBulkJob(exchange, session, action, form);
+                case "branding-name" -> saveBrandingName(exchange, session, action, form);
+                case "branding-reset" -> resetBranding(exchange, session, action, form);
+                case "default-theme" -> saveTheme(exchange, session, action, form);
+                case "create-key", "update-key", "enable-key", "disable-key", "delete-key" ->
+                    changeCredentials(exchange, session, action, form);
+                default -> changeStorage(exchange, session, action, form);
+            }
+        } catch (StoreException error) {
+            auditOutcome(action, target, peer, error.code);
+            send(exchange, error.status, actionErrorPage(action, form, session.csrf(), error),
+                "text/html; charset=utf-8");
+        } catch (IOException error) {
+            auditOutcome(action, target, peer, "IOError");
+            send(exchange, 503, page(consoleHeader(session.csrf()) +
+                "<h2>Storage unavailable</h2><p class=error>Change was not saved.</p>"),
+                "text/html; charset=utf-8");
+        }
+    }
+
+    private void checkAccess(HttpExchange exchange, Session session, String action,
+                              Map<String, String> form) throws IOException {
+        String peer = exchange.getRemoteAddress().getAddress().getHostAddress();
+        String target = auditTarget(form);
+        AccessCheck check = accessCheck;
+        if (check == null) throw new StoreException(503, "ServiceUnavailable", "Access checker unavailable");
+        AdminAccessCheck.Result result = check.check(form.get("principal"),
+            form.get("operation"), form.get("bucket"), form.get("key"));
+        auditOutcome(action, target, peer, result.allowed() ? "allowed" : "denied");
+        send(exchange, 200, AdminOperationsPages.auditPage(identities, diagnostics, audit, session.csrf(), result, form), "text/html; charset=utf-8");
+    }
+
+    private void startBulkJob(HttpExchange exchange, Session session, String action,
+                              Map<String, String> form) throws IOException {
+        String peer = exchange.getRemoteAddress().getAddress().getHostAddress();
+        String target = auditTarget(form);
+        String operation = form.getOrDefault("operation", "");
+        if (operation.equals("delete") && !form.getOrDefault("bucket", "").equals(form.get("confirm")))
+            throw new StoreException(400, "InvalidArgument", "Type the source bucket to confirm deletion");
+        AdminBulkJobs.Spec spec = new AdminBulkJobs.Spec(operation,
+            form.getOrDefault("bucket", ""), form.getOrDefault("prefix", ""),
+            form.getOrDefault("targetBucket", ""), form.getOrDefault("targetPrefix", ""),
+            form.getOrDefault("tag", ""), form.getOrDefault("value", ""));
+        AdminBulkJobs.Snapshot job = jobs.start(spec);
+        auditOutcome(action, target, peer, "started:" + job.id());
+        redirect(exchange, PATH + "/jobs");
+    }
+
+    private void cancelBulkJob(HttpExchange exchange, Session session, String action,
+                              Map<String, String> form) throws IOException {
+        String peer = exchange.getRemoteAddress().getAddress().getHostAddress();
+        String target = auditTarget(form);
+        jobs.cancel(form.getOrDefault("id", ""));
+        auditOutcome(action, "job:" + form.getOrDefault("id", ""), peer, "requested");
+        redirect(exchange, PATH + "/jobs");
+    }
+
+    private void saveBrandingName(HttpExchange exchange, Session session, String action,
+                              Map<String, String> form) throws IOException {
+        String peer = exchange.getRemoteAddress().getAddress().getHostAddress();
+        String target = auditTarget(form);
+        branding.setName(form.get("displayName"));
+        auditOutcome(action, target, peer, "succeeded");
+        redirect(exchange, PATH + "/settings");
+    }
+
+    private void resetBranding(HttpExchange exchange, Session session, String action,
+                              Map<String, String> form) throws IOException {
+        String peer = exchange.getRemoteAddress().getAddress().getHostAddress();
+        String target = auditTarget(form);
+        branding.reset();
+        auditOutcome(action, target, peer, "succeeded");
+        redirect(exchange, PATH + "/settings");
+    }
+
+    private void saveTheme(HttpExchange exchange, Session session, String action,
+                              Map<String, String> form) throws IOException {
+        String peer = exchange.getRemoteAddress().getAddress().getHostAddress();
+        String target = auditTarget(form);
+        branding.setDefaultTheme(form.get("defaultTheme"));
+        auditOutcome(action, target, peer, "succeeded");
+        redirect(exchange, PATH + "/settings");
+    }
+
+    private void changeCredentials(HttpExchange exchange, Session session, String action,
+                              Map<String, String> form) throws IOException {
+        String peer = exchange.getRemoteAddress().getAddress().getHostAddress();
+        String target = auditTarget(form);
+        ManagedCredentials managed = managedCredentials;
+        if (managed == null)
+            throw new StoreException(409, "InvalidRequest", "Managed keys are not configured");
+        ManagedCredentials.Key created = null;
+        if (action.equals("create-key")) {
+            String bucket = form.getOrDefault("bucket", "");
+            store.bucket(bucket);
+            created = managed.create(bucket, form.getOrDefault("prefix", ""), keyPermissions(form));
+        } else {
+            String id = form.getOrDefault("id", "");
+            if (!id.matches("[A-Z0-9]{32}") || !id.equals(form.get("confirm")))
+                throw new StoreException(400, "InvalidArgument", "Type the access key ID to confirm");
+            switch (action) {
+                case "update-key" -> {
+                    String bucket = form.getOrDefault("bucket", "");
+                    store.bucket(bucket);
+                    managed.update(id, bucket, form.getOrDefault("prefix", ""), keyPermissions(form));
+                }
+                case "enable-key" -> managed.setEnabled(id, true);
+                case "disable-key" -> managed.setEnabled(id, false);
+                case "delete-key" -> managed.remove(id);
+                default -> throw new IllegalStateException();
+            }
+        }
+        refreshCredentials.run();
+        auditOutcome(action, target, peer, "succeeded");
+        System.out.println("ObjectStore admin action " + action + " from " +
+            exchange.getRemoteAddress().getAddress().getHostAddress());
+        if (created == null) redirect(exchange, PATH + "/credentials");
+        else send(exchange, 200, AdminSettingsPages.credentialsPage(managedCredentials, store, session.csrf(), created),
+            "text/html; charset=utf-8");
+    }
+
+    private void changeStorage(HttpExchange exchange, Session session, String action,
+                               Map<String, String> form) throws IOException {
+        String peer = exchange.getRemoteAddress().getAddress().getHostAddress();
+        String target = auditTarget(form);
+        String destination = action.equals("edit-object") ?
+            AdminTextEditor.save(store, form) :
+                AdminActions.apply(store, action, form, identities, managedCredentials);
+        BucketActivity activity = bucketActivity;
+        if (activity != null) {
+            String bucket = form.get("bucket");
+            if (action.equals("rename-bucket")) activity.rename(bucket, form.get("newName"));
+            else if (action.equals("delete-bucket")) activity.remove(bucket);
+        }
+        System.out.println("ObjectStore admin action " + action + " from " +
+            exchange.getRemoteAddress().getAddress().getHostAddress());
+        auditOutcome(action, target, peer, "succeeded");
+        redirect(exchange, destination);
+    }
+
+    private void browse(HttpExchange exchange, String origin) throws IOException {
+        String path = exchange.getRequestURI().getRawPath();
+        Session session = requireSession(exchange, "GET");
+        if (session == null) return;
+        operations.read(() -> {
             try {
                 String body = path.equals(PATH + "/buckets") ?
                     AdminBrowser.index(store, exchange.getRequestURI().getRawQuery(), session.csrf()) :
                     path.equals(PATH + "/bucket") ?
-                    AdminBrowser.bucket(store, exchange.getRequestURI().getRawQuery(), session.csrf()) :
+                    AdminBrowser.bucket(store, exchange.getRequestURI().getRawQuery(), session.csrf(),
+                        null, bucketActivity) :
+                    path.equals(PATH + "/versions") ?
+                    AdminBrowser.versions(store, exchange.getRequestURI().getRawQuery(), session.csrf()) :
                     AdminBrowser.object(store, exchange.getRequestURI().getRawQuery(), session.csrf());
                 send(exchange, 200, page(body, true), "text/html; charset=utf-8");
             } catch (StoreException error) {
@@ -400,196 +670,74 @@ final class AdminConsole {
                     "<h2>Storage unavailable</h2><p class=muted>Try again when the service is ready.</p>"),
                     "text/html; charset=utf-8");
             }
+        });
+    }
+
+    private void settings(HttpExchange exchange, String origin) throws IOException {
+        String method = exchange.getRequestMethod();
+        if (!method.equals("GET")) {
+            methodNotAllowed(exchange, "GET");
             return;
         }
-        send(exchange, 404, "Not found", "text/plain; charset=utf-8");
+        Session session = authentication.session(exchange);
+        if (session == null) redirect(exchange, PATH + "/login");
+        else send(exchange, 200, page(AdminSettingsPages.settingsPage(session.csrf()), true), "text/html; charset=utf-8");
     }
 
     private void login(HttpExchange exchange) throws IOException {
         Map<String, String> form = readForm(exchange);
-        if (!consumeLoginToken(form.get("csrf"))) {
-            send(exchange, 403, loginPage("Sign-in expired. Reload the page and try again.", issueLoginToken()),
+        if (!authentication.consumeLoginToken(form.get("csrf"))) {
+            send(exchange, 403, loginPage("Sign-in expired. Reload the page and try again.", authentication.issueLoginToken()),
                 "text/html; charset=utf-8");
             return;
         }
         String password = form.get("password");
         String client = exchange.getRemoteAddress().getAddress().getHostAddress();
-        if (throttled(client)) {
+        if (authentication.throttled(client)) {
+            auditOutcome("login", "admin", client, "throttled");
             exchange.getResponseHeaders().set("Retry-After", "300");
-            send(exchange, 429, loginPage("Too many attempts. Try again in five minutes.", issueLoginToken()),
+            send(exchange, 429, loginPage("Too many attempts. Try again in five minutes.", authentication.issueLoginToken()),
                 "text/html; charset=utf-8");
             return;
         }
-        byte[] candidate = SigV4.hash((password == null ? "" : password).getBytes(StandardCharsets.UTF_8));
-        if (!MessageDigest.isEqual(candidate, passwordHash)) {
-            failed(client);
-            send(exchange, 401, loginPage("Invalid password", issueLoginToken()), "text/html; charset=utf-8");
+        if (!authentication.matchesPassword(password)) {
+            authentication.failed(client);
+            auditOutcome("login", "admin", client, "denied");
+            send(exchange, 401, loginPage("Invalid password", authentication.issueLoginToken()), "text/html; charset=utf-8");
             return;
         }
-        String token = randomToken();
-        synchronized (this) {
-            attempts.remove(client);
-            long now = System.currentTimeMillis();
-            sessions.entrySet().removeIf(entry -> entry.getValue().expires() <= now);
-            if (sessions.size() >= MAX_SESSIONS) sessions.remove(sessions.keySet().iterator().next());
-            sessions.put(token, new Session(now + SESSION_MILLIS, randomToken()));
-        }
-        exchange.getResponseHeaders().add("Set-Cookie", cookie(token, 1800));
+        String token = authentication.signIn(client);
+        exchange.getResponseHeaders().add("Set-Cookie", authentication.cookie(token, 1800));
+        auditOutcome("login", "admin", client, "succeeded");
         redirect(exchange, PATH + "/overview");
     }
 
-    private static Map<String, String> readForm(HttpExchange exchange) throws IOException {
-        String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
-        if (contentType == null || !contentType.split(";", 2)[0].trim()
-            .equalsIgnoreCase("application/x-www-form-urlencoded")) {
-            throw new StoreException(415, "InvalidRequest", "Expected a form submission");
-        }
-        byte[] body = exchange.getRequestBody().readNBytes(4097);
-        if (body.length > 4096) {
-            throw new StoreException(413, "InvalidRequest", "Form is too large");
-        }
-        Map<String, String> values = new java.util.HashMap<>();
+    private String actionErrorPage(String action, Map<String, String> form, String csrf,
+                                   StoreException error) {
         try {
-            for (String field : new String(body, StandardCharsets.UTF_8).split("&", -1)) {
-                int split = field.indexOf('=');
-                if (split < 0) continue;
-                String key = URLDecoder.decode(field.substring(0, split), StandardCharsets.UTF_8);
-                String value = URLDecoder.decode(field.substring(split + 1), StandardCharsets.UTF_8);
-                if (values.putIfAbsent(key, value) != null)
-                    throw new IllegalArgumentException("Duplicate form field");
+            if (action.equals("policy") && form.containsKey("bucket")) {
+                String query = "name=" + AdminBrowser.encoded(form.get("bucket"));
+                return page(AdminBrowser.bucket(store, query, csrf,
+                    new AdminBrowser.EditorDraft(form.getOrDefault("policy", ""), error.getMessage()),
+                    bucketActivity), true);
             }
-        } catch (IllegalArgumentException error) {
-            throw new StoreException(400, "InvalidRequest", "Invalid form submission");
+            if (action.equals("edit-object") && form.containsKey("bucket") && form.containsKey("key")) {
+                String query = "bucket=" + AdminBrowser.encoded(form.get("bucket")) +
+                    "&key=" + AdminBrowser.encoded(form.get("key"));
+                return page(AdminBrowser.object(store, query, csrf,
+                    new AdminBrowser.EditorDraft(form.getOrDefault("content", ""), error.getMessage())), true);
+            }
+        } catch (IOException | IllegalArgumentException | StoreException ignored) {
         }
-        return values;
-    }
-
-    private synchronized String issueLoginToken() {
-        long now = System.currentTimeMillis();
-        loginTokens.entrySet().removeIf(entry -> entry.getValue() <= now);
-        if (loginTokens.size() >= MAX_SESSIONS) loginTokens.remove(loginTokens.keySet().iterator().next());
-        String token = randomToken();
-        loginTokens.put(token, now + Duration.ofMinutes(10).toMillis());
-        return token;
-    }
-
-    private synchronized boolean consumeLoginToken(String token) {
-        if (token == null || !token.matches("[A-Za-z0-9_-]{43}")) return false;
-        Long until = loginTokens.remove(token);
-        return until != null && until > System.currentTimeMillis();
-    }
-
-    private String randomToken() {
-        byte[] value = new byte[32];
-        random.nextBytes(value);
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(value);
-    }
-
-    private synchronized boolean throttled(String client) {
-        Attempt attempt = attempts.get(client);
-        return attempt != null && System.currentTimeMillis() - attempt.started < ATTEMPT_WINDOW_MILLIS &&
-            attempt.failures >= 5;
-    }
-
-    private synchronized void failed(String client) {
-        long now = System.currentTimeMillis();
-        Attempt attempt = attempts.get(client);
-        if (attempt == null || now - attempt.started >= ATTEMPT_WINDOW_MILLIS)
-            attempts.put(client, new Attempt(now, 1));
-        else attempts.put(client, new Attempt(attempt.started, attempt.failures + 1));
-        if (attempts.size() > MAX_CLIENTS) {
-            Iterator<String> oldest = attempts.keySet().iterator();
-            oldest.next();
-            oldest.remove();
-        }
-    }
-
-    private synchronized Session session(HttpExchange exchange) {
-        String token = sessionCookie(exchange);
-        Session session = sessions.get(token);
-        if (session == null) return null;
-        if (session.expires() > System.currentTimeMillis()) return session;
-        sessions.remove(token);
-        return null;
-    }
-
-    private String sessionCookie(HttpExchange exchange) {
-        String header = exchange.getRequestHeaders().getFirst("Cookie");
-        if (header == null || header.length() > 8192) return "";
-        String name = secureOrigin() ? "__Host-objectstore_admin=" : "objectstore_admin=";
-        for (String field : header.split(";")) {
-            String value = field.trim();
-            if (value.startsWith(name) && value.substring(name.length()).matches("[A-Za-z0-9_-]{43}"))
-                return value.substring(name.length());
-        }
-        return "";
-    }
-
-    private String cookie(String token, int seconds) {
-        String name = secureOrigin() ? "__Host-objectstore_admin" : "objectstore_admin";
-        String path = secureOrigin() ? "/" : PATH;
-        return name + "=" + token + "; Path=" + path + "; HttpOnly; SameSite=Strict; Max-Age=" + seconds +
-            (secureOrigin() ? "; Secure" : "");
-    }
-
-    private boolean secureOrigin() {
-        return publicOrigin != null && "https".equals(publicOrigin.getScheme());
-    }
-
-    private static boolean privateIpv4(String host) {
-        if (host == null || !host.matches("[0-9]+(?:\\.[0-9]+){3}")) return false;
-        String[] fields = host.split("\\.");
-        int[] octets = new int[4];
-        for (int i = 0; i < octets.length; i++) {
-            if (fields[i].length() > 3 || (fields[i].length() > 1 && fields[i].startsWith("0"))) return false;
-            octets[i] = Integer.parseInt(fields[i]);
-            if (octets[i] > 255) return false;
-        }
-        return octets[0] == 10 ||
-            (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) ||
-            (octets[0] == 192 && octets[1] == 168);
-    }
-
-    private String requestOrigin(HttpExchange exchange) {
-        String host = exchange.getRequestHeaders().getFirst("Host");
-        if (host == null || exchange.getRequestHeaders().get("Host").size() != 1) return null;
-        if (publicOrigin != null)
-            return host.equalsIgnoreCase(publicOrigin.getRawAuthority()) ? publicOrigin.toString() : null;
-        if (!host.matches("(?i)(localhost|127\\.0\\.0\\.1|\\[::1\\])(?::[0-9]{1,5})?")) return null;
-        return "http://" + host.toLowerCase(java.util.Locale.ROOT);
-    }
-
-    private static void securityHeaders(HttpExchange exchange) {
-        exchange.getResponseHeaders().set("Cache-Control", "no-store");
-        exchange.getResponseHeaders().set("Content-Security-Policy",
-            "default-src 'none'; style-src 'self'; style-src-elem 'self' 'unsafe-inline'; " +
-            "style-src-attr 'none'; script-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; " +
-            "frame-ancestors 'none'; base-uri 'none'");
-        exchange.getResponseHeaders().set("Referrer-Policy", "no-referrer");
-        exchange.getResponseHeaders().set("X-Frame-Options", "DENY");
-        exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
-    }
-
-    private static void methodNotAllowed(HttpExchange exchange, String methods) throws IOException {
-        exchange.getResponseHeaders().set("Allow", methods);
-        send(exchange, 405, "Method not allowed", "text/plain; charset=utf-8");
-    }
-
-    private static void redirect(HttpExchange exchange, String path) throws IOException {
-        exchange.getResponseHeaders().set("Location", path);
-        exchange.sendResponseHeaders(303, -1);
-    }
-
-    private static void send(HttpExchange exchange, int status, String body, String contentType) throws IOException {
-        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().set("Content-Type", contentType);
-        exchange.sendResponseHeaders(status, bytes.length);
-        exchange.getResponseBody().write(bytes);
+        return page(consoleHeader(csrf) +
+            "<h2>Change was not saved</h2><p class=error>" + escape(error.getMessage()) +
+            "</p><p><a href='" + PATH + "/buckets'>Return to buckets</a> · " +
+            "<a href='" + PATH + "/credentials'>Return to access keys</a></p>");
     }
 
     private static String loginPage(String error, String csrf) {
         return page("<div class=login><div class=login-card><div class=login-brand>" +
-            logoMark() + "<strong>ObjectStore</strong></div><h1>Admin console</h1>" +
+            AdminLayout.logoMark() + "<strong>ObjectStore</strong></div><h1>Admin console</h1>" +
             "<p class=muted>Sign in to view this service.</p>" +
             (error.isEmpty() ? "" : "<p role=alert class=error>" + error + "</p>") +
             "<form method=post action='" + PATH + "/login'>" +
@@ -599,133 +747,53 @@ final class AdminConsole {
             "</form></div></div>");
     }
 
-    private static String overviewPage(String mode, String status, long maxObject, long maxTotal,
-                                       List<ObjectStorage.Bucket> buckets, boolean bucketListAvailable,
-                                       String csrf) {
-        StringBuilder content = new StringBuilder(consoleHeader(csrf) +
-            "<div class=intro><div><h2>Overview</h2><p>Service status and configured limits</p></div>" +
-            "<biscuit-badgeview theme=dark variant='" + (status.equals("Ready") ? "success" : "danger") + "'>" +
-            status + "</biscuit-badgeview></div>" +
-            "<div class=grid><biscuit-cardview><small>Storage mode</small><strong>" + mode +
-            "</strong></biscuit-cardview><biscuit-cardview><small>Buckets</small><strong>" +
-            (bucketListAvailable ? buckets.size() : "Unavailable") +
-            "</strong></biscuit-cardview><biscuit-cardview><small>Maximum object</small><strong>" +
-            formatBytes(maxObject) + "</strong></biscuit-cardview><biscuit-cardview>" +
-            "<small>Total storage limit</small><strong>" + formatBytes(maxTotal) +
-            "</strong></biscuit-cardview></div><section class=buckets><h2>Buckets</h2>" +
-            "<p>Read-only view of the first 25 buckets. <a href='" + PATH +
-            "/buckets'>Browse all buckets</a></p>");
-        if (!bucketListAvailable || buckets.isEmpty()) {
-            content.append("<div class='table-wrap empty'>")
-                .append(bucketListAvailable ? "No buckets yet." : "Bucket list unavailable.")
-                .append("</div>");
-        } else {
-            content.append("<div class=table-wrap><table><thead><tr><th>Bucket</th><th>Versioning</th>" +
-                "<th>Ownership</th></tr></thead><tbody>");
-            for (ObjectStorage.Bucket bucket : buckets.stream().limit(25).toList()) {
-                String versioning = bucket.versioning() == ObjectStorage.VersioningState.NEVER ?
-                    "Off" : bucket.versioning().name().toLowerCase(java.util.Locale.ROOT);
-                String ownership = switch (bucket.ownership()) {
-                    case BUCKET_OWNER_ENFORCED -> "Owner enforced";
-                    case BUCKET_OWNER_PREFERRED -> "Owner preferred";
-                    case OBJECT_WRITER -> "Object writer";
-                };
-                content.append("<tr><td><a href='").append(AdminBrowser.bucketUrl(bucket.name(), "", null))
-                    .append("'>").append(escape(bucket.name())).append("</a></td><td>")
-                    .append(versioning).append("</td><td>").append(ownership).append("</td></tr>");
-            }
-            content.append("</tbody></table></div>");
-        }
-        content.append("</section>");
-        return page(content.toString(), true);
+    private static String auditTarget(Map<String, String> form) {
+        String bucket = form.getOrDefault("bucket", "");
+        String key = form.getOrDefault("key", "");
+        String id = form.getOrDefault("id", "");
+        if (!id.isEmpty()) return "key:" + id;
+        if (!bucket.isEmpty()) return key.isEmpty() ? bucket : bucket + "/" + key;
+        return "admin";
     }
 
-    private static String performancePage(String csrf) {
-        StringBuilder content = new StringBuilder(consoleHeader(csrf));
-        content.append("<div class=intro><div><h2>Performance</h2>")
-            .append("<p>Live S3 traffic and process health</p></div>")
-            .append("<biscuit-badgeview theme=dark variant=accent>Live</biscuit-badgeview></div>")
-            .append("<p class=perf-note>Sampled every 3 seconds while this tab is visible. ")
-            .append("Traffic excludes admin pages and health checks. Charts keep only the last 60 samples ")
-            .append("in this browser tab.</p><p id=perf-state class=perf-status role=status>Collecting samples…</p>")
-            .append("<div class=perf-grid>")
-            .append(perfCard("Requests / second", "perf-rps"))
-            .append(perfCard("Average latency", "perf-latency"))
-            .append(perfCard("Inbound / second", "perf-inbound"))
-            .append(perfCard("Outbound / second", "perf-outbound"))
-            .append(perfCard("Average CPU · recent", "perf-cpu"))
-            .append(perfCard("Process RAM (RSS)", "perf-ram"))
-            .append(perfCard("GC collections", "perf-gc"))
-            .append(perfCard("In flight", "perf-inflight"))
-            .append("</div><div class=perf-charts hidden>")
-            .append("<biscuit-chartview id=perf-requests-chart theme=dark type=line ")
-            .append("name='Requests / second' height=250 max-rows=60></biscuit-chartview>")
-            .append("<biscuit-chartview id=perf-transfer-chart theme=dark type=line ")
-            .append("name='Transfer / second' height=250 max-rows=60></biscuit-chartview>")
-            .append("<biscuit-chartview id=perf-cpu-chart theme=dark type=line ")
-            .append("name='Process CPU' height=250 max-rows=60></biscuit-chartview>")
-            .append("<biscuit-chartview id=perf-memory-chart theme=dark type=line ")
-            .append("name='Process memory' height=250 max-rows=60></biscuit-chartview>")
-            .append("</div><p class=perf-note>Inbound and outbound measure HTTP body bytes, including ")
-            .append("S3 metadata responses. CPU is the process share of available cores. ")
-            .append("GC counts reset when the service restarts.</p>");
-        return page(content.toString(), true, true);
+    private void auditOutcome(String action, String target, String peer, String reason) {
+        try { audit.record(action, target, reason, peer); }
+        catch (IOException error) { System.err.println("Admin audit write failed: " + error.getMessage()); }
     }
 
-    private static String perfCard(String label, String id) {
-        return "<biscuit-cardview><small>" + label + "</small><strong id='" + id +
-            "'>—</strong></biscuit-cardview>";
+    private void auditStart(String action, String target, HttpExchange exchange) throws IOException {
+        audit.record(action, target, "started",
+            exchange.getRemoteAddress().getAddress().getHostAddress());
     }
 
-    private static String page(String content) {
-        return page(content, false);
+    private static Set<String> keyPermissions(Map<String, String> form) {
+        Set<String> permissions = new java.util.HashSet<>();
+        for (String permission : List.of("read", "write", "list"))
+            if (form.containsKey(permission)) permissions.add(permission);
+        return permissions;
     }
 
     static String page(String content, boolean widgets) {
-        return page(content, widgets, false);
+        return AdminLayout.page(content, widgets);
     }
 
-    private static String page(String content, boolean widgets, boolean performance) {
-        return "<!doctype html><html lang=en><head><meta charset=utf-8>" +
-            "<meta name=viewport content='width=device-width,initial-scale=1'><title>ObjectStore admin</title>" +
-            "<link rel=stylesheet href='" + PATH + "/style.css'>" +
-            (widgets ? "<script defer src='" + PATH + "/biscuit.js'></script>" : "") +
-            (performance ? "<script defer src='" + PATH + "/performance.js'></script>" : "") +
-            "</head><body><main>" +
-            content + "</main></body></html>";
+    private static String page(String content) {
+        return AdminLayout.page(content);
     }
 
     static String consoleHeader(String csrf) {
-        return "<header><div class=header-title>" + logoMark() +
-            "<div><h1>ObjectStore</h1><small>Admin console · v" + Version.VALUE +
-            "</small></div></div><form method=post action='" + PATH +
-            "/logout'><input type=hidden name=csrf value='" + csrf +
-            "'><button type=submit>Sign out</button></form></header>" +
-            "<nav class=console-nav aria-label='Admin sections'><a href='" + PATH +
-            "/overview'>Overview</a><a href='" + PATH + "/buckets'>Buckets</a>" +
-            "<a href='" + PATH + "/performance'>Performance</a></nav>";
+        return AdminLayout.consoleHeader(csrf);
     }
 
-    private static String logoMark() {
-        return "<span class=mark aria-hidden=true><img src='" + PATH +
-            "/logo.png' alt='' width=56 height=56></span>";
+    static String icon(String name) {
+        return AdminLayout.icon(name);
     }
 
     static String escape(String value) {
-        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace("\"", "&quot;").replace("'", "&#39;");
+        return AdminLayout.escape(value);
     }
 
     static String formatBytes(long bytes) {
-        if (bytes == Long.MAX_VALUE) return "Unlimited";
-        if (bytes < 1024) return bytes + " B";
-        String[] units = { "KiB", "MiB", "GiB", "TiB", "PiB", "EiB" };
-        double value = bytes;
-        int unit = -1;
-        do {
-            value /= 1024;
-            unit++;
-        } while (value >= 1024 && unit < units.length - 1);
-        return String.format(java.util.Locale.ROOT, "%.1f %s", value, units[unit]);
+        return AdminLayout.formatBytes(bytes);
     }
 }

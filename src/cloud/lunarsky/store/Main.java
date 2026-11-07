@@ -22,12 +22,23 @@ public final class Main {
     private final ClientLimits clientLimits;
     private final Semaphore slots;
     private final Semaphore adminSlots = new Semaphore(8);
+    private final Semaphore adminStreams = new Semaphore(4);
     private final String virtualHostSuffix;
     private final BrowserCors cors;
     private final KeyScopes keyScopes;
     private final RequestMetrics metrics;
+    private final StoreOperations operations = new StoreOperations();
+    private final RequestDiagnostics diagnostics = new RequestDiagnostics();
+    private volatile BucketActivity bucketActivity;
     private final int maxInFlight;
     private volatile AdminConsole adminConsole;
+    private volatile ManagedCredentials managedCredentials;
+
+    private static final class RequestContext {
+        String principal;
+        String bucket;
+        String operation;
+    }
 
     Main(DiskStore store, SigV4 authentication, String bucket) throws IOException {
         this(store, new MultipartStore(store), authentication, bucket);
@@ -103,7 +114,37 @@ public final class Main {
 
     void setAdminConsole(AdminConsole adminConsole) {
         this.adminConsole = adminConsole;
-        if (adminConsole != null) adminConsole.setMetrics(metrics);
+        if (adminConsole != null) {
+            adminConsole.setOperations(operations);
+            adminConsole.setMetrics(metrics);
+            adminConsole.setDiagnostics(diagnostics);
+            adminConsole.setBucketActivity(bucketActivity);
+            adminConsole.setIdentities(authentication.identities());
+            adminConsole.setManagedCredentials(managedCredentials, this::refreshManagedCredentials);
+            adminConsole.setAccessCheck((principal, operation, bucket, key) ->
+                new AdminAccessCheck(store, access, keyScopes, authentication.identities(),
+                    managedCredentials).check(principal, operation, bucket, key));
+        }
+    }
+
+    void setBucketActivity(BucketActivity bucketActivity) {
+        this.bucketActivity = bucketActivity;
+        if (adminConsole != null) adminConsole.setBucketActivity(bucketActivity);
+    }
+
+    void setManagedCredentials(ManagedCredentials managedCredentials) {
+        this.managedCredentials = managedCredentials;
+        refreshManagedCredentials();
+        if (adminConsole != null)
+            adminConsole.setManagedCredentials(managedCredentials, this::refreshManagedCredentials);
+    }
+
+    private synchronized void refreshManagedCredentials() {
+        ManagedCredentials managed = managedCredentials;
+        if (managed == null) return;
+        access.setManagedPolicies(managed.policies());
+        authentication.setManagedIdentities(managed.identities());
+        if (adminConsole != null) adminConsole.setIdentities(authentication.identities());
     }
 
     void handle(HttpExchange exchange) throws IOException {
@@ -113,6 +154,7 @@ public final class Main {
         TrafficMeter traffic = null;
         ClientLimits.Client client = null;
         String requestId = UUID.randomUUID().toString();
+        RequestContext context = new RequestContext();
         exchange.getResponseHeaders().set("x-amz-request-id", requestId);
         exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
         try {
@@ -132,8 +174,9 @@ public final class Main {
             admitted = slots.tryAcquire();
             if (!admitted) throw new StoreException(503, "SlowDown", "Too many concurrent requests");
             if (cors.preflight(exchange)) return;
-            if (handleStatus(exchange)) return;
-            dispatch(exchange);
+            operations.read(() -> {
+                if (!handleStatus(exchange)) dispatch(exchange, context);
+            });
         } catch (StoreException error) {
             sendStoreError(exchange, error, requestId);
         } catch (Exception error) {
@@ -146,15 +189,20 @@ public final class Main {
                 clientLimits.leave(client);
                 long elapsed = System.nanoTime() - started;
                 metrics.record(exchange.getResponseCode(), elapsed);
-                if (dataStarted)
+                if (dataStarted) {
                     metrics.dataFinished(exchange.getResponseCode(), elapsed,
                         traffic.inbound(), traffic.outbound());
+                    if (adminConsole != null) diagnostics.record(requestId,
+                        context.operation, context.bucket, exchange.getResponseCode(), elapsed,
+                        context.principal);
+                }
             }
         }
     }
 
     void handleAdmin(HttpExchange exchange) throws IOException {
         boolean admitted = false;
+        boolean streaming = false;
         try {
             String path = exchange.getRequestURI().getRawPath();
             if (adminConsole == null ||
@@ -162,29 +210,31 @@ public final class Main {
                 exchange.sendResponseHeaders(404, -1);
                 return;
             }
-            admitted = adminSlots.tryAcquire();
+            streaming = path.equals(AdminConsole.PATH + "/performance.events");
+            admitted = (streaming ? adminStreams : adminSlots).tryAcquire();
             if (!admitted) {
                 exchange.sendResponseHeaders(503, -1);
                 return;
             }
             adminConsole.handle(exchange);
         } catch (StoreException error) {
-            exchange.sendResponseHeaders(error.status, -1);
+            if (exchange.getResponseCode() <= 0) exchange.sendResponseHeaders(error.status, -1);
         } catch (Exception error) {
             System.err.println("ObjectStore admin request failed: " + error.getClass().getSimpleName());
-            exchange.sendResponseHeaders(500, -1);
+            if (exchange.getResponseCode() <= 0) exchange.sendResponseHeaders(500, -1);
         } finally {
             exchange.close();
-            if (admitted) adminSlots.release();
+            if (admitted) (streaming ? adminStreams : adminSlots).release();
         }
     }
 
-    private void dispatch(HttpExchange exchange) throws IOException {
+    private void dispatch(HttpExchange exchange, RequestContext context) throws IOException {
         SigV4.Verified verified = anonymousRead(exchange)
             ? new SigV4.Verified("UNSIGNED-PAYLOAD", exchange.getRequestURI().getRawQuery(),
                 null, null, null, null, null)
             : authentication.verifyRequest(exchange.getRequestMethod(),
                 exchange.getRequestURI(), exchange.getRequestHeaders());
+        context.principal = verified.principal();
         String path = SigV4.decode(exchange.getRequestURI().getRawPath());
         Map<String, String> query = S3Request.query(verified.applicationQuery());
         if (path.equals(CAPABILITIES_PATH)) {
@@ -209,18 +259,40 @@ public final class Main {
         int slash = path.indexOf('/', 1);
         String requestedBucket = hostBucket == null ?
             (slash < 0 ? path.substring(1) : path.substring(1, slash)) : hostBucket;
+        context.bucket = requestedBucket;
+        context.operation = (hostBucket != null ? path.equals("/") : slash < 0 ||
+            slash == path.length() - 1) ? "Bucket " + exchange.getRequestMethod() :
+            "Object " + exchange.getRequestMethod();
         if (requestedBucket.isEmpty()) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
         if (hostBucket != null ? path.equals("/") : slash < 0 || slash == path.length() - 1) {
-            keyScopes.checkBucket(verified.principal(), requestedBucket, exchange.getRequestMethod(), query);
+            ManagedCredentials managed = managedScope(verified.principal());
+            if (managed != null)
+                managed.checkBucket(verified.principal(), requestedBucket, exchange.getRequestMethod(), query);
+            else keyScopes.checkBucket(verified.principal(), requestedBucket, exchange.getRequestMethod(), query);
             bucketHandler.handleBucket(exchange, query, verified.payload(), requestedBucket, verified.principal());
         } else {
             store.bucket(requestedBucket);
             String key = hostBucket == null ? path.substring(slash + 1) : path.substring(1);
-            keyScopes.checkObject(verified.principal(), requestedBucket, key,
+            ManagedCredentials managed = managedScope(verified.principal());
+            if (managed != null)
+                managed.checkObject(verified.principal(), requestedBucket, key,
+                    exchange.getRequestMethod(), query, exchange.getRequestHeaders());
+            else keyScopes.checkObject(verified.principal(), requestedBucket, key,
                 exchange.getRequestMethod(), query, exchange.getRequestHeaders());
             objectHandler.handleObject(exchange, key,
                 query, verified, requestedBucket);
         }
+        BucketActivity activity = bucketActivity;
+        if (activity != null && exchange.getResponseCode() > 0 && exchange.getResponseCode() < 400)
+            activity.record(requestedBucket, exchange.getRequestMethod());
+    }
+
+    private ManagedCredentials managedScope(String principal) {
+        if (principal == null || authentication.configuredIdentity(principal)) return null;
+        ManagedCredentials managed = managedCredentials;
+        if (managed == null || !managed.contains(principal))
+            throw new StoreException(403, "AccessDenied", "Access denied");
+        return managed;
     }
 
     private static String validateVirtualHostSuffix(String value) {

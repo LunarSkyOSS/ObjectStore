@@ -115,12 +115,23 @@ final class BucketPolicy {
     }
 
     private static boolean glob(String pattern, String text) {
-        int p = 0, t = 0, star = -1, retry = 0;
+        int p = 0;
+        int t = 0;
+        int star = -1;
+        int retry = 0;
         while (t < text.length()) {
-            if (p < pattern.length() && pattern.charAt(p) == text.charAt(t)) { p++; t++; }
-            else if (p < pattern.length() && pattern.charAt(p) == '*') { star = p++; retry = t; }
-            else if (star >= 0) { p = star + 1; t = ++retry; }
-            else return false;
+            if (p < pattern.length() && pattern.charAt(p) == text.charAt(t)) {
+                p++;
+                t++;
+            } else if (p < pattern.length() && pattern.charAt(p) == '*') {
+                star = p++;
+                retry = t;
+            } else if (star >= 0) {
+                p = star + 1;
+                t = ++retry;
+            } else {
+                return false;
+            }
         }
         while (p < pattern.length() && pattern.charAt(p) == '*') p++;
         return p == pattern.length();
@@ -190,7 +201,10 @@ final class BucketPolicy {
                 char c = input.charAt(index++);
                 if (c == '"') return result.toString();
                 if (c < 0x20) throw invalid();
-                if (c != '\\') { result.append(c); continue; }
+                if (c != '\\') {
+                    result.append(c);
+                    continue;
+                }
                 if (index == input.length()) throw invalid();
                 char escape = input.charAt(index++);
                 switch (escape) {
@@ -217,7 +231,10 @@ final class BucketPolicy {
         }
 
         private boolean take(char expected) {
-            if (index < input.length() && input.charAt(index) == expected) { index++; return true; }
+            if (index < input.length() && input.charAt(index) == expected) {
+                index++;
+                return true;
+            }
             return false;
         }
 

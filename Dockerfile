@@ -9,12 +9,20 @@ COPY lib/hash4j-0.30.0.jar /tmp/hash4j.jar
 RUN echo 'd3224b113ea835ce3452097747e5209ec760cf443dbed770d6ba68a0d480178f  /tmp/hash4j.jar' | sha256sum -c -
 RUN mkdir /out && javac --release 21 --add-modules jdk.httpserver,java.net.http -cp /tmp/hash4j.jar -d /out src/cloud/lunarsky/store/*.java test/cloud/lunarsky/store/*.java
 RUN java --add-modules jdk.httpserver -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.StoreTest
+RUN java --add-modules jdk.httpserver -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.DiskBucketNamesTest
+RUN java --add-modules jdk.httpserver -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.ConditionalEditTest
+RUN java -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.ClusterRepairCliTest
 RUN java --add-modules jdk.httpserver -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.ConcurrencyTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.HttpTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.ClientLimitsTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.AdminConsoleTest
+RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.RequestCoordinationTest
+RUN java -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.RequestDiagnosticsTest
+RUN java -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.BucketActivityTest
+RUN java --add-modules jdk.httpserver -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.AdminOperationsTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.FeatureTest
 RUN java -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.EncryptedVolumeTest
+RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.NodeHttpTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.ClusterNodeTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.ClusterTlsTest
 RUN java -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.CliTest

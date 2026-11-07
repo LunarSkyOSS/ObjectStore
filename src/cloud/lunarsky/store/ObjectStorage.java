@@ -92,6 +92,10 @@ interface ObjectStorage extends AutoCloseable {
                          String checksum, boolean createOnly, String contentType) throws IOException {
         return put(bucket, key, input, length, expectedHash, checksum, createOnly, contentType, Map.of(), Map.of());
     }
+    default Metadata replaceVersion(String bucket, String key, byte[] content, Metadata expected)
+            throws IOException {
+        throw new StoreException(501, "NotImplemented", "Conditional object editing is unavailable");
+    }
     OpenObject open(String bucket, String key) throws IOException;
     default OpenObject open(String bucket, String key, String versionId) throws IOException {
         if (versionId == null) return open(bucket, key);
@@ -126,6 +130,9 @@ interface ObjectStorage extends AutoCloseable {
     Bucket bucket(String bucket) throws IOException;
     List<Bucket> buckets() throws IOException;
     void createBucket(String bucket) throws IOException;
+    default void renameBucket(String bucket, String newName) throws IOException {
+        throw new StoreException(501, "NotImplemented", "Bucket rename is unavailable");
+    }
     void deleteBucket(String bucket) throws IOException;
     void setBucketAcl(String bucket, Map<String, String> acl) throws IOException;
     void setBucketOwnership(String bucket, ObjectOwnership ownership) throws IOException;

@@ -21,7 +21,6 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -29,16 +28,22 @@ import java.util.UUID;
 
 final class ClusterStore implements ObjectStorage, MultipartStorage {
     private record Segment(UUID id, int length, byte[] hash, List<UUID> replicas) {}
-    private record RepairTarget(UUID id, int part, int ordinal, long version, Segment segment) {}
     private record Upload(String contentType, Map<String, String> userMetadata,
                           Map<String, String> tags, Map<String, String> acl) {}
     private record StoredPart(long length, String etag, List<Segment> segments) {}
     record RepairReport(int scanned, int restored, int rebalanced, int underReplicated, int unrecoverable) {}
+    record RepairStatus(long startedAt, long updatedAt, long finishedAt, String state,
+                        RepairReport report) {}
+    record NodeStatus(NodeClient.Node node, boolean reachable) {}
+    record ClusterStatus(boolean metadataWritable, List<NodeStatus> nodes,
+                         int omittedNodes, RepairStatus repair,
+                         Map<UUID, Long> verifiedReplicas, long checkedAt) {}
     record GcReport(int scanned, int eligible, int deleted, int unavailableNodes) {}
-    private final String jdbcUrl, user, password, configuredBucket;
+    private final String jdbcUrl, user, password;
     private final NodeClient nodes;
     private final long maxObject, maxTotal;
     private final boolean testNodeDomains;
+    private final ClusterMonitor monitor;
 
     ClusterStore(String jdbcUrl, String user, String password, String bucket,
                  List<URI> nodeUrls, String token, String repairToken, long maxObject, long maxTotal,
@@ -50,7 +55,6 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         this.jdbcUrl = jdbcUrl;
         this.user = user;
         this.password = password;
-        this.configuredBucket = bucket;
         this.maxObject = maxObject;
         this.maxTotal = maxTotal;
         this.testNodeDomains = testNodeDomains;
@@ -58,6 +62,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
             int format = SchemaMigrator.prepare(connection, bucket);
             if (format != 2) throw new IOException("Legacy replica positions require objectstore cluster-migrate before this gateway can start");
             nodes = NodeRegistry.load(connection, nodeUrls, token, repairToken);
+            monitor = new ClusterMonitor(this::connect, nodes);
         } catch (SQLException error) { throw databaseError(error); }
     }
 
@@ -268,6 +273,60 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
         } catch (SQLException error) { throw databaseError(error); }
     }
 
+    @Override public void renameBucket(String oldName, String newName) throws IOException {
+        if (newName == null || !newName.matches("[a-z0-9][a-z0-9-]{1,61}[a-z0-9]"))
+            throw new StoreException(400, "InvalidBucketName", "Invalid bucket name");
+        if (oldName.equals(newName))
+            throw new StoreException(400, "InvalidArgument", "Choose a different name");
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                try (var lock = connection.createStatement()) {
+                    lock.execute("SELECT pg_advisory_xact_lock(6834071092784)");
+                    lock.execute("LOCK TABLE cluster_usage, cluster_buckets, cluster_objects, " +
+                        "cluster_tombstones, cluster_object_versions, cluster_object_heads, " +
+                        "cluster_uploads IN ACCESS EXCLUSIVE MODE");
+                }
+                lockUsage(connection, oldName);
+                try (PreparedStatement check = connection.prepareStatement(
+                    "SELECT EXISTS (SELECT 1 FROM cluster_buckets WHERE name=?)")) {
+                    check.setString(1, newName);
+                    try (ResultSet result = check.executeQuery()) {
+                        result.next();
+                        if (result.getBoolean(1))
+                            throw new StoreException(409, "BucketAlreadyExists", "Bucket name is already in use");
+                    }
+                }
+                try (PreparedStatement update = connection.prepareStatement(
+                    "UPDATE cluster_buckets SET name=?, bucket_policy=" +
+                    "replace(replace(bucket_policy, ?, ?), ?, ?) WHERE name=?")) {
+                    update.setString(1, newName);
+                    update.setString(2, "arn:aws:s3:::" + oldName + "/");
+                    update.setString(3, "arn:aws:s3:::" + newName + "/");
+                    update.setString(4, "arn:aws:s3:::" + oldName + "\"");
+                    update.setString(5, "arn:aws:s3:::" + newName + "\"");
+                    update.setString(6, oldName);
+                    if (update.executeUpdate() != 1)
+                        throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+                }
+                for (String table : List.of("cluster_usage", "cluster_objects", "cluster_tombstones",
+                    "cluster_object_versions", "cluster_object_heads", "cluster_uploads")) {
+                    try (PreparedStatement update = connection.prepareStatement(
+                        "UPDATE " + table + " SET bucket=? WHERE bucket=?")) {
+                        update.setString(1, newName);
+                        update.setString(2, oldName);
+                        update.executeUpdate();
+                    }
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException error) {
+                connection.rollback();
+                if (error instanceof SQLException sql) throw databaseError(sql);
+                throw error;
+            }
+        } catch (SQLException error) { throw databaseError(error); }
+    }
+
     private static void lockGc(Connection connection, boolean shared) throws SQLException {
         try (var statement = connection.createStatement()) {
             statement.execute("SELECT pg_advisory_lock" + (shared ? "_shared" : "") + "(6834071092783)");
@@ -279,6 +338,24 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                                   Map<String, String> userMetadata, Map<String, String> tags,
                                   java.util.function.Supplier<Map<String, String>> checksums,
                                   Map<String, String> acl) throws IOException {
+        return put(bucket, key, input, length, expectedHash, checksum, createOnly, contentType,
+            userMetadata, tags, checksums, acl, null);
+    }
+
+    @Override public Metadata replaceVersion(String bucket, String key, byte[] content, Metadata expected)
+            throws IOException {
+        if (expected == null || expected.versionId() == null)
+            throw new StoreException(412, "PreconditionFailed", "Object has no stable version to replace");
+        return put(bucket, key, new ByteArrayInputStream(content), content.length, null, null, false,
+            expected.contentType(), expected.userMetadata(), expected.tags(), Map::of, expected.acl(),
+            expected);
+    }
+
+    private Metadata put(String bucket, String key, InputStream input, long length, String expectedHash,
+                         String checksum, boolean createOnly, String contentType,
+                         Map<String, String> userMetadata, Map<String, String> tags,
+                         java.util.function.Supplier<Map<String, String>> checksums,
+                         Map<String, String> acl, Metadata expected) throws IOException {
         validatePut(bucket, length, contentType);
         MessageDigest md5 = digest("MD5");
         Crc64Nvme crc64 = new Crc64Nvme();
@@ -295,7 +372,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                 Metadata metadata = new Metadata(length, Instant.now().toEpochMilli(),
                     HexFormat.of().formatHex(md5.digest()), fullHash, bucket, key, contentType,
                     Map.copyOf(userMetadata), Map.copyOf(tags), null, storedChecksums, Map.copyOf(acl));
-                return persistObject(connection, metadata, segments, createOnly);
+                return persistObject(connection, metadata, segments, createOnly, expected);
             } catch (SQLException error) { throw databaseError(error); }
         } finally { Files.deleteIfExists(staged); }
     }
@@ -384,7 +461,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     }
 
     private Metadata persistObject(Connection connection, Metadata metadata, List<Segment> segments,
-                                   boolean createOnly) throws IOException {
+                                   boolean createOnly, Metadata expected) throws IOException {
         String bucket = metadata.bucket(), key = metadata.key();
         long length = metadata.length();
         UUID generation = UUID.randomUUID();
@@ -393,6 +470,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
             try {
                 long used = lockUsage(connection, bucket);
                 VersioningState state = versioningState(connection, bucket);
+                if (expected != null) requireCurrentVersion(connection, bucket, key, state, expected);
                 long previous = currentLength(connection, bucket, key);
                 if (createOnly && previous >= 0)
                     throw new StoreException(412, "PreconditionFailed", "Object already exists");
@@ -416,12 +494,30 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
                 Metadata stored = publishObject(connection, metadata, generation, used, replaced, state);
                 connection.commit();
                 return stored;
-            } catch (SQLException | RuntimeException error) {
+            } catch (SQLException | IOException | RuntimeException error) {
                 connection.rollback();
                 if (error instanceof SQLException sql) throw databaseError(sql);
                 throw error;
             }
         } catch (SQLException error) { throw databaseError(error); }
+    }
+
+    private static void requireCurrentVersion(Connection connection, String bucket, String key,
+                                              VersioningState state, Metadata expected) throws SQLException, IOException {
+        try (PreparedStatement query = connection.prepareStatement(
+                "SELECT h.version_id, v.sha256, v.tags, v.acl FROM cluster_object_heads h JOIN cluster_object_versions v " +
+                "USING (bucket, object_key, version_id) WHERE h.bucket=? AND h.object_key=? AND NOT v.delete_marker")) {
+            query.setString(1, bucket);
+            query.setString(2, key);
+            try (ResultSet row = query.executeQuery()) {
+                if (state != VersioningState.ENABLED || !row.next() ||
+                    !expected.versionId().equals(row.getString(1)) ||
+                    !MessageDigest.isEqual(expected.sha256(), row.getBytes(2)) ||
+                    !expected.tags().equals(ObjectAttributes.decode(row.getBytes(3))) ||
+                    !expected.acl().equals(ObjectAttributes.decode(row.getBytes(4))))
+                    throw new StoreException(412, "PreconditionFailed", "Object changed since it was opened");
+            }
+        }
     }
 
     private static long nullVersionLength(Connection connection, String bucket, String key) throws SQLException {
@@ -763,8 +859,7 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
 
     @Override public int activeUploads() {
         try (Connection connection = connect(); PreparedStatement query = connection.prepareStatement(
-            "SELECT count(*) FROM cluster_uploads WHERE bucket=?")) {
-            query.setString(1, configuredBucket);
+            "SELECT count(*) FROM cluster_uploads")) {
             try (ResultSet result = query.executeQuery()) {
                 result.next();
                 return result.getInt(1);
@@ -773,8 +868,11 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
     }
 
     @Override public long stagedBytes() {
-        try (Connection connection = connect()) { return stagedBytes(connection, configuredBucket); }
-        catch (SQLException error) { throw new IllegalStateException("Could not count staged bytes", error); }
+        try (Connection connection = connect(); var query = connection.createStatement();
+             ResultSet result = query.executeQuery("SELECT COALESCE(sum(length), 0) FROM cluster_upload_parts")) {
+            result.next();
+            return result.getLong(1);
+        } catch (SQLException error) { throw new IllegalStateException("Could not count staged bytes", error); }
     }
 
     @Override public OpenObject open(String bucket, String key) throws IOException {
@@ -1400,116 +1498,14 @@ final class ClusterStore implements ObjectStorage, MultipartStorage {
             return result.next() && result.getBoolean(1);
         } catch (SQLException error) { return false; }
     }
+    ClusterStatus status() { return monitor.status(); }
     RepairReport repairOnce() throws IOException {
-        int scanned = 0, restored = 0, rebalanced = 0, underReplicated = 0, unrecoverable = 0;
-        try (Connection reader = connect()) {
-            reader.setAutoCommit(false);
-            try (var lock = reader.createStatement()) {
-                lock.execute("SELECT pg_advisory_xact_lock(6834071092782)");
-            }
-            try (PreparedStatement query = reader.prepareStatement(
-                "SELECT s.generation, 0, s.ordinal, s.segment_id, s.length, s.sha256, s.replica_ids, s.placement_version " +
-                "FROM cluster_segments s JOIN cluster_object_versions o ON o.generation=s.generation " +
-                "UNION ALL SELECT s.upload_id, s.part_number, s.ordinal, s.segment_id, s.length, s.sha256, " +
-                "s.replica_ids, s.placement_version FROM cluster_upload_segments s " +
-                "ORDER BY 1, 2, 3")) {
-                query.setFetchSize(128);
-                try (ResultSet result = query.executeQuery()) {
-                    while (result.next()) {
-                        scanned++;
-                        RepairTarget target = new RepairTarget((UUID) result.getObject(1), result.getInt(2),
-                            result.getInt(3), result.getLong(8), new Segment((UUID) result.getObject(4),
-                                result.getInt(5), result.getBytes(6), replicaIds(result, 7)));
-                        Segment segment = target.segment();
-                        byte[] copy = null;
-                        Set<UUID> healthy = new LinkedHashSet<>();
-                        Set<UUID> healthyHosts = new HashSet<>();
-                        for (UUID id : segment.replicas()) {
-                            int node = nodes.index(id);
-                            if (node < 0) continue;
-                            byte[] candidate = readableReplica(node, segment);
-                            if (candidate == null) continue;
-                            if (copy == null) copy = candidate;
-                            healthy.add(id);
-                            healthyHosts.add(nodes.faultDomain(node, testNodeDomains));
-                        }
-                        if (copy == null) {
-                            unrecoverable++;
-                            continue;
-                        }
-                        List<UUID> preferred = new ArrayList<>();
-                        Set<UUID> preferredHosts = new HashSet<>();
-                        for (int node : PlacementPolicy.candidates(segment.id(), nodes, testNodeDomains)) {
-                            UUID host = nodes.faultDomain(node, testNodeDomains);
-                            if (!preferredHosts.add(host)) continue;
-                            preferred.add(nodes.node(node).id());
-                            if (preferred.size() == 3) break;
-                        }
-                        for (UUID id : preferred) {
-                            int node = nodes.index(id);
-                            UUID host = nodes.faultDomain(node, testNodeDomains);
-                            if (healthy.contains(id)) continue;
-                            if (repairReplica(node, segment, copy)) {
-                                healthy.add(id);
-                                healthyHosts.add(host);
-                                restored++;
-                            }
-                        }
-                        if (healthyHosts.size() < 3) underReplicated++;
-                        List<UUID> listed = new ArrayList<>();
-                        Set<UUID> listedHosts = new HashSet<>();
-                        for (UUID id : preferred) {
-                            if (healthy.contains(id)) {
-                                listed.add(id);
-                                listedHosts.add(nodes.faultDomain(nodes.index(id), testNodeDomains));
-                            }
-                        }
-                        for (UUID id : segment.replicas()) {
-                            if (listed.size() == 3) break;
-                            int node = nodes.index(id);
-                            if (healthy.contains(id) && node >= 0 &&
-                                listedHosts.add(nodes.faultDomain(node, testNodeDomains))) listed.add(id);
-                        }
-                        if (listed.size() < 3) {
-                            for (UUID id : segment.replicas()) {
-                                if (!listed.contains(id)) listed.add(id);
-                            }
-                        }
-                        if (!listed.equals(segment.replicas())) {
-                            String table = target.part() == 0 ? "cluster_segments" : "cluster_upload_segments";
-                            String identity = target.part() == 0 ? "generation=? AND ordinal=?" :
-                                "upload_id=? AND part_number=? AND ordinal=?";
-                            try (Connection writer = connect(); PreparedStatement update = writer.prepareStatement(
-                                "UPDATE " + table + " SET replica_ids=?, placement_version=placement_version+1 WHERE " +
-                                    identity + " AND placement_version=?")) {
-                                update.setArray(1, writer.createArrayOf("uuid", listed.toArray()));
-                                update.setObject(2, target.id());
-                                int next = 3;
-                                if (target.part() != 0) update.setInt(next++, target.part());
-                                update.setInt(next++, target.ordinal());
-                                update.setLong(next, target.version());
-                                if (update.executeUpdate() == 1 && preferred.stream().anyMatch(id ->
-                                    !segment.replicas().contains(id) && listed.contains(id))) rebalanced++;
-                            }
-                        }
-                    }
-                }
-            }
-            reader.commit();
-        } catch (SQLException error) { throw databaseError(error); }
-        return new RepairReport(scanned, restored, rebalanced, underReplicated, unrecoverable);
+        return new ClusterRepairPass(this::connect, nodes, testNodeDomains, monitor).run();
     }
 
     private byte[] readableReplica(int node, Segment segment) {
         try { return nodes.get(node, segment.id(), segment.length(), segment.hash()); }
         catch (IOException unavailable) { return null; }
-    }
-
-    private boolean repairReplica(int node, Segment segment, byte[] copy) {
-        try {
-            nodes.repair(node, segment.id(), copy, segment.hash());
-            return true;
-        } catch (IOException unavailable) { return false; }
     }
 
     GcReport collectGarbage(long minimumAgeMillis, boolean apply) throws IOException {

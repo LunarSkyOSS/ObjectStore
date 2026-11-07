@@ -25,6 +25,16 @@ public final class ClusterIntegrationTest {
             String bucket = env.get("S3_BUCKET");
             byte[] stable = "acknowledged object survives node loss".getBytes(StandardCharsets.UTF_8);
             switch (args[0]) {
+                case "status" -> {
+                    ClusterStore.ClusterStatus status = store.status();
+                    require(status.metadataWritable(), "Cluster status lost writable metadata primary");
+                    require(status.nodes().size() >= 3 &&
+                        status.nodes().stream().allMatch(ClusterStore.NodeStatus::reachable),
+                        "Cluster status missed reachable storage nodes");
+                    require(status.repair() != null && status.repair().report().scanned() >= 0,
+                        "Last repair report is missing");
+                    System.out.println("Cluster status test passed");
+                }
                 case "basic" -> {
                     byte[] large = new byte[ClusterNode.MAX_SEGMENT + 37];
                     for (int i = 0; i < large.length; i++) {

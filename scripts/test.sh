@@ -2,16 +2,25 @@
 set -eu
 cd "$(dirname "$0")/.."
 sh scripts/test-start-server.sh
+bash scripts/test-install.sh
 mkdir -p out/classes
 javac --release 21 --add-modules jdk.httpserver,java.net.http -cp lib/hash4j-0.30.0.jar -d out/classes \
   src/cloud/lunarsky/store/*.java test/cloud/lunarsky/store/*.java
 java --add-modules jdk.httpserver -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.StoreTest
+java --add-modules jdk.httpserver -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.DiskBucketNamesTest
+java --add-modules jdk.httpserver -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.ConditionalEditTest
+java -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.ClusterRepairCliTest
 java --add-modules jdk.httpserver -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.ConcurrencyTest
 java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.HttpTest
 java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.ClientLimitsTest
 java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.AdminConsoleTest
+java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.RequestCoordinationTest
+java -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.RequestDiagnosticsTest
+java -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.BucketActivityTest
+java --add-modules jdk.httpserver -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.AdminOperationsTest
 java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.FeatureTest
 java -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.EncryptedVolumeTest
+java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.NodeHttpTest
 java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.ClusterNodeTest
 java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.ClusterTlsTest
 java -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.CliTest

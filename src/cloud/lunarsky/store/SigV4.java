@@ -29,7 +29,8 @@ final class SigV4 {
     }
     private static final DateTimeFormatter DATE = DateTimeFormatter.ofPattern("uuuuMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
     private static final Pattern HEX = Pattern.compile("[0-9a-f]{64}");
-    private final Map<String, String> identities;
+    private final Map<String, String> configuredIdentities;
+    private volatile Map<String, String> identities;
     private final Map<String, SessionCredentials.Session> sessions;
     private final String root;
     private final String region;
@@ -45,7 +46,8 @@ final class SigV4 {
 
     SigV4(Map<String, String> identities, Map<String, SessionCredentials.Session> sessions,
           String root, String region, Clock clock) {
-        this.identities = Map.copyOf(identities);
+        this.configuredIdentities = Map.copyOf(identities);
+        this.identities = configuredIdentities;
         this.sessions = Map.copyOf(sessions);
         if (!this.identities.containsKey(root)) throw new IllegalArgumentException("Missing root identity");
         if (this.sessions.keySet().stream().anyMatch(this.identities::containsKey))
@@ -56,6 +58,17 @@ final class SigV4 {
     }
 
     String root() { return root; }
+    boolean configuredIdentity(String principal) {
+        return principal != null &&
+            (configuredIdentities.containsKey(principal) || sessions.containsKey(principal));
+    }
+    synchronized void setManagedIdentities(Map<String, String> managed) {
+        Map<String, String> combined = new java.util.HashMap<>(configuredIdentities);
+        for (var entry : managed.entrySet())
+            if (combined.putIfAbsent(entry.getKey(), entry.getValue()) != null || sessions.containsKey(entry.getKey()))
+                throw new IllegalArgumentException("Managed access key conflicts with a configured identity");
+        identities = Map.copyOf(combined);
+    }
     Set<String> identities() {
         var all = new java.util.HashSet<>(identities.keySet());
         all.addAll(sessions.keySet());

@@ -475,6 +475,24 @@ final class DiskStore implements ObjectStorage {
                  Map<String, String> userMetadata, Map<String, String> tags,
                  java.util.function.Supplier<Map<String, String>> checksums,
                  Map<String, String> acl) throws IOException {
+        return put(bucket, key, input, length, expectedHash, checksum, createOnly, contentType,
+            userMetadata, tags, checksums, acl, null);
+    }
+
+    @Override public Metadata replaceVersion(String bucket, String key, byte[] content, Metadata expected)
+            throws IOException {
+        if (expected == null || expected.versionId() == null)
+            throw new StoreException(412, "PreconditionFailed", "Object has no stable version to replace");
+        return put(bucket, key, new ByteArrayInputStream(content), content.length, null, null, false,
+            expected.contentType(), expected.userMetadata(), expected.tags(), Map::of, expected.acl(),
+            expected);
+    }
+
+    private Metadata put(String bucket, String key, InputStream input, long length, String expectedHash,
+                         String checksum, boolean createOnly, String contentType,
+                         Map<String, String> userMetadata, Map<String, String> tags,
+                         java.util.function.Supplier<Map<String, String>> checksums,
+                         Map<String, String> acl, Metadata expected) throws IOException {
         if (length < 0) throw new StoreException(411, "MissingContentLength", "Content-Length is required");
         if (length > maxObject) throw new StoreException(413, "EntityTooLarge", "Object exceeds the configured size limit");
         byte[] bucketBytes = bucket.getBytes(StandardCharsets.UTF_8);
@@ -488,7 +506,7 @@ final class DiskStore implements ObjectStorage {
             Metadata metadata = stagePut(pending, input, length, expectedHash, checksum,
                 bucket, key, contentType, bucketBytes, keyBytes, typeBytes,
                 metadataBytes, tagBytes, userMetadata, tags, checksums, acl);
-            return installPending(destination, pending, metadata, createOnly);
+            return installPending(destination, pending, metadata, createOnly, expected);
         } finally { Files.deleteIfExists(pending); }
     }
 
@@ -554,10 +572,19 @@ final class DiskStore implements ObjectStorage {
     }
 
     private Metadata installPending(Path destination, Path pending, Metadata metadata,
-                                    boolean createOnly) throws IOException {
+                                    boolean createOnly, Metadata expected) throws IOException {
         synchronized (lock(destination)) {
             synchronized (this) {
                 Bucket configured = buckets.get(metadata.bucket());
+                if (expected != null) {
+                    Metadata current = index.get(indexKey(metadata.bucket(), metadata.key()));
+                    if (configured == null || configured.versioning() != VersioningState.ENABLED ||
+                        current == null || !expected.versionId().equals(
+                            current.versionId() == null ? "null" : current.versionId()) ||
+                        !MessageDigest.isEqual(expected.sha256(), current.sha256()) ||
+                        !expected.tags().equals(current.tags()) || !expected.acl().equals(current.acl()))
+                        throw new StoreException(412, "PreconditionFailed", "Object changed since it was opened");
+                }
                 if (configured != null && configured.versioning() != VersioningState.NEVER)
                     return installVersionedPending(destination, pending, metadata, createOnly,
                         configured.versioning());

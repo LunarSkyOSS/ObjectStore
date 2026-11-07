@@ -121,6 +121,15 @@ public final class FeatureTest {
             status(200, client.send(HttpTest.signedUriAs(ownReadable,
                 "GET", new byte[0], Map.of(), LIMITED, LIMITED_SECRET), HttpResponse.BodyHandlers.ofString()));
             var trafficAfter = metrics.dataSnapshot();
+            long metricsDeadline = System.nanoTime() + 2_000_000_000L;
+            while (System.nanoTime() < metricsDeadline &&
+                   (trafficAfter.requests() - trafficBefore.requests() < 2 ||
+                    trafficAfter.inboundBytes() - trafficBefore.inboundBytes() < content.length ||
+                    trafficAfter.outboundBytes() - trafficBefore.outboundBytes() < content.length ||
+                    trafficAfter.inFlight() != 0)) {
+                Thread.sleep(10);
+                trafficAfter = metrics.dataSnapshot();
+            }
             if (trafficAfter.requests() - trafficBefore.requests() != 2 ||
                 trafficAfter.inboundBytes() - trafficBefore.inboundBytes() < content.length ||
                 trafficAfter.outboundBytes() - trafficBefore.outboundBytes() < content.length ||

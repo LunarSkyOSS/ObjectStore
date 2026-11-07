@@ -28,6 +28,7 @@ final class ObjectStoreServer {
         String mode = env.getOrDefault("STORE_MODE", "disk");
         ObjectStorage store;
         MultipartStorage multipart;
+        DiskStore disk = null;
         if (mode.equals("cluster")) {
             if (!"true".equals(env.get("CLUSTER_LOCAL_DEV")))
                 throw new IllegalArgumentException("Cluster mode is local development only; set CLUSTER_LOCAL_DEV=true");
@@ -39,9 +40,10 @@ final class ObjectStoreServer {
                 maxObject, maxTotal, "true".equals(env.get("CLUSTER_TEST_NODE_DOMAINS")));
             multipart = (ClusterStore) store;
         } else if (mode.equals("disk")) {
-            DiskStore disk = new DiskStore(Path.of(env.getOrDefault("DATA_DIR", "/data")), maxObject, maxTotal);
-            store = disk;
-            multipart = new MultipartStore(disk);
+            disk = new DiskStore(Path.of(env.getOrDefault("DATA_DIR", "/data")), maxObject, maxTotal);
+            DiskBucketNames names = new DiskBucketNames(disk, new MultipartStore(disk));
+            store = names;
+            multipart = names;
         } else throw new IllegalArgumentException("Invalid STORE_MODE");
         Map<String, String> identities = identities(env, access, secret);
         var sessions = SessionCredentials.fromEnvironment(env, identities.keySet());
@@ -55,7 +57,14 @@ final class ObjectStoreServer {
             new RequestMetrics(env.get("METRICS_BEARER_TOKEN")),
             IdentityPolicies.fromEnvironment(env, access, allIdentities),
             publicEndpoint(env));
+        BucketActivity bucketActivity = "true".equals(env.get("ADMIN_UI_ENABLED")) ?
+            new BucketActivity(Path.of(env.getOrDefault("ADMIN_UI_STATE_DIR",
+                env.getOrDefault("DATA_DIR", "/data")), "bucket-activity.tsv")) : null;
+        if (bucketActivity != null) app.setBucketActivity(bucketActivity);
+        app.setManagedCredentials(ManagedCredentials.fromEnvironment(env,
+            disk == null ? store : disk, allIdentities));
         AdminConsole adminConsole = AdminConsole.fromEnvironment(env, store);
+        if (adminConsole != null) adminConsole.setDiskStore(disk);
         app.setAdminConsole(adminConsole);
         int port = Integer.parseInt(env.getOrDefault("PORT", "9000"));
         int adminPort = adminConsole == null ? 0 : positiveInt(env, "ADMIN_UI_PORT", 9001, 65535);
@@ -77,12 +86,13 @@ final class ObjectStoreServer {
             server.stop(5);
             if (adminServer != null) adminServer.stop(5);
             executor.close();
+            if (bucketActivity != null) bucketActivity.close();
             try { store.close(); }
             catch (IOException error) { System.err.println("Could not release ObjectStore data lock: " + error.getMessage()); }
         }));
         server.start();
         if (adminServer != null) adminServer.start();
-        if (store instanceof DiskStore disk) printStartup(disk, multipart, bucket, region, port);
+        if (disk != null) printStartup(disk, multipart, bucket, region, port);
         else System.out.println("ObjectStore local cluster prototype v" + Version.VALUE + " listening on :" + port);
         if (adminServer != null) System.out.println("ObjectStore admin listening on :" + adminPort);
     }

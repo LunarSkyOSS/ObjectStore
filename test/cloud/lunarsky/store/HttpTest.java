@@ -318,6 +318,14 @@ public final class HttpTest {
         if (!java.util.Arrays.equals(body, read.body())) throw new AssertionError("Streaming upload mismatch");
         status(204, client.send(signedUri(object, "DELETE", new byte[0], Map.of()),
             HttpResponse.BodyHandlers.ofByteArray()));
+        for (String size : new String[] {"8000000000000000", "ffffffffffffffff"}) {
+            byte[] oversized = (size + ";chunk-signature=" + "0".repeat(64) + "\r\n")
+                .getBytes(StandardCharsets.US_ASCII);
+            status(400, client.send(request.PUT(HttpRequest.BodyPublishers.ofByteArray(oversized))
+                .build(), HttpResponse.BodyHandlers.ofByteArray()));
+        }
+        status(404, client.send(signedUri(object, "GET", new byte[0], Map.of()),
+            HttpResponse.BodyHandlers.ofByteArray()));
     }
 
     private static void testStreamingTrailer(HttpClient client, String base) throws Exception {

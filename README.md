@@ -54,7 +54,21 @@ Versioning supports enabled and suspended states. Old versions and delete marker
 
 ## Single-node setup
 
-Requires Docker Compose. Copy `.env.example` to `.env`, then set `S3_ACCESS_KEY` and `S3_SECRET_KEY` to unique values. The access key must be at least 16 alphanumeric characters; the secret must be at least 32 characters.
+Requires Docker Compose and OpenSSL. From a fresh checkout, one command creates local credentials, enables the loopback-only admin console, and starts the service:
+
+```sh
+bash scripts/install.sh
+```
+
+For a new machine, clone and install in one shell line:
+
+```sh
+git clone https://github.com/LunarSkyOSS/ObjectStore.git objectstore && cd objectstore && bash scripts/install.sh
+```
+
+The installer supports the stock single-node Compose stack and keeps existing `.env`, secrets, and Docker data volumes on reruns. It refuses encrypted storage, existing data bind mounts, and extra Compose overlays; update those deployments using their original Compose command. Credentials are in `.env` and `secrets/admin-password`; keep `secrets/managed-master` for recovery. Review [admin access and key management](OPERATIONS.md#local-admin-console) before binding the console to a VPN interface.
+
+For manual setup, copy `.env.example` to `.env`, then set `S3_ACCESS_KEY` and `S3_SECRET_KEY` to unique values. The access key must be at least 16 alphanumeric characters; the secret must be at least 32 characters.
 
 ```sh
 cp .env.example .env
@@ -64,7 +78,7 @@ curl http://127.0.0.1:9000/health
 
 Port 9000 binds to localhost. Data stays in the `object-data` Docker volume. `docker compose down -v` deletes that volume.
 
-The optional [local admin console](OPERATIONS.md#local-admin-console) has bucket and live performance views, its own password, and is disabled by default.
+The optional [local admin console](OPERATIONS.md#local-admin-console) manages buckets, ACLs, policies, scoped keys, bulk jobs, access checks, and live performance. It has its own password and is disabled in the base Compose stack.
 
 The standalone defaults are 128 MiB per object and 2 GiB total. Set `MAX_OBJECT_BYTES` and `MAX_TOTAL_BYTES` in `.env` to change them. Incomplete multipart uploads consume space until aborted.
 

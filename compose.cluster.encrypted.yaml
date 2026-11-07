@@ -25,6 +25,11 @@ services:
         target: /tmp
         bind:
           create_host_path: false
+      - type: bind
+        source: ${ENCRYPTED_STORAGE_ROOT:?Set ENCRYPTED_STORAGE_ROOT}/cluster/gateway-admin
+        target: /data
+        bind:
+          create_host_path: false
 
   metadata:
     environment:

@@ -1,7 +1,6 @@
 package cloud.lunarsky.store;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -76,18 +75,11 @@ final class NodeClient {
         HttpRequest request = HttpRequest.newBuilder(url.resolve("/identity"))
             .timeout(Duration.ofSeconds(2)).header("X-Cluster-Token", token).GET().build();
         try {
-            HttpResponse<InputStream> response = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
-            try (InputStream body = response.body()) {
-                if (response.statusCode() != 200) throw new IOException("Node identity request failed: " + response.statusCode());
-                byte[] bytes = body.readNBytes(128);
-                if (bytes.length == 128) throw new IOException("Node identity response is too large");
-                String[] parts = new String(bytes, java.nio.charset.StandardCharsets.US_ASCII).trim().split(" ", -1);
-                if (parts.length != 2) throw new IOException("Invalid node identity response");
-                return new NodeIdentity(UUID.fromString(parts[0]), UUID.fromString(parts[1]));
-            }
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted during node identity request", error);
+            HttpResponse<byte[]> response = NodeHttp.bytes(http, request, 127);
+            if (response.statusCode() != 200) throw new IOException("Node identity request failed: " + response.statusCode());
+            String[] parts = new String(response.body(), java.nio.charset.StandardCharsets.US_ASCII).trim().split(" ", -1);
+            if (parts.length != 2) throw new IOException("Invalid node identity response");
+            return new NodeIdentity(UUID.fromString(parts[0]), UUID.fromString(parts[1]));
         } catch (IllegalArgumentException error) {
             throw new IOException("Invalid node identity response", error);
         }
@@ -96,6 +88,12 @@ final class NodeClient {
     static NodeIdentity probeIfAvailable(URI url, String token) {
         try { return probe(url, token); }
         catch (IOException offline) { return null; }
+    }
+
+    boolean reachable(Node node) {
+        NodeIdentity actual = probeIfAvailable(node.url(), token, http);
+        return actual != null && actual.nodeId().equals(node.id()) &&
+            actual.hostId().equals(node.hostId());
     }
 
     private static NodeIdentity probeIfAvailable(URI url, String token, HttpClient http) {
@@ -176,8 +174,8 @@ final class NodeClient {
                 throw new IOException("Repair authority is not available to this process");
             builder.header("X-Cluster-Repair", "true").header("X-Cluster-Repair-Token", repairToken);
         }
-        HttpResponse<Void> response = send(builder.PUT(HttpRequest.BodyPublishers.ofByteArray(data)).build(),
-            HttpResponse.BodyHandlers.discarding());
+        HttpResponse<Void> response = NodeHttp.discard(http,
+            builder.PUT(HttpRequest.BodyPublishers.ofByteArray(data)).build());
         if (response.statusCode() != 200) throw new IOException("Node " + node.id() + " rejected segment: " + response.statusCode());
     }
 
@@ -196,22 +194,15 @@ final class NodeClient {
         HttpRequest request = HttpRequest.newBuilder(node.url().resolve("/segments/" + id))
             .timeout(Duration.ofSeconds(30)).header("X-Cluster-Token", token)
             .header("X-Cluster-Expected-Node", node.id().toString()).GET().build();
-        HttpResponse<InputStream> response;
-        try { response = send(request, HttpResponse.BodyHandlers.ofInputStream()); }
+        HttpResponse<byte[]> response;
+        try { response = NodeHttp.bytes(http, request, length + 1); }
         catch (IOException error) {
             markUnreadable(node);
             throw error;
         }
-        if (response.statusCode() != 200) {
-            response.body().close();
+        if (response.statusCode() != 200)
             throw new IOException("Node " + node.id() + " has no verified copy of segment " + id);
-        }
-        byte[] bytes;
-        try (InputStream body = response.body()) { bytes = body.readNBytes(length + 1); }
-        catch (IOException error) {
-            markUnreadable(node);
-            throw error;
-        }
+        byte[] bytes = response.body();
         if (bytes.length != length || !MessageDigest.isEqual(SigV4.hash(bytes), sha256))
             throw new IOException("Node " + node.id() + " has no verified copy of segment " + id);
         unreadableUntil.remove(node.id());
@@ -228,31 +219,28 @@ final class NodeClient {
             .timeout(Duration.ofSeconds(30)).header("X-Cluster-Token", token)
             .header("X-Cluster-Expected-Node", node.id().toString())
             .header("X-Cluster-Repair-Token", repairToken).GET().build();
-        HttpResponse<InputStream> response = send(request, HttpResponse.BodyHandlers.ofInputStream());
-        try (InputStream body = response.body()) {
-            if (response.statusCode() != 200) throw new IOException("Node inventory failed: " + response.statusCode());
-            byte[] bytes = body.readNBytes(70001);
-            if (bytes.length > 70000) throw new IOException("Node inventory response is too large");
-            List<StoredSegment> result = new ArrayList<>();
-            String last = after == null ? "" : after.toString();
-            for (String line : new String(bytes, java.nio.charset.StandardCharsets.US_ASCII).split("\n")) {
-                if (line.isEmpty()) continue;
-                String[] fields = line.split(" ", -1);
-                if (fields.length != 2) throw new IOException("Invalid node inventory response");
-                try {
-                    UUID id = UUID.fromString(fields[0]);
-                    if (!id.toString().equals(fields[0]) || !fields[0].startsWith(shard) ||
-                        fields[0].compareTo(last) <= 0)
-                        throw new IOException("Invalid node inventory cursor");
-                    result.add(new StoredSegment(id, Long.parseLong(fields[1])));
-                    last = fields[0];
-                } catch (IllegalArgumentException error) {
-                    throw new IOException("Invalid node inventory response", error);
-                }
+        HttpResponse<byte[]> response = NodeHttp.bytes(http, request, 70000);
+        if (response.statusCode() != 200) throw new IOException("Node inventory failed: " + response.statusCode());
+        byte[] bytes = response.body();
+        List<StoredSegment> result = new ArrayList<>();
+        String last = after == null ? "" : after.toString();
+        for (String line : new String(bytes, java.nio.charset.StandardCharsets.US_ASCII).split("\n")) {
+            if (line.isEmpty()) continue;
+            String[] fields = line.split(" ", -1);
+            if (fields.length != 2) throw new IOException("Invalid node inventory response");
+            try {
+                UUID id = UUID.fromString(fields[0]);
+                if (!id.toString().equals(fields[0]) || !fields[0].startsWith(shard) ||
+                    fields[0].compareTo(last) <= 0)
+                    throw new IOException("Invalid node inventory cursor");
+                result.add(new StoredSegment(id, Long.parseLong(fields[1])));
+                last = fields[0];
+            } catch (IllegalArgumentException error) {
+                throw new IOException("Invalid node inventory response", error);
             }
-            if (result.size() > 1000) throw new IOException("Node inventory page is too large");
-            return result;
         }
+        if (result.size() > 1000) throw new IOException("Node inventory page is too large");
+        return result;
     }
 
     boolean deleteOrphan(int index, StoredSegment segment, long minimumAgeMillis) throws IOException {
@@ -266,17 +254,10 @@ final class NodeClient {
             .header("X-Cluster-Expected-Mtime", Long.toString(segment.modified()))
             .header("X-Cluster-Gc-Min-Age-Millis", Long.toString(minimumAgeMillis))
             .DELETE().build();
-        HttpResponse<Void> response = send(request, HttpResponse.BodyHandlers.discarding());
+        HttpResponse<Void> response = NodeHttp.discard(http, request);
         if (response.statusCode() == 204) return true;
         if (response.statusCode() == 404 || response.statusCode() == 409) return false;
         throw new IOException("Node refused orphan deletion: " + response.statusCode());
     }
 
-    private <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) throws IOException {
-        try { return http.send(request, handler); }
-        catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted during node request", error);
-        }
-    }
 }

@@ -4,7 +4,7 @@ set -eu
 mode=${1:-}
 case "$mode" in
   single) directories='single' ;;
-  cluster) directories='cluster/gateway-staging cluster/metadata cluster/metadata-recovery cluster/repair-staging cluster/gc-staging cluster/maintenance-staging cluster/node-a cluster/node-b cluster/node-c cluster/node-d' ;;
+  cluster) directories='cluster/gateway-staging cluster/gateway-admin cluster/metadata cluster/metadata-recovery cluster/repair-staging cluster/gc-staging cluster/maintenance-staging cluster/node-a cluster/node-b cluster/node-c cluster/node-d' ;;
   *) echo 'Usage: prepare-encrypted-storage.sh single|cluster [environment-file]' >&2; exit 2 ;;
 esac
 

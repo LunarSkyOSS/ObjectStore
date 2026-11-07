@@ -103,7 +103,8 @@ final class AwsChunkedInputStream extends FilterInputStream {
             throw invalid("Invalid signed chunk header");
         try { chunkLeft = Long.parseUnsignedLong(size, 16); }
         catch (NumberFormatException error) { throw invalid("Invalid signed chunk size"); }
-        if (chunkLeft > decodedLength - decoded) throw invalid("Signed chunks exceed decoded length");
+        if (chunkLeft < 0 || chunkLeft > decodedLength - decoded)
+            throw invalid("Signed chunks exceed decoded length");
         chunkHash.reset();
         if (chunkLeft == 0) finishPayload();
     }

@@ -21,7 +21,7 @@ final class SchemaMigrator {
                     result.next();
                     version = result.getInt(1);
                 }
-                if (version > 11) throw new IOException("Metadata schema is newer than this ObjectStore build");
+                if (version > 14) throw new IOException("Metadata schema is newer than this ObjectStore build");
                 if (version < 1) {
                     statement.execute("CREATE TABLE IF NOT EXISTS cluster_usage (bucket text PRIMARY KEY, used_bytes bigint NOT NULL CHECK (used_bytes >= 0))");
                     statement.execute("CREATE TABLE IF NOT EXISTS cluster_objects (bucket text NOT NULL, object_key text COLLATE \"C\" NOT NULL, generation uuid NOT NULL, length bigint NOT NULL, modified bigint NOT NULL, etag text NOT NULL, sha256 bytea NOT NULL, content_type text NOT NULL, PRIMARY KEY (bucket, object_key))");
@@ -109,11 +109,36 @@ final class SchemaMigrator {
                     statement.execute("ALTER TABLE cluster_buckets ADD COLUMN bucket_policy text");
                     statement.execute("INSERT INTO cluster_schema_migrations VALUES (11)");
                 }
+                if (version < 12) {
+                    statement.execute("CREATE TABLE cluster_repair_status (singleton integer PRIMARY KEY " +
+                        "CHECK (singleton=1), finished_at bigint NOT NULL, scanned integer NOT NULL, " +
+                        "restored integer NOT NULL, rebalanced integer NOT NULL, under_replicated integer NOT NULL, " +
+                        "unrecoverable integer NOT NULL)");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (12)");
+                }
+                if (version < 13) {
+                    statement.execute("ALTER TABLE cluster_repair_status ADD COLUMN started_at bigint NOT NULL DEFAULT 0");
+                    statement.execute("ALTER TABLE cluster_repair_status ADD COLUMN updated_at bigint NOT NULL DEFAULT 0");
+                    statement.execute("ALTER TABLE cluster_repair_status ADD COLUMN state text NOT NULL DEFAULT 'completed' " +
+                        "CHECK (state IN ('running','completed','failed'))");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (13)");
+                }
+                if (version < 14) {
+                    statement.execute("CREATE TABLE cluster_repair_node_counts (node_id uuid PRIMARY KEY, " +
+                        "verified_replicas bigint NOT NULL CHECK (verified_replicas >= 0), " +
+                        "finished_at bigint NOT NULL)");
+                    statement.execute("INSERT INTO cluster_schema_migrations VALUES (14)");
+                }
                 statement.execute("INSERT INTO cluster_format SELECT 1, CASE WHEN EXISTS (SELECT 1 FROM cluster_segments WHERE replica_ids IS NULL) THEN 1 ELSE 2 END WHERE NOT EXISTS (SELECT 1 FROM cluster_format)");
             }
-            try (PreparedStatement insert = connection.prepareStatement("INSERT INTO cluster_usage VALUES (?, 0) ON CONFLICT DO NOTHING")) {
-                insert.setString(1, bucket);
-                insert.executeUpdate();
+            try (PreparedStatement check = connection.prepareStatement(
+                "SELECT count(*), count(*) FILTER (WHERE name=?) FROM cluster_buckets")) {
+                check.setString(1, bucket);
+                try (ResultSet result = check.executeQuery()) {
+                    result.next();
+                    if (result.getLong(1) > 0 && result.getLong(2) == 0)
+                        throw new IOException("Configured S3_BUCKET does not exist; update it or create the bucket explicitly");
+                }
             }
             try (PreparedStatement insert = connection.prepareStatement(
                 "INSERT INTO cluster_buckets (name, created_at, object_ownership, block_public_acls, " +
@@ -121,6 +146,10 @@ final class SchemaMigrator {
                 "VALUES (?, ?, 'BUCKET_OWNER_ENFORCED', true, true, true, true) ON CONFLICT DO NOTHING")) {
                 insert.setString(1, bucket);
                 insert.setLong(2, System.currentTimeMillis());
+                insert.executeUpdate();
+            }
+            try (PreparedStatement insert = connection.prepareStatement("INSERT INTO cluster_usage VALUES (?, 0) ON CONFLICT DO NOTHING")) {
+                insert.setString(1, bucket);
                 insert.executeUpdate();
             }
             int format;
