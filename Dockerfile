@@ -20,6 +20,7 @@ RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar clo
 RUN java -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.RequestDiagnosticsTest
 RUN java -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.BucketActivityTest
 RUN java --add-modules jdk.httpserver -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.AdminOperationsTest
+RUN java --add-modules jdk.httpserver -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.AdminBulkJobsTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.FeatureTest
 RUN java -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.EncryptedVolumeTest
 RUN java --add-modules jdk.httpserver,java.net.http -cp /out:/tmp/hash4j.jar cloud.lunarsky.store.NodeHttpTest

@@ -26,6 +26,7 @@ The script compiles the source and test programs into `out/classes`, then runs:
 | `ClientLimitsTest` | Disabled defaults, trusted-proxy address validation, ignored untrusted headers, per-IP request refusal, and paced response bytes. |
 | `AdminConsoleTest` | Admin sign-in, CSRF and origin checks, bucket and object changes, public-access confirmations, live metrics, encrypted managed-key persistence, scoped reads and listings, and key revocation. |
 | `AdminOperationsTest` | Persisted admin events, effective access checks, stale editor conflicts, and paged copy, tag, inventory, and delete jobs; private copy ACLs, checksum verification, and tag validation. |
+| `AdminBulkJobsTest` | Exact job limits, truncated and stalled pagination, cancellation, and bounded per-object error reports. |
 | `EncryptedVolumeTest` | Marker acceptance and refusal when the configured encrypted directory is missing, mismatched, or a symlink. |
 | `NodeHttpTest` | Total node response deadlines, stalled-body cancellation, response-size limits, and interruption. |
 | `ClusterNodeTest` | Node identity and locking, authenticated segment transfers, checksum rejection, repair authorization, inventory and guarded deletion, and restart cleanup. |

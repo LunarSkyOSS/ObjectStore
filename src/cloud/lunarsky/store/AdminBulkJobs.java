@@ -119,39 +119,7 @@ final class AdminBulkJobs {
 
     private void run(Job job) {
         try {
-            String after = null;
-            do {
-                if (job.cancel) break;
-                ObjectStorage.ListPage page = list(job, after);
-                int remaining = MAX_ITEMS - job.processed;
-                for (ObjectStorage.ListedObject entry : page.objects()) {
-                    if (job.cancel || job.processed >= MAX_ITEMS) break;
-                    try {
-                        operations.read(() -> process(job.spec, entry));
-                        job.succeeded++;
-                        String detail = job.spec.operation().equals("inventory") ?
-                            "bytes=" + entry.metadata().length() + " etag=" + entry.metadata().etag() :
-                            job.spec.operation();
-                        append(job, "ok", entry.key(), detail);
-                    } catch (Exception error) {
-                        job.failed++;
-                        String detail = error instanceof StoreException storeError ?
-                            storeError.code + ": " + storeError.getMessage() :
-                            error.getClass().getSimpleName();
-                        append(job, "error", entry.key(), detail.length() > 200 ?
-                            detail.substring(0, 200) : detail);
-                    }
-                    job.processed++;
-                }
-                if (job.processed >= MAX_ITEMS) {
-                    job.capped = page.truncated() || page.objects().size() > remaining;
-                    break;
-                }
-                if (!page.truncated()) break;
-                if (page.nextKey() == null || page.nextKey().equals(after))
-                    throw new IOException("Storage listing did not advance");
-                after = page.nextKey();
-            } while (true);
+            processPages(job);
             job.state = job.cancel ? "Cancelled" : job.capped ? "Capped" : "Completed";
         } catch (Exception error) {
             job.state = "Failed";
@@ -160,6 +128,49 @@ final class AdminBulkJobs {
             job.finished = System.currentTimeMillis();
             onFinish.accept(job.snapshot());
         }
+    }
+
+    private void processPages(Job job) throws IOException {
+        String after = null;
+        while (!job.cancel) {
+            ObjectStorage.ListPage page = list(job, after);
+            if (processPage(job, page) || !page.truncated()) return;
+            if (page.nextKey() == null || page.nextKey().equals(after))
+                throw new IOException("Storage listing did not advance");
+            after = page.nextKey();
+        }
+    }
+
+    private boolean processPage(Job job, ObjectStorage.ListPage page) {
+        int remaining = MAX_ITEMS - job.processed;
+        for (ObjectStorage.ListedObject entry : page.objects()) {
+            if (job.cancel || job.processed >= MAX_ITEMS) break;
+            processEntry(job, entry);
+        }
+        if (job.processed < MAX_ITEMS) return false;
+        job.capped = page.truncated() || page.objects().size() > remaining;
+        return true;
+    }
+
+    private void processEntry(Job job, ObjectStorage.ListedObject entry) {
+        try {
+            operations.read(() -> process(job.spec, entry));
+            job.succeeded++;
+            String detail = job.spec.operation().equals("inventory") ?
+                "bytes=" + entry.metadata().length() + " etag=" + entry.metadata().etag() :
+                job.spec.operation();
+            append(job, "ok", entry.key(), detail);
+        } catch (Exception error) {
+            job.failed++;
+            append(job, "error", entry.key(), errorDetail(error));
+        }
+        job.processed++;
+    }
+
+    private static String errorDetail(Exception error) {
+        String detail = error instanceof StoreException storeError ?
+            storeError.code + ": " + storeError.getMessage() : error.getClass().getSimpleName();
+        return detail.length() > 200 ? detail.substring(0, 200) : detail;
     }
 
     private ObjectStorage.ListPage list(Job job, String after) throws IOException {

@@ -18,6 +18,7 @@ java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.
 java -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.RequestDiagnosticsTest
 java -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.BucketActivityTest
 java --add-modules jdk.httpserver -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.AdminOperationsTest
+java --add-modules jdk.httpserver -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.AdminBulkJobsTest
 java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.FeatureTest
 java -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.EncryptedVolumeTest
 java --add-modules jdk.httpserver,java.net.http -cp out/classes:lib/hash4j-0.30.0.jar cloud.lunarsky.store.NodeHttpTest

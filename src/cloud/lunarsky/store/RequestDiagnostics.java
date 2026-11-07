@@ -46,20 +46,23 @@ final class RequestDiagnostics {
 
     void record(String requestId, String operation, String bucket, int status, long elapsedNanos,
                 String principal) {
-        if (operation == null) operation = "Service";
         long now = System.currentTimeMillis();
-        long minute = now / MINUTE_MILLIS;
+        recordWindow(currentWindow(now / MINUTE_MILLIS), status, elapsedNanos);
+        recordKey(principal, status, now);
+        if (status >= 400) recordFailure(requestId, operation, bucket, status, now);
+    }
+
+    private Window currentWindow(long minute) {
         int slot = (int) Math.floorMod(minute, windows.length());
-        Window window;
-        do {
-            window = windows.get(slot);
-            if (window != null && window.minute == minute) break;
+        while (true) {
+            Window window = windows.get(slot);
+            if (window != null && window.minute == minute) return window;
             Window fresh = new Window(minute);
-            if (windows.compareAndSet(slot, window, fresh)) {
-                window = fresh;
-                break;
-            }
-        } while (true);
+            if (windows.compareAndSet(slot, window, fresh)) return fresh;
+        }
+    }
+
+    private static void recordWindow(Window window, int status, long elapsedNanos) {
         window.requests.increment();
         if (status >= 500) window.serverErrors.increment();
         else if (status >= 400) window.clientErrors.increment();
@@ -68,23 +71,26 @@ final class RequestDiagnostics {
         while (latencySlot < LATENCY_BOUNDS_MS.length && millis > LATENCY_BOUNDS_MS[latencySlot])
             latencySlot++;
         window.latency[latencySlot].increment();
-        if (principal != null && principal.length() <= 128) {
-            KeyCounters counters = keys.get(principal);
-            if (counters == null && keys.size() < 128)
-                counters = keys.computeIfAbsent(principal, ignored -> new KeyCounters());
-            if (counters != null) {
-                counters.requests.increment();
-                if (status >= 400) counters.failures.increment();
-                counters.lastSeen.set(now);
-            }
-        }
-        if (status >= 400) {
-            if (operation.length() > 32) operation = "Other";
-            if (bucket == null || bucket.length() > 63 || !bucket.matches("[a-zA-Z0-9.-]+")) bucket = "—";
-            long sequence = failureSequence.getAndIncrement();
-            failures.set((int) (sequence % failures.length()),
-                new Failure(sequence, now, requestId, operation, bucket, status));
-        }
+    }
+
+    private void recordKey(String principal, int status, long now) {
+        if (principal == null || principal.length() > 128) return;
+        KeyCounters counters = keys.get(principal);
+        if (counters == null && keys.size() < 128)
+            counters = keys.computeIfAbsent(principal, ignored -> new KeyCounters());
+        if (counters == null) return;
+        counters.requests.increment();
+        if (status >= 400) counters.failures.increment();
+        counters.lastSeen.set(now);
+    }
+
+    private void recordFailure(String requestId, String operation, String bucket, int status, long now) {
+        if (operation == null) operation = "Service";
+        if (operation.length() > 32) operation = "Other";
+        if (bucket == null || bucket.length() > 63 || !bucket.matches("[a-zA-Z0-9.-]+")) bucket = "—";
+        long sequence = failureSequence.getAndIncrement();
+        failures.set((int) (sequence % failures.length()),
+            new Failure(sequence, now, requestId, operation, bucket, status));
     }
 
     List<KeyActivity> keyActivity() {

@@ -72,63 +72,86 @@
           ? history.filter(point => point.cpu !== null) : history;
     }
 
+    function showMemory(sample) {
+      const rss = sample.rssBytes >= 0 ? sample.rssBytes : sample.heapBytes + sample.nonHeapBytes;
+      if (sample.rssBytes < 0 && !memoryFallback) {
+        memoryFallback = true;
+        document.querySelector('#perf-ram').previousElementSibling.textContent = 'JVM memory used';
+        charts[3].series = [
+          { type: 'line', x: 'time', y: 'memory', name: 'JVM used MiB' },
+          { type: 'line', x: 'time', y: 'heap', name: 'Heap MiB' }
+        ];
+      }
+      show('perf-ram', bytes(rss));
+      return rss;
+    }
+
+    function cpuUsage(sample, before, seconds) {
+      if (!(sample.cpuNanos >= 0 && before.cpuNanos >= 0)) return null;
+      return Math.max(0, Math.min(100,
+        (sample.cpuNanos - before.cpuNanos) /
+        (seconds * 1e9 * Math.max(1, sample.processors)) * 100));
+    }
+
+    function samplePoint(sample, before, seconds, rss) {
+      const errors = counterDelta(sample, before, 'failures4xx') +
+        counterDelta(sample, before, 'failures5xx');
+      return {
+        time: new Date().toLocaleTimeString(),
+        requests: counterDelta(sample, before, 'requests') / seconds,
+        errors: errors / seconds,
+        inbound: counterDelta(sample, before, 'inboundBytes') / seconds / 1024,
+        outbound: counterDelta(sample, before, 'outboundBytes') / seconds / 1024,
+        cpu: cpuUsage(sample, before, seconds),
+        memory: rss / 1048576,
+        heap: sample.heapBytes / 1048576,
+        seconds
+      };
+    }
+
+    function showCpuAverage() {
+      const cpuPoints = history.filter(entry => entry.cpu !== null);
+      const cpuSeconds = cpuPoints.reduce((total, entry) => total + entry.seconds, 0);
+      show('perf-cpu', cpuSeconds ?
+        (cpuPoints.reduce((total, entry) => total + entry.cpu * entry.seconds, 0) /
+          cpuSeconds).toFixed(1) + '%' : '—');
+    }
+
+    function showInterval(sample, before, point) {
+      const requests = counterDelta(sample, before, 'requests');
+      show('perf-rps', rate(point.requests));
+      show('perf-latency', requests ?
+        (counterDelta(sample, before, 'durationNanos') / requests / 1e6).toFixed(1) + ' ms' : '—');
+      show('perf-inbound', bytes(point.inbound * 1024, '/s'));
+      show('perf-outbound', bytes(point.outbound * 1024, '/s'));
+      showCpuAverage();
+      updateCharts();
+    }
+
+    function recordSample(sample, now, rss) {
+      if (!previous) return;
+      const before = previous.sample;
+      if (sample.requests < before.requests) {
+        history.length = 0;
+        updateCharts();
+      }
+      if (!(sample.requests >= before.requests)) return;
+      const seconds = (now - previous.at) / 1000;
+      if (!(seconds > 0.1)) return;
+      const point = samplePoint(sample, before, seconds, rss);
+      history.push(point);
+      if (history.length > 60) history.shift();
+      showInterval(sample, before, point);
+    }
+
     function accept(sample) {
       if (!active || document.hidden) return;
       try {
         const now = performance.now();
-        const rss = sample.rssBytes >= 0 ? sample.rssBytes : sample.heapBytes + sample.nonHeapBytes;
-        if (sample.rssBytes < 0 && !memoryFallback) {
-          memoryFallback = true;
-          document.querySelector('#perf-ram').previousElementSibling.textContent = 'JVM memory used';
-          charts[3].series = [
-            { type: 'line', x: 'time', y: 'memory', name: 'JVM used MiB' },
-            { type: 'line', x: 'time', y: 'heap', name: 'Heap MiB' }
-          ];
-        }
-        show('perf-ram', bytes(rss));
+        const rss = showMemory(sample);
         show('perf-gc', Number(sample.gcCount).toLocaleString());
         show('perf-inflight', Number(sample.inFlight).toLocaleString());
-        if (previous && sample.requests < previous.sample.requests) {
-          history.length = 0;
-          updateCharts();
-        }
-        if (previous && sample.requests >= previous.sample.requests) {
-          const seconds = (now - previous.at) / 1000;
-          if (seconds > 0.1) {
-            const requests = counterDelta(sample, previous.sample, 'requests');
-            const errors = counterDelta(sample, previous.sample, 'failures4xx') +
-              counterDelta(sample, previous.sample, 'failures5xx');
-            const cpu = sample.cpuNanos >= 0 && previous.sample.cpuNanos >= 0
-              ? Math.max(0, Math.min(100,
-                  (sample.cpuNanos - previous.sample.cpuNanos) /
-                  (seconds * 1e9 * Math.max(1, sample.processors)) * 100))
-              : null;
-            const point = {
-              time: new Date().toLocaleTimeString(),
-              requests: requests / seconds,
-              errors: errors / seconds,
-              inbound: counterDelta(sample, previous.sample, 'inboundBytes') / seconds / 1024,
-              outbound: counterDelta(sample, previous.sample, 'outboundBytes') / seconds / 1024,
-              cpu,
-              memory: rss / 1048576,
-              heap: sample.heapBytes / 1048576,
-              seconds
-            };
-            history.push(point);
-            if (history.length > 60) history.shift();
-            show('perf-rps', rate(point.requests));
-            show('perf-latency', requests ?
-              (counterDelta(sample, previous.sample, 'durationNanos') / requests / 1e6).toFixed(1) + ' ms' : '—');
-            show('perf-inbound', bytes(point.inbound * 1024, '/s'));
-            show('perf-outbound', bytes(point.outbound * 1024, '/s'));
-            const cpuPoints = history.filter(entry => entry.cpu !== null);
-            const cpuSeconds = cpuPoints.reduce((total, entry) => total + entry.seconds, 0);
-            show('perf-cpu', cpuSeconds ?
-              (cpuPoints.reduce((total, entry) => total + entry.cpu * entry.seconds, 0) /
-                cpuSeconds).toFixed(1) + '%' : '—');
-            updateCharts();
-          }
-        }
+        recordSample(sample, now, rss);
         previous = { sample, at: now };
         showState(history.length ? 'Live · one-second samples' :
           'Collecting a second sample…', history.length ? 'live' : 'loading');

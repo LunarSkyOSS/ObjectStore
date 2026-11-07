@@ -576,63 +576,81 @@ final class DiskStore implements ObjectStorage {
         synchronized (lock(destination)) {
             synchronized (this) {
                 Bucket configured = buckets.get(metadata.bucket());
-                if (expected != null) {
-                    Metadata current = index.get(indexKey(metadata.bucket(), metadata.key()));
-                    if (configured == null || configured.versioning() != VersioningState.ENABLED ||
-                        current == null || !expected.versionId().equals(
-                            current.versionId() == null ? "null" : current.versionId()) ||
-                        !MessageDigest.isEqual(expected.sha256(), current.sha256()) ||
-                        !expected.tags().equals(current.tags()) || !expected.acl().equals(current.acl()))
-                        throw new StoreException(412, "PreconditionFailed", "Object changed since it was opened");
-                }
-                if (configured != null && configured.versioning() != VersioningState.NEVER)
+                checkExpectedVersion(configured, metadata, expected);
+                if (isVersioned(configured))
                     return installVersionedPending(destination, pending, metadata, createOnly,
                         configured.versioning());
             }
-            long previous = 0;
-            boolean existed = Files.exists(destination);
-            boolean legacy = false;
-            if (existed) {
-                if (createOnly) throw new StoreException(412, "PreconditionFailed", "Object already exists");
-                try (var in = new DataInputStream(Files.newInputStream(destination))) {
-                    Metadata old = readRecord(in).metadata();
-                    previous = old.length();
-                    legacy = old.key() == null;
-                }
-            }
-            long additional = Math.max(0, metadata.length() - previous);
+            Metadata previous = previousMetadata(destination, createOnly);
+            long previousLength = previous == null ? 0 : previous.length();
+            long additional = Math.max(0, metadata.length() - previousLength);
             synchronized (this) {
                 Bucket configured = buckets.get(metadata.bucket());
-                if (configured != null && configured.versioning() != VersioningState.NEVER)
+                if (isVersioned(configured))
                     return installVersionedPending(destination, pending, metadata, createOnly,
                         configured.versioning());
-                if (Files.exists(catalog) && configured == null)
-                    throw new StoreException(404, "NoSuchBucket", "Bucket not found");
-                if (maxTotal - used - reservedBytes < additional)
-                    throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
-                reservedBytes += additional;
-                publishingByBucket.merge(metadata.bucket(), 1, Integer::sum);
+                reservePublication(metadata.bucket(), configured, additional);
             }
-            boolean moved = false;
-            try {
-                Files.move(pending, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                moved = true;
-                syncDirectory(destination.getParent());
-            } finally {
-                synchronized (this) {
-                    if (moved) {
-                        used = used - previous + metadata.length();
-                        if (!existed) objectCount++;
-                        if (legacy) legacyCount--;
-                        index.put(indexKey(metadata.bucket(), metadata.key()), metadata);
-                    }
-                    reservedBytes -= additional;
-                    publishingByBucket.compute(metadata.bucket(), (bucket, count) -> count == 1 ? null : count - 1);
-                    notifyAll();
-                }
-            }
+            publishUnversioned(destination, pending, metadata, previous, additional);
             return metadata;
         }
+    }
+
+    private void checkExpectedVersion(Bucket configured, Metadata metadata, Metadata expected) {
+        if (expected == null) return;
+        Metadata current = index.get(indexKey(metadata.bucket(), metadata.key()));
+        if (configured == null || configured.versioning() != VersioningState.ENABLED ||
+            current == null || !expected.versionId().equals(
+                current.versionId() == null ? "null" : current.versionId()) ||
+            !MessageDigest.isEqual(expected.sha256(), current.sha256()) ||
+            !expected.tags().equals(current.tags()) || !expected.acl().equals(current.acl()))
+            throw new StoreException(412, "PreconditionFailed", "Object changed since it was opened");
+    }
+
+    private static boolean isVersioned(Bucket configured) {
+        return configured != null && configured.versioning() != VersioningState.NEVER;
+    }
+
+    private Metadata previousMetadata(Path destination, boolean createOnly) throws IOException {
+        if (!Files.exists(destination)) return null;
+        if (createOnly) throw new StoreException(412, "PreconditionFailed", "Object already exists");
+        try (var in = new DataInputStream(Files.newInputStream(destination))) {
+            return readRecord(in).metadata();
+        }
+    }
+
+    private void reservePublication(String bucket, Bucket configured, long additional) {
+        if (Files.exists(catalog) && configured == null)
+            throw new StoreException(404, "NoSuchBucket", "Bucket not found");
+        if (maxTotal - used - reservedBytes < additional)
+            throw new StoreException(507, "InsufficientStorage", "Store capacity limit reached");
+        reservedBytes += additional;
+        publishingByBucket.merge(bucket, 1, Integer::sum);
+    }
+
+    private void publishUnversioned(Path destination, Path pending, Metadata metadata,
+                                    Metadata previous, long additional) throws IOException {
+        boolean moved = false;
+        try {
+            Files.move(pending, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            moved = true;
+            syncDirectory(destination.getParent());
+        } finally {
+            finishPublication(metadata, previous, additional, moved);
+        }
+    }
+
+    private synchronized void finishPublication(Metadata metadata, Metadata previous,
+                                                 long additional, boolean moved) {
+        if (moved) {
+            used = used - (previous == null ? 0 : previous.length()) + metadata.length();
+            if (previous == null) objectCount++;
+            else if (previous.key() == null) legacyCount--;
+            index.put(indexKey(metadata.bucket(), metadata.key()), metadata);
+        }
+        reservedBytes -= additional;
+        publishingByBucket.compute(metadata.bucket(), (bucket, count) -> count == 1 ? null : count - 1);
+        notifyAll();
     }
 
     private Metadata installVersionedPending(Path destination, Path pending, Metadata metadata,

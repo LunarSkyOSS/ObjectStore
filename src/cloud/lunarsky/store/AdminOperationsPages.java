@@ -138,6 +138,13 @@ final class AdminOperationsPages {
             return page(content.toString(), true);
         }
         ClusterStore.ClusterStatus status = cluster.status();
+        appendClusterSummary(content, status);
+        appendClusterTopology(content, status);
+        appendRepairProgress(content, status.repair());
+        return page(content.toString(), true);
+    }
+
+    private static void appendClusterSummary(StringBuilder content, ClusterStore.ClusterStatus status) {
         long healthy = status.nodes().stream().filter(ClusterStore.NodeStatus::reachable).count();
         long hosts = status.nodes().stream().filter(ClusterStore.NodeStatus::reachable)
             .map(node -> node.node().hostId()).distinct().count();
@@ -150,8 +157,11 @@ final class AdminOperationsPages {
             .append("</strong></biscuit-cardview><biscuit-cardview><small>Reachable nodes</small><strong>")
             .append(healthy).append(" / ").append(status.nodes().size())
             .append("</strong></biscuit-cardview><biscuit-cardview><small>Reachable hosts</small><strong>")
-            .append(hosts).append("</strong></biscuit-cardview></div>")
-            .append("<section class=cluster-topology aria-label='Cluster topology'><div class=cluster-core>")
+            .append(hosts).append("</strong></biscuit-cardview></div>");
+    }
+
+    private static void appendClusterTopology(StringBuilder content, ClusterStore.ClusterStatus status) {
+        content.append("<section class=cluster-topology aria-label='Cluster topology'><div class=cluster-core>")
             .append("<strong>Metadata primary</strong><p>")
             .append(status.metadataWritable() ? "Writable" : "Unavailable or read-only")
             .append("</p></div><div class=cluster-connect aria-hidden=true></div><div class=cluster-nodes>");
@@ -163,8 +173,7 @@ final class AdminOperationsPages {
                 .append("</code><code>Host ").append(node.node().hostId())
                 .append("</code><code>").append(escape(node.node().url().toString()))
                 .append("</code><small>Verified replicas at last repair: ")
-                .append(status.repair() == null || !status.repair().state().equals("completed") ||
-                    status.repair().report().scanned() > 0 && status.verifiedReplicas().isEmpty() ?
+                .append(!replicasMeasured(status) ?
                     "Not measured" :
                     Long.toString(status.verifiedReplicas().getOrDefault(node.node().id(), 0L)))
                 .append("</small></div>");
@@ -174,33 +183,48 @@ final class AdminOperationsPages {
             "Multiple nodes on one host do not provide host-level redundancy.</p>");
         if (status.omittedNodes() > 0) content.append("<p class=rename-warning>")
             .append(status.omittedNodes()).append(" additional nodes are not probed in this view.</p>");
+    }
+
+    private static boolean replicasMeasured(ClusterStore.ClusterStatus status) {
         ClusterStore.RepairStatus repair = status.repair();
+        if (repair == null || !repair.state().equals("completed")) return false;
+        return repair.report().scanned() <= 0 || !status.verifiedReplicas().isEmpty();
+    }
+
+    private static void appendRepairProgress(StringBuilder content, ClusterStore.RepairStatus repair) {
         content.append("<section class=insight><h3>Repair progress</h3>");
         if (repair == null) content.append("<p class=muted>No repair report has been recorded yet.</p>");
         else {
-            ClusterStore.RepairReport report = repair.report();
-            boolean stale = repair.state().equals("running") &&
-                System.currentTimeMillis() - repair.updatedAt() > 300_000;
-            content.append("<p><strong>").append(stale ? "May be interrupted" :
-                repair.state().equals("running") ? "Running" :
-                    repair.state().equals("failed") ? "Failed" : "Completed")
-                .append("</strong> · Started ")
-                .append(java.time.Instant.ofEpochMilli(repair.startedAt()))
-                .append(" UTC · Last update ")
-                .append(java.time.Instant.ofEpochMilli(repair.updatedAt()))
-                .append(" UTC</p><p class=muted>These counts are from this repair pass, " +
-                    "not a live replica inventory.</p><div class=grid>")
-                .append("<biscuit-cardview><small>Segments scanned</small><strong>")
-                .append(report.scanned()).append("</strong></biscuit-cardview>")
-                .append("<biscuit-cardview><small>Replicas restored</small><strong>")
-                .append(report.restored()).append("</strong></biscuit-cardview>")
-                .append("<biscuit-cardview><small>Under-replicated</small><strong>")
-                .append(report.underReplicated()).append("</strong></biscuit-cardview>")
-                .append("<biscuit-cardview><small>Unrecoverable</small><strong>")
-                .append(report.unrecoverable()).append("</strong></biscuit-cardview></div>");
+            appendRepairReport(content, repair);
         }
         content.append("<p class=muted>Repair is run by the separate cluster maintenance service. " +
             "This panel does not trigger repair or change placement.</p></section>");
-        return page(content.toString(), true);
+    }
+
+    private static void appendRepairReport(StringBuilder content, ClusterStore.RepairStatus repair) {
+        ClusterStore.RepairReport report = repair.report();
+        content.append("<p><strong>").append(repairLabel(repair))
+            .append("</strong> · Started ")
+            .append(java.time.Instant.ofEpochMilli(repair.startedAt()))
+            .append(" UTC · Last update ")
+            .append(java.time.Instant.ofEpochMilli(repair.updatedAt()))
+            .append(" UTC</p><p class=muted>These counts are from this repair pass, " +
+                "not a live replica inventory.</p><div class=grid>")
+            .append("<biscuit-cardview><small>Segments scanned</small><strong>")
+            .append(report.scanned()).append("</strong></biscuit-cardview>")
+            .append("<biscuit-cardview><small>Replicas restored</small><strong>")
+            .append(report.restored()).append("</strong></biscuit-cardview>")
+            .append("<biscuit-cardview><small>Under-replicated</small><strong>")
+            .append(report.underReplicated()).append("</strong></biscuit-cardview>")
+            .append("<biscuit-cardview><small>Unrecoverable</small><strong>")
+            .append(report.unrecoverable()).append("</strong></biscuit-cardview></div>");
+    }
+
+    private static String repairLabel(ClusterStore.RepairStatus repair) {
+        if (repair.state().equals("running")) {
+            return System.currentTimeMillis() - repair.updatedAt() > 300_000
+                ? "May be interrupted" : "Running";
+        }
+        return repair.state().equals("failed") ? "Failed" : "Completed";
     }
 }
