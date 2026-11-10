@@ -74,22 +74,33 @@ final class S3Request {
 
     static boolean multipartRequest(String method, Map<String, String> query) {
         if (query.containsKey("uploads"))
-            return method.equals("POST") && query.get("uploads").isEmpty() &&
-                query.keySet().stream().allMatch(java.util.Set.of("uploads", "x-id")::contains) &&
-                (!query.containsKey("x-id") || query.get("x-id").equals("CreateMultipartUpload"));
+            return multipartInitiationRequest(method, query);
         if (!query.containsKey("uploadId") ||
             !query.keySet().stream().allMatch(java.util.Set.of("uploadId", "partNumber",
                 "part-number-marker", "max-parts", "x-id")::contains))
             return false;
         String xId = query.get("x-id");
-        if (method.equals("PUT")) return query.containsKey("partNumber") &&
-            !query.containsKey("part-number-marker") && !query.containsKey("max-parts") &&
-            (xId == null || xId.equals("UploadPart"));
+        if (method.equals("PUT")) return multipartPartRequest(query, xId);
         if (query.containsKey("partNumber")) return false;
-        if (method.equals("GET")) return xId == null || xId.equals("ListParts");
+        if (method.equals("GET")) return matchesOperationId(xId, "ListParts");
         if (query.containsKey("part-number-marker") || query.containsKey("max-parts")) return false;
-        return (method.equals("POST") && (xId == null || xId.equals("CompleteMultipartUpload"))) ||
-            (method.equals("DELETE") && (xId == null || xId.equals("AbortMultipartUpload")));
+        return (method.equals("POST") && matchesOperationId(xId, "CompleteMultipartUpload")) ||
+            (method.equals("DELETE") && matchesOperationId(xId, "AbortMultipartUpload"));
+    }
+
+    private static boolean multipartInitiationRequest(String method, Map<String, String> query) {
+        return method.equals("POST") && query.get("uploads").isEmpty() &&
+            query.keySet().stream().allMatch(java.util.Set.of("uploads", "x-id")::contains) &&
+            (!query.containsKey("x-id") || query.get("x-id").equals("CreateMultipartUpload"));
+    }
+
+    private static boolean multipartPartRequest(Map<String, String> query, String xId) {
+        return query.containsKey("partNumber") && !query.containsKey("part-number-marker") &&
+            !query.containsKey("max-parts") && matchesOperationId(xId, "UploadPart");
+    }
+
+    private static boolean matchesOperationId(String xId, String expected) {
+        return xId == null || xId.equals(expected);
     }
     static int boundedNumber(String text, int minimum, int maximum, int defaultValue) {
         if (text == null) return defaultValue;

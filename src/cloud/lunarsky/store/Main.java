@@ -229,59 +229,85 @@ public final class Main {
     }
 
     private void dispatch(HttpExchange exchange, RequestContext context) throws IOException {
-        SigV4.Verified verified = anonymousRead(exchange)
-            ? new SigV4.Verified("UNSIGNED-PAYLOAD", exchange.getRequestURI().getRawQuery(),
-                null, null, null, null, null)
-            : authentication.verifyRequest(exchange.getRequestMethod(),
-                exchange.getRequestURI(), exchange.getRequestHeaders());
+        SigV4.Verified verified = verifyRequest(exchange);
         context.principal = verified.principal();
         String path = SigV4.decode(exchange.getRequestURI().getRawPath());
         Map<String, String> query = S3Request.query(verified.applicationQuery());
         if (path.equals(CAPABILITIES_PATH)) {
-            access.requireOwner(verified.principal());
-            if (!exchange.getRequestMethod().equals("GET")) S3Request.unsupported("Capability operation");
-            if (!query.isEmpty())
-                throw new StoreException(400, "InvalidArgument", "Capability request has unsupported query parameters");
-            S3Request.requireEmptyBody(exchange, verified.payload());
-            capabilities(exchange);
+            handleCapabilities(exchange, query, verified);
             return;
         }
         String hostBucket = virtualHostBucket(exchange);
         if (path.equals("/") && hostBucket == null) {
-            access.requireOwner(verified.principal());
-            if (!exchange.getRequestMethod().equals("GET") ||
-                !(query.isEmpty() || query.size() == 1 && "ListBuckets".equals(query.get("x-id"))))
-                S3Request.unsupported("Service operation");
-            S3Request.requireEmptyBody(exchange, verified.payload());
-            bucketHandler.listBuckets(exchange);
+            handleService(exchange, query, verified);
             return;
         }
         int slash = path.indexOf('/', 1);
         String requestedBucket = hostBucket == null ?
             (slash < 0 ? path.substring(1) : path.substring(1, slash)) : hostBucket;
+        boolean bucketRequest = hostBucket != null ? path.equals("/") : slash < 0 || slash == path.length() - 1;
         context.bucket = requestedBucket;
-        context.operation = (hostBucket != null ? path.equals("/") : slash < 0 ||
-            slash == path.length() - 1) ? "Bucket " + exchange.getRequestMethod() :
-            "Object " + exchange.getRequestMethod();
+        context.operation = (bucketRequest ? "Bucket " : "Object ") + exchange.getRequestMethod();
         if (requestedBucket.isEmpty()) throw new StoreException(404, "NoSuchBucket", "Bucket not found");
-        if (hostBucket != null ? path.equals("/") : slash < 0 || slash == path.length() - 1) {
-            ManagedCredentials managed = managedScope(verified.principal());
-            if (managed != null)
-                managed.checkBucket(verified.principal(), requestedBucket, exchange.getRequestMethod(), query);
-            else keyScopes.checkBucket(verified.principal(), requestedBucket, exchange.getRequestMethod(), query);
-            bucketHandler.handleBucket(exchange, query, verified.payload(), requestedBucket, verified.principal());
+        if (bucketRequest) {
+            dispatchBucket(exchange, query, verified, requestedBucket);
         } else {
             store.bucket(requestedBucket);
             String key = hostBucket == null ? path.substring(slash + 1) : path.substring(1);
-            ManagedCredentials managed = managedScope(verified.principal());
-            if (managed != null)
-                managed.checkObject(verified.principal(), requestedBucket, key,
-                    exchange.getRequestMethod(), query, exchange.getRequestHeaders());
-            else keyScopes.checkObject(verified.principal(), requestedBucket, key,
-                exchange.getRequestMethod(), query, exchange.getRequestHeaders());
-            objectHandler.handleObject(exchange, key,
-                query, verified, requestedBucket);
+            dispatchObject(exchange, query, verified, requestedBucket, key);
         }
+        recordBucketActivity(exchange, requestedBucket);
+    }
+
+    private SigV4.Verified verifyRequest(HttpExchange exchange) {
+        if (anonymousRead(exchange))
+            return new SigV4.Verified("UNSIGNED-PAYLOAD", exchange.getRequestURI().getRawQuery(),
+                null, null, null, null, null);
+        return authentication.verifyRequest(exchange.getRequestMethod(),
+            exchange.getRequestURI(), exchange.getRequestHeaders());
+    }
+
+    private void handleCapabilities(HttpExchange exchange, Map<String, String> query,
+                                    SigV4.Verified verified) throws IOException {
+        access.requireOwner(verified.principal());
+        if (!exchange.getRequestMethod().equals("GET")) S3Request.unsupported("Capability operation");
+        if (!query.isEmpty())
+            throw new StoreException(400, "InvalidArgument", "Capability request has unsupported query parameters");
+        S3Request.requireEmptyBody(exchange, verified.payload());
+        capabilities(exchange);
+    }
+
+    private void handleService(HttpExchange exchange, Map<String, String> query,
+                                SigV4.Verified verified) throws IOException {
+        access.requireOwner(verified.principal());
+        if (!exchange.getRequestMethod().equals("GET") ||
+            !(query.isEmpty() || query.size() == 1 && "ListBuckets".equals(query.get("x-id"))))
+            S3Request.unsupported("Service operation");
+        S3Request.requireEmptyBody(exchange, verified.payload());
+        bucketHandler.listBuckets(exchange);
+    }
+
+    private void dispatchBucket(HttpExchange exchange, Map<String, String> query,
+                                 SigV4.Verified verified, String bucket) throws IOException {
+        ManagedCredentials managed = managedScope(verified.principal());
+        if (managed != null)
+            managed.checkBucket(verified.principal(), bucket, exchange.getRequestMethod(), query);
+        else keyScopes.checkBucket(verified.principal(), bucket, exchange.getRequestMethod(), query);
+        bucketHandler.handleBucket(exchange, query, verified.payload(), bucket, verified.principal());
+    }
+
+    private void dispatchObject(HttpExchange exchange, Map<String, String> query,
+                                 SigV4.Verified verified, String bucket, String key) throws IOException {
+        ManagedCredentials managed = managedScope(verified.principal());
+        if (managed != null)
+            managed.checkObject(verified.principal(), bucket, key,
+                exchange.getRequestMethod(), query, exchange.getRequestHeaders());
+        else keyScopes.checkObject(verified.principal(), bucket, key,
+            exchange.getRequestMethod(), query, exchange.getRequestHeaders());
+        objectHandler.handleObject(exchange, key, query, verified, bucket);
+    }
+
+    private void recordBucketActivity(HttpExchange exchange, String requestedBucket) {
         BucketActivity activity = bucketActivity;
         if (activity != null && exchange.getResponseCode() > 0 && exchange.getResponseCode() < 400)
             activity.record(requestedBucket, exchange.getRequestMethod());

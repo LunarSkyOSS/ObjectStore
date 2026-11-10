@@ -422,6 +422,35 @@ public final class HttpTest {
             HttpResponse.BodyHandlers.ofByteArray()));
     }
 
+    private static void testServiceRouting(HttpClient client, String base) throws Exception {
+        for (String path : new String[]{"/", "/?x-id=ListBuckets"}) {
+            URI uri = URI.create(base + path);
+            status(200, client.send(signedUri(uri, "GET", new byte[0], Map.of()),
+                HttpResponse.BodyHandlers.ofByteArray()));
+            status(403, client.send(signedUriAs(uri, "GET", new byte[0], Map.of(),
+                SECONDARY, SECONDARY_SECRET), HttpResponse.BodyHandlers.ofByteArray()));
+            status(403, client.send(HttpRequest.newBuilder(uri).GET().build(),
+                HttpResponse.BodyHandlers.ofByteArray()));
+        }
+        for (String path : new String[]{"/?extra=1", "/?x-id=GetObject", "/?x-id=ListBuckets&extra=1"}) {
+            URI uri = URI.create(base + path);
+            status(501, client.send(signedUri(uri, "GET", new byte[0], Map.of()),
+                HttpResponse.BodyHandlers.ofByteArray()));
+            status(403, client.send(signedUriAs(uri, "GET", new byte[0], Map.of(),
+                SECONDARY, SECONDARY_SECRET), HttpResponse.BodyHandlers.ofByteArray()));
+        }
+        for (String path : new String[]{"/", "/_objectstore/capabilities"}) {
+            URI uri = URI.create(base + path);
+            status(501, client.send(signedUri(uri, "POST", new byte[0], Map.of()),
+                HttpResponse.BodyHandlers.ofByteArray()));
+            status(403, client.send(signedUriAs(uri, "POST", new byte[0], Map.of(),
+                SECONDARY, SECONDARY_SECRET), HttpResponse.BodyHandlers.ofByteArray()));
+        }
+        for (String path : new String[]{"/objects", "/objects/"})
+            status(200, client.send(signedUri(URI.create(base + path), "HEAD", new byte[0], Map.of()),
+                HttpResponse.BodyHandlers.ofByteArray()));
+    }
+
     private static void status(int expected, HttpResponse<?> response) {
         if (response.statusCode() != expected) {
             throw new AssertionError("Expected HTTP " + expected + ", got " + response.statusCode()
@@ -988,6 +1017,7 @@ public final class HttpTest {
             String base = "http://127.0.0.1:" + server.getAddress().getPort();
             HttpClient client = HttpClient.newHttpClient();
             testCapabilities(client, base);
+            testServiceRouting(client, base);
             testPresigned(client, base);
             testStreaming(client, base);
             testStreamingTrailer(client, base);

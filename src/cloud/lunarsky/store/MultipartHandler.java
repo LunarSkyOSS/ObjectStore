@@ -1,6 +1,7 @@
 package cloud.lunarsky.store;
 
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpsExchange;
 import java.io.IOException;
 import java.net.URI;
@@ -32,72 +33,16 @@ final class MultipartHandler {
                                  String key, SigV4.Verified verified, String bucketName) throws IOException {
         String hash = verified.payload();
         var headers = exchange.getRequestHeaders();
-        if ((headers.containsKey("content-encoding") && !(method.equals("PUT") && verified.streaming())) ||
-            headers.containsKey("if-none-match"))
-            S3Request.unsupported("Multipart request header");
-        if (headers.containsKey("x-amz-copy-source") || headers.containsKey("x-amz-metadata-directive") ||
-            headers.containsKey("x-amz-tagging-directive"))
-            S3Request.unsupported("Multipart copy request");
-        if (!query.containsKey("uploads") &&
-            (headers.containsKey("x-amz-tagging") || !ObjectAttributes.userMetadata(headers).isEmpty() ||
-             headers.containsKey("x-amz-acl") || headers.keySet().stream().anyMatch(
-                 name -> name.toLowerCase(Locale.ROOT).startsWith("x-amz-grant-"))))
-            S3Request.unsupported("Multipart object attributes belong on initiation");
         boolean initiate = query.containsKey("uploads");
-        if (!method.equals("PUT") && (headers.containsKey("content-md5") ||
-            headers.containsKey("x-amz-sdk-checksum-algorithm") ||
-            headers.keySet().stream().anyMatch(name -> {
-                String lower = name.toLowerCase(Locale.ROOT);
-                return lower.startsWith("x-amz-checksum-") &&
-                    !(initiate && lower.equals("x-amz-checksum-algorithm"));
-            })))
-            S3Request.unsupported("Multipart checksum header");
+        validateHeaders(headers, method, verified.streaming(), initiate);
         if (initiate) {
-            String algorithm = SigV4.single(headers, "x-amz-checksum-algorithm");
-            if (algorithm != null && !algorithm.equals("CRC32"))
-                S3Request.unsupported("Multipart checksum algorithm");
-            S3Request.requireEmptyBody(exchange, hash);
-            Map<String, String> acl = Acl.fromHeaders(headers, authentication.identities());
-            BucketSecurity.checkAcl(store.bucket(bucketName), headers, acl, false);
-            if (!acl.isEmpty() && !owner.equals(verified.principal()))
-                access.requireBucket(bucketName, verified.principal(), Acl.WRITE_ACP);
-            String id = multipart.create(bucketName, key, S3Request.contentType(headers),
-                ObjectAttributes.userMetadata(headers),
-                ObjectAttributes.tagsHeader(SigV4.single(headers, "x-amz-tagging")), acl);
-            S3Xml.sendXml(exchange, 200, "<InitiateMultipartUploadResult><Bucket>" + S3Xml.xml(bucketName) +
-                "</Bucket><Key>" + S3Xml.xml(key) + "</Key><UploadId>" + id +
-                "</UploadId></InitiateMultipartUploadResult>");
+            initiateUpload(exchange, key, verified, bucketName);
             return;
         }
         String id = query.get("uploadId");
         switch (method) {
-            case "PUT" -> {
-                int number;
-                try { number = Integer.parseInt(query.get("partNumber")); }
-                catch (NumberFormatException e) { throw new StoreException(400, "InvalidArgument", "Invalid part number"); }
-                long length = verified.streaming() ? S3Request.decodedLength(headers) : S3Request.contentLength(headers);
-                UploadChecksums checksums = UploadChecksums.from(headers);
-                AwsChunkedInputStream chunked = verified.streaming() ? S3Request.chunkedBody(exchange, verified) : null;
-                String etag = multipart.putPart(id, bucketName, key, number,
-                    checksums.verifying(chunked == null ? exchange.getRequestBody() : chunked),
-                    length, S3Request.expectedPayloadHash(hash), checksums.sha256());
-                exchange.getResponseHeaders().set("ETag", "\"" + etag + "\"");
-                checksums.response(exchange.getResponseHeaders());
-                if (chunked != null && chunked.trailerValue() != null)
-                    exchange.getResponseHeaders().set(SigV4.single(headers, "x-amz-trailer"), chunked.trailerValue());
-                exchange.sendResponseHeaders(200, -1);
-            }
-            case "POST" -> {
-                byte[] body = S3Request.signedBody(exchange, hash, 65536);
-                List<MultipartStorage.Part> parts = S3Xml.completedParts(body);
-                var meta = multipart.complete(id, bucketName, key, parts);
-                if (meta.versionId() != null)
-                    exchange.getResponseHeaders().set("x-amz-version-id", meta.versionId());
-                S3Xml.sendXml(exchange, 200, "<CompleteMultipartUploadResult><Location>" +
-                    S3Xml.xml(location(exchange, bucketName, key)) + "</Location><Bucket>" + S3Xml.xml(bucketName) +
-                    "</Bucket><Key>" + S3Xml.xml(key) + "</Key><ETag>&quot;" + meta.etag() +
-                    "&quot;</ETag></CompleteMultipartUploadResult>");
-            }
+            case "PUT" -> uploadPart(exchange, id, key, query.get("partNumber"), verified, bucketName);
+            case "POST" -> completeUpload(exchange, id, key, hash, bucketName);
             case "DELETE" -> {
                 S3Request.requireEmptyBody(exchange, hash);
                 multipart.abort(id, bucketName, key);
@@ -109,6 +54,86 @@ final class MultipartHandler {
             }
             default -> S3Request.unsupported("Multipart operation");
         }
+    }
+
+    private static void validateHeaders(Headers headers, String method, boolean streaming, boolean initiate) {
+        if ((headers.containsKey("content-encoding") && !(method.equals("PUT") && streaming)) ||
+            headers.containsKey("if-none-match"))
+            S3Request.unsupported("Multipart request header");
+        if (headers.containsKey("x-amz-copy-source") || headers.containsKey("x-amz-metadata-directive") ||
+            headers.containsKey("x-amz-tagging-directive"))
+            S3Request.unsupported("Multipart copy request");
+        if (!initiate && hasObjectAttributes(headers))
+            S3Request.unsupported("Multipart object attributes belong on initiation");
+        validateChecksumHeaders(headers, method, initiate);
+    }
+
+    private static boolean hasObjectAttributes(Headers headers) {
+        return headers.containsKey("x-amz-tagging") || !ObjectAttributes.userMetadata(headers).isEmpty() ||
+            headers.containsKey("x-amz-acl") || headers.keySet().stream().anyMatch(
+                name -> name.toLowerCase(Locale.ROOT).startsWith("x-amz-grant-"));
+    }
+
+    private static void validateChecksumHeaders(Headers headers, String method, boolean initiate) {
+        if (!method.equals("PUT") && (headers.containsKey("content-md5") ||
+            headers.containsKey("x-amz-sdk-checksum-algorithm") ||
+            headers.keySet().stream().anyMatch(name -> {
+                String lower = name.toLowerCase(Locale.ROOT);
+                return lower.startsWith("x-amz-checksum-") &&
+                    !(initiate && lower.equals("x-amz-checksum-algorithm"));
+            })))
+            S3Request.unsupported("Multipart checksum header");
+    }
+
+    private void initiateUpload(HttpExchange exchange, String key, SigV4.Verified verified,
+                                String bucketName) throws IOException {
+        var headers = exchange.getRequestHeaders();
+        String algorithm = SigV4.single(headers, "x-amz-checksum-algorithm");
+        if (algorithm != null && !algorithm.equals("CRC32"))
+            S3Request.unsupported("Multipart checksum algorithm");
+        S3Request.requireEmptyBody(exchange, verified.payload());
+        Map<String, String> acl = Acl.fromHeaders(headers, authentication.identities());
+        BucketSecurity.checkAcl(store.bucket(bucketName), headers, acl, false);
+        if (!acl.isEmpty() && !owner.equals(verified.principal()))
+            access.requireBucket(bucketName, verified.principal(), Acl.WRITE_ACP);
+        String id = multipart.create(bucketName, key, S3Request.contentType(headers),
+            ObjectAttributes.userMetadata(headers),
+            ObjectAttributes.tagsHeader(SigV4.single(headers, "x-amz-tagging")), acl);
+        S3Xml.sendXml(exchange, 200, "<InitiateMultipartUploadResult><Bucket>" + S3Xml.xml(bucketName) +
+            "</Bucket><Key>" + S3Xml.xml(key) + "</Key><UploadId>" + id +
+            "</UploadId></InitiateMultipartUploadResult>");
+    }
+
+    private void uploadPart(HttpExchange exchange, String id, String key, String partNumber,
+                            SigV4.Verified verified, String bucketName) throws IOException {
+        var headers = exchange.getRequestHeaders();
+        int number;
+        try { number = Integer.parseInt(partNumber); }
+        catch (NumberFormatException e) { throw new StoreException(400, "InvalidArgument", "Invalid part number"); }
+        long length = verified.streaming() ? S3Request.decodedLength(headers) : S3Request.contentLength(headers);
+        UploadChecksums checksums = UploadChecksums.from(headers);
+        AwsChunkedInputStream chunked = verified.streaming() ? S3Request.chunkedBody(exchange, verified) : null;
+        String etag = multipart.putPart(id, bucketName, key, number,
+            checksums.verifying(chunked == null ? exchange.getRequestBody() : chunked),
+            length, S3Request.expectedPayloadHash(verified.payload()), checksums.sha256());
+        exchange.getResponseHeaders().set("ETag", "\"" + etag + "\"");
+        checksums.response(exchange.getResponseHeaders());
+        if (chunked != null && chunked.trailerValue() != null)
+            exchange.getResponseHeaders().set(SigV4.single(headers, "x-amz-trailer"), chunked.trailerValue());
+        exchange.sendResponseHeaders(200, -1);
+    }
+
+    private void completeUpload(HttpExchange exchange, String id, String key, String hash,
+                                String bucketName) throws IOException {
+        byte[] body = S3Request.signedBody(exchange, hash, 65536);
+        List<MultipartStorage.Part> parts = S3Xml.completedParts(body);
+        var meta = multipart.complete(id, bucketName, key, parts);
+        if (meta.versionId() != null)
+            exchange.getResponseHeaders().set("x-amz-version-id", meta.versionId());
+        S3Xml.sendXml(exchange, 200, "<CompleteMultipartUploadResult><Location>" +
+            S3Xml.xml(location(exchange, bucketName, key)) + "</Location><Bucket>" + S3Xml.xml(bucketName) +
+            "</Bucket><Key>" + S3Xml.xml(key) + "</Key><ETag>&quot;" + meta.etag() +
+            "&quot;</ETag></CompleteMultipartUploadResult>");
     }
 
     private String location(HttpExchange exchange, String bucket, String key) {
